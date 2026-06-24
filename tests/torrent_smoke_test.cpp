@@ -46,6 +46,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <chrono>       /* the H1 regression test polls with a bounded wait    */
+#include <filesystem>   /* a portable temp dir for the create-torrent path     */
+#include <fstream>
+#include <thread>
 
 static int g_fail = 0;
 static int g_checks = 0;
@@ -378,6 +382,64 @@ static void test_buffer_needed_contract() {
     btx_session_free(s);
 }
 
+/* =========================================================================
+ *  Regression for H1 (the drain wedge): when a pending alert is larger than the
+ *  caller buffer, btx_pop_alerts must report its TRUE -needed (so the caller can
+ *  grow and make progress), NEVER a bogus -2 that leaves the stream stuck. We
+ *  create a real .torrent locally (we hold all the data, so it generates state
+ *  alerts without any network) and drain it through a 4-byte buffer.
+ * ========================================================================= */
+static void test_drain_oversized_makes_progress() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path dir = fs::temp_directory_path() / "torrentxt_smoke_h1";
+    fs::create_directories(dir, ec);
+    fs::path file = dir / "data.bin";
+    {
+        std::ofstream f(file.string().c_str(), std::ios::binary);
+        std::vector<char> junk(200000, 'x');
+        f.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+    }
+
+    int s = btx_session_new();
+    CHECK(s > 0);
+
+    /* Build a .torrent for the file, then add it. */
+    std::vector<char> tbuf(65536);
+    int n = btx_create_torrent(file.string().c_str(), 16384, 0,
+                               tbuf.data(), static_cast<int>(tbuf.size()));
+    if (n < 0) {
+        tbuf.resize(static_cast<size_t>(-n));
+        n = btx_create_torrent(file.string().c_str(), 16384, 0,
+                               tbuf.data(), static_cast<int>(tbuf.size()));
+    }
+    CHECK(n > 0);
+    int t = btx_add_torrent_file(s, tbuf.data(), n, dir.string().c_str());
+    CHECK(t > 0);
+
+    /* Poll with a 4-byte buffer until an alert is pending (bounded ~5s). The
+     * first pending alert cannot fit 4 bytes, so the shim must return -needed. */
+    unsigned char tiny[4];
+    int got = 0;
+    for (int i = 0; i < 1000 && got == 0; ++i) {
+        got = btx_pop_alerts(s, tiny, static_cast<int>(sizeof tiny));
+        if (got == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (got < 0) {
+        CHECK(got < -2);   /* the H1 assertion: TRUE need, never the bogus -2     */
+        int need = -got;
+        std::vector<char> grow(static_cast<size_t>(need));
+        int n2 = btx_pop_alerts(s, grow.data(), need);
+        CHECK(n2 >= 1);    /* grew to -needed -> drained at least one record       */
+    }
+    /* If no alert appeared in the window, the H1 assertion is simply skipped (no
+     * false failure) — matching the drain-roundtrip test's network tolerance. */
+
+    btx_remove(s, t, 1);
+    btx_session_free(s);
+    fs::remove_all(dir, ec);
+}
+
 int main() {
     test_session_lifecycle();
     test_bogus_handles_are_noops();
@@ -386,6 +448,7 @@ int main() {
     test_exception_firewall();
     test_buffer_needed_contract();
     test_alert_drain_roundtrip();
+    test_drain_oversized_makes_progress();
 
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

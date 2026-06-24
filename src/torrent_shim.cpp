@@ -803,11 +803,13 @@ extern "C" BTX_API int BTX_CALL btx_torrent_status(int t, void *out, int cap) {
         r.put_int(btx::F_NUM_COMPLETE, ts.num_complete);
         r.put_int(btx::F_NUM_INCOMPLETE, ts.num_incomplete);
 
-        /* Boolean state flags as 0/1 ints (no bool field type on the wire). */
-        r.put_bool(btx::F_IS_FINISHED,
-                   ts.state == lt::torrent_status::finished
-                || ts.state == lt::torrent_status::seeding);
-        r.put_bool(btx::F_IS_SEEDING, ts.state == lt::torrent_status::seeding);
+        /* Boolean state flags as 0/1 ints (no bool field type on the wire). Use
+         * libtorrent's AUTHORITATIVE is_finished/is_seeding, NOT the state enum:
+         * a selective-download torrent that has all WANTED data is is_finished
+         * while state may still read downloading, and the two disagree during
+         * transitions. */
+        r.put_bool(btx::F_IS_FINISHED, ts.is_finished);
+        r.put_bool(btx::F_IS_SEEDING, ts.is_seeding);
         r.put_bool(btx::F_IS_PAUSED,
                    (ts.flags & lt::torrent_flags::paused) != lt::torrent_flags_t{});
 
@@ -1063,14 +1065,29 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
         return true;
     }
     if (auto *p = lt::alert_cast<lt::save_resume_data_alert>(a)) {
-        out.type = btx::A_RESUME_DATA_READY;
         out.torrentId = idForHandle(p->handle);
-        /* The bytes the app persists. write_resume_data_buf consumes the alert's
-         * params (which is move-only) — we COPY the resulting buffer into our
-         * owning vector immediately, since the alert dies at the next pop. */
+        /* The bytes the app persists. write_resume_data_buf takes the alert's
+         * params by const-ref; move the result into our owning vector (the alert
+         * dies at the next pop). */
         std::vector<char> buf = lt::write_resume_data_buf(p->params);
-        out.hasResumeData = true;
-        out.resumeData.assign(buf.begin(), buf.end());
+        /* The event record carries the blob in a u16-LENGTH field, so the whole
+         * entry must stay under 64 KB. btx_save_resume deliberately omits
+         * save_info_dict, so a normal torrent's blob is far smaller; but guard the
+         * pathological case (a huge piece count) by reporting a clean FAILURE
+         * rather than SILENTLY TRUNCATING the blob and WRAPPING the drain's u16
+         * bodyLen (which would corrupt every later record in the batch). A future
+         * ABI revision could add a raw-bytes resume getter to lift this cap. */
+        static const size_t kResumeRecordMax = 0xFF00;  /* ~256 B headroom under u16 */
+        if (buf.size() > kResumeRecordMax) {
+            out.type = btx::A_RESUME_DATA_FAILED;
+            out.hasErrorMessage = true;
+            out.errorMessage = "resume data (" + std::to_string(buf.size())
+                + " bytes) exceeds the event-record limit; not delivered";
+        } else {
+            out.type = btx::A_RESUME_DATA_READY;
+            out.hasResumeData = true;
+            out.resumeData = std::move(buf);
+        }
         return true;
     }
     if (auto *p = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
@@ -1083,12 +1100,20 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
     if (auto *p = lt::alert_cast<lt::torrent_removed_alert>(a)) {
         out.type = btx::A_TORRENT_REMOVED;
         /* The handle may already be invalid here; the alert also carries the
-         * info_hashes so the app can still identify which torrent went away.
-         * Look up our id (likely already erased by btx_remove -> 0). */
-        out.torrentId = idForHandle(p->handle);
+         * info_hashes so the app can still identify which torrent went away. */
+        const int id = idForHandle(p->handle);
+        out.torrentId = id;
         lt::info_hash_t ih = p->info_hashes;
         if (ih.has_v1()) { out.hasInfoHashV1 = true; out.infoHashV1 = hash_hex(ih.v1); }
         if (ih.has_v2()) { out.hasInfoHashV2 = true; out.infoHashV2 = hash_hex(ih.v2); }
+        /* Reclaim the slot + reverse-map entry HERE — the one place that catches
+         * BOTH an app-initiated btx_remove AND a SELF-removal (fatal error etc.)
+         * that never went through btx_remove. torrent_removed_alert fires before
+         * the handle is reused, so this never frees a live torrent. For an
+         * app-initiated remove the entry is already gone, so this is a no-op
+         * (preventing the unbounded table/map leak the previous code had). */
+        if (id != 0) st->torrents.free(id);
+        st->idOf.erase(p->handle);
         return true;
     }
     if (lt::alert_cast<lt::dht_bootstrap_alert>(a)) {
@@ -1171,50 +1196,53 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
  * We size-probe with a zero-capacity RecordWriter to learn the exact byte need,
  * then only commit to the real writer if it fits the remaining capacity. This
  * keeps the "never drop, never half-write" guarantee simple. */
-bool emit_alert(btx::RecordWriter &w, const PendingAlert &pa) {
-    /* --- measure: how many bytes does this entry need? --- */
-    auto writeBody = [&](btx::RecordWriter &rw) {
-        rw.put_u16(pa.type);
-        const size_t bodyAt = rw.pos();
-        rw.put_u16(0);  /* bodyLen placeholder */
-        const size_t bodyStart = rw.pos();
-        {
-            btx::KVRecord r(rw);
-            /* F_EVT_TORRENT is ALWAYS the first field (0 when the alert has no
-             * torrent, e.g. dht/listen), matching the golden vector ordering so
-             * the LCB walker can read a stable leading id. */
-            r.put_int(btx::F_EVT_TORRENT, pa.torrentId);
-            if (pa.hasMessage)      r.put_str(btx::F_EVT_MESSAGE, pa.message);
-            if (pa.hasErrorCode)    r.put_int(btx::F_EVT_ERROR_CODE, pa.errorCode);
-            if (pa.hasErrorMessage) r.put_str(btx::F_EVT_ERROR_MESSAGE, pa.errorMessage);
-            if (pa.hasPieceIndex)   r.put_int(btx::F_EVT_PIECE_INDEX, pa.pieceIndex);
-            if (pa.hasState)        r.put_int(btx::F_EVT_STATE, pa.state);
-            if (pa.hasPrevState)    r.put_int(btx::F_EVT_PREV_STATE, pa.prevState);
-            if (pa.hasTrackerUrl)   r.put_str(btx::F_EVT_TRACKER_URL, pa.trackerUrl);
-            if (pa.hasNumPeers)     r.put_int(btx::F_EVT_NUM_PEERS, pa.numPeers);
-            if (pa.hasResumeData)   r.put_bytes(btx::F_EVT_RESUME_DATA,
-                                                pa.resumeData.data(), pa.resumeData.size());
-            if (pa.hasInfoHashV1)   r.put_hex(btx::F_EVT_INFO_HASH_V1, pa.infoHashV1);
-            if (pa.hasInfoHashV2)   r.put_hex(btx::F_EVT_INFO_HASH_V2, pa.infoHashV2);
-            if (pa.hasName)         r.put_str(btx::F_EVT_NAME, pa.name);
-            if (pa.hasEndpoint)     r.put_str(btx::F_EVT_ENDPOINT, pa.endpoint);
-            r.finish();
-        }
-        rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
-    };
+void write_alert_entry(btx::RecordWriter &rw, const PendingAlert &pa) {
+    rw.put_u16(pa.type);
+    const size_t bodyAt = rw.pos();
+    rw.put_u16(0);  /* bodyLen placeholder */
+    const size_t bodyStart = rw.pos();
+    {
+        btx::KVRecord r(rw);
+        /* F_EVT_TORRENT is ALWAYS the first field (0 when the alert has no
+         * torrent, e.g. dht/listen), matching the golden vector ordering so the
+         * LCB walker can read a stable leading id. */
+        r.put_int(btx::F_EVT_TORRENT, pa.torrentId);
+        if (pa.hasMessage)      r.put_str(btx::F_EVT_MESSAGE, pa.message);
+        if (pa.hasErrorCode)    r.put_int(btx::F_EVT_ERROR_CODE, pa.errorCode);
+        if (pa.hasErrorMessage) r.put_str(btx::F_EVT_ERROR_MESSAGE, pa.errorMessage);
+        if (pa.hasPieceIndex)   r.put_int(btx::F_EVT_PIECE_INDEX, pa.pieceIndex);
+        if (pa.hasState)        r.put_int(btx::F_EVT_STATE, pa.state);
+        if (pa.hasPrevState)    r.put_int(btx::F_EVT_PREV_STATE, pa.prevState);
+        if (pa.hasTrackerUrl)   r.put_str(btx::F_EVT_TRACKER_URL, pa.trackerUrl);
+        if (pa.hasNumPeers)     r.put_int(btx::F_EVT_NUM_PEERS, pa.numPeers);
+        if (pa.hasResumeData)   r.put_bytes(btx::F_EVT_RESUME_DATA,
+                                            pa.resumeData.data(), pa.resumeData.size());
+        if (pa.hasInfoHashV1)   r.put_hex(btx::F_EVT_INFO_HASH_V1, pa.infoHashV1);
+        if (pa.hasInfoHashV2)   r.put_hex(btx::F_EVT_INFO_HASH_V2, pa.infoHashV2);
+        if (pa.hasName)         r.put_str(btx::F_EVT_NAME, pa.name);
+        if (pa.hasEndpoint)     r.put_str(btx::F_EVT_ENDPOINT, pa.endpoint);
+        r.finish();
+    }
+    rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
+}
 
+/* Exact byte size write_alert_entry would produce for `pa`. RecordWriter
+ * advances pos() even past capacity (it just stops COPYING), so writing into a
+ * zero-capacity probe MEASURES the entry without touching memory. This is the
+ * function the old code lacked — it measured by calling emit_alert on a 0-cap
+ * writer, which refused to write and so always reported a bogus 2 bytes. */
+size_t measure_alert_entry(const PendingAlert &pa) {
     btx::RecordWriter probe(nullptr, 0);
-    writeBody(probe);
-    const size_t need = probe.pos();
+    write_alert_entry(probe, pa);
+    return probe.pos();
+}
 
-    /* Will it fit what remains of the real buffer? remaining = cap - pos. We use
-     * the writer's own measure-or-write: if after writing the real one it would
-     * overflow, we must NOT have written it. But RecordWriter advances pos even
-     * on overflow, so we check capacity up front and refuse cleanly. */
-    const size_t already = w.pos();
-    if (already + need > w.capacity()) return false;  /* stash it for next call */
-
-    writeBody(w);
+/* Emit one entry IF it fits the buffer's remaining capacity; otherwise return
+ * false having written nothing past the cursor, so the caller stashes it. */
+bool emit_alert(btx::RecordWriter &w, const PendingAlert &pa) {
+    const size_t need = measure_alert_entry(pa);
+    if (w.pos() + need > w.capacity()) return false;  /* stash it for next call */
+    write_alert_entry(w, pa);
     return true;
 }
 
@@ -1252,12 +1280,12 @@ extern "C" BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap) {
         if (!st->stash.empty()) {
             w.patch_u16(countAt, written);
             if (written == 0) {
-                /* The first stashed record did not fit an empty-ish buffer.
-                 * Measure it to report -need (drain contract). */
-                btx::RecordWriter probe(nullptr, 0);
-                probe.put_u16(0);
-                emit_alert(probe, st->stash.front());
-                return -static_cast<int>(probe.pos());
+                /* Even the first stashed entry did not fit. Report the TRUE need
+                 * (the [alertCount:u16] prefix + the entry) so the caller grows
+                 * and makes progress. The old code measured with emit_alert on a
+                 * 0-cap writer, which wrote nothing and always returned -2 — so a
+                 * grow to 2 bytes still never fit and the stream wedged forever. */
+                return -static_cast<int>(2 + measure_alert_entry(st->stash.front()));
             }
             return written;
         }
@@ -1293,6 +1321,12 @@ extern "C" BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap) {
         }
 
         w.patch_u16(countAt, written);
+        if (written == 0 && !st->stash.empty()) {
+            /* A FRESH alert was too big for the buffer (nothing emitted, the tail
+             * was stashed). Signal -need now so the caller grows on the next call
+             * instead of seeing a misleading 0 ("no alerts pending"). */
+            return -static_cast<int>(2 + measure_alert_entry(st->stash.front()));
+        }
         return written;
     });
 }
@@ -1395,9 +1429,13 @@ extern "C" BTX_API int BTX_CALL btx_save_resume(int t) {
         /* REQUEST resume data; the bytes arrive later as a save_resume_data_alert
          * we surface as A_RESUME_DATA_READY (carrying F_EVT_RESUME_DATA). There is
          * deliberately no synchronous getter — this honours libtorrent's async
-         * model. save_info_dict makes the blob self-contained for re-add. */
-        h.save_resume_data(lt::torrent_handle::save_info_dict
-                         | lt::torrent_handle::flush_disk_cache);
+         * model. We do NOT pass save_info_dict: it embeds the full piece-hash
+         * table, which blows past the event record's u16 length cap for any
+         * non-trivial torrent (and the blob cannot be re-fragmented). The
+         * fast-resume state (piece progress, priorities, trackers) is what matters
+         * for resuming; the torrent metadata is recovered on re-add from the
+         * original magnet/.torrent (or re-fetched), per libtorrent's normal model. */
+        h.save_resume_data(lt::torrent_handle::flush_disk_cache);
         return BTX_OK;
     });
 }
