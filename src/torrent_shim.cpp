@@ -330,7 +330,7 @@ extern "C" BTX_API int BTX_CALL btx_session_new(void) {
             | lt::alert_category::storage
             | lt::alert_category::tracker
             | lt::alert_category::dht
-            | lt::alert_category::performance;
+            | lt::alert_category::performance_warning;
         sp.set_int(lt::settings_pack::alert_mask, mask);
 
         sp.set_bool(lt::settings_pack::enable_dht, true);
@@ -956,17 +956,13 @@ extern "C" BTX_API int BTX_CALL btx_peer_list(int t, void *out, int cap) {
                 btx::KVRecord r(w);
                 /* "ip:port" built directly from the asio endpoint to avoid the
                  * print_endpoint / aux namespace ambiguity. address().to_string()
-                 * handles both v4 and v6. */
-                std::string ep;
-                {
-                    lt::error_code epc;
-                    std::string addr = pi.ip.address().to_string(epc);
-                    if (!epc) {
-                        ep = addr;
-                        ep += ':';
-                        ep += std::to_string(pi.ip.port());
-                    }
-                }
+                 * handles both v4 and v6. The no-argument to_string() is the form
+                 * that is stable across Boost versions (the error_code overload was
+                 * dropped in newer Boost.Asio); a throw on a degenerate address is
+                 * caught by the surrounding firewall. */
+                std::string ep = pi.ip.address().to_string();
+                ep += ':';
+                ep += std::to_string(pi.ip.port());
                 r.put_str(btx::F_PEER_ENDPOINT, ep);
                 r.put_str(btx::F_PEER_CLIENT, pi.client);
                 r.put_int(btx::F_PEER_DOWN_RATE, pi.down_speed);
@@ -1108,12 +1104,9 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
         out.type = btx::A_LISTEN_SUCCEEDED;
         /* No torrent handle; carry the endpoint string for the event. */
         out.hasEndpoint = true;
-        {
-            lt::error_code epc;
-            std::string addr = p->address.to_string(epc);
-            if (!epc) { out.endpoint = addr; out.endpoint += ':';
-                        out.endpoint += std::to_string(p->port); }
-        }
+        out.endpoint = p->address.to_string();  /* no-arg form: stable across Boost */
+        out.endpoint += ':';
+        out.endpoint += std::to_string(p->port);
         out.hasMessage = true; out.message = p->message();
         return true;
     }
@@ -1431,7 +1424,7 @@ extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
         /* pieceSize 0 == auto (let libtorrent pick). flags pass through to
          * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose. */
         lt::create_torrent ct(fs, pieceSize, lt::create_flags_t{
-            static_cast<std::uint64_t>(static_cast<unsigned>(flags))});
+            static_cast<std::uint32_t>(static_cast<unsigned>(flags))});
 
         /* set_piece_hashes needs the PARENT directory of the content so it can
          * open the files; derive it from contentPath. */
