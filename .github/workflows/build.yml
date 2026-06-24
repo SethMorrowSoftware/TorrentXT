@@ -100,6 +100,14 @@ jobs:
     name: ${{ matrix.name }}
     needs: static-gates       # do not spend matrix minutes if the cheap gate is red
     runs-on: ${{ matrix.os }}
+    # Per the project decision: the harder lanes (32-bit Linux, universal macOS,
+    # Windows) acquire libtorrent/Boost by routes that are authored but not yet
+    # proven, so they are marked experimental and run CONTINUE-ON-ERROR - they are
+    # informational signal, not a merge gate, until the Phase-4 packaging pass.
+    # The REQUIRED green checks are `static-gates` and `linux-x86_64` (the latter
+    # builds the shim against system libtorrent and runs the smoke test under
+    # ASan/UBSan - the binding is verified there).
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false        # one platform's failure should not mask the others
       matrix:
@@ -112,6 +120,7 @@ jobs:
           # COMMITTED release binary must be built from the pinned v2.0.11 source
           # (FetchContent / a controlled toolchain), per docs/building.md.
           - name: linux-x86_64
+            experimental: false    # REQUIRED lane - the binding is verified here
             os: ubuntu-22.04
             platform_id: x86_64-linux
             acquire: apt
@@ -123,6 +132,7 @@ jobs:
           # toolchain. HEAVY and the most likely lane to need hand-tuning; marked
           # best-effort. (A cleaner long-term answer is a 32-bit container.)
           - name: linux-x86
+            experimental: true     # 32-bit libtorrent acquisition not yet proven
             os: ubuntu-22.04
             platform_id: x86-linux
             acquire: fetchcontent-m32
@@ -134,6 +144,7 @@ jobs:
           # is a separate, codesigned+notarized build (creds we do not have in CI -
           # documented placeholder below and in docs/building.md).
           - name: macos-universal
+            experimental: true     # brew bottle is single-arch; universal not yet proven
             os: macos-14
             platform_id: universal-mac
             acquire: brew
@@ -143,6 +154,7 @@ jobs:
           # vcpkg is the sane Windows route to libtorrent 2.0.x. We pin vcpkg's
           # baseline so the version is reproducible (see the vcpkg step).
           - name: windows-x86_64
+            experimental: true     # vcpkg libtorrent build not yet proven
             os: windows-2022
             platform_id: x86_64-win32
             acquire: vcpkg
@@ -154,6 +166,7 @@ jobs:
           # gives clean undecorated cdecl exports here (the reason 32-bit Windows
           # needs the module-definition at all).
           - name: windows-x86
+            experimental: true     # vcpkg 32-bit libtorrent build not yet proven
             os: windows-2022
             platform_id: x86-win32
             acquire: vcpkg
