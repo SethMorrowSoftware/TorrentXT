@@ -24,8 +24,12 @@ name: build
 on:
   push:
     branches: ["**"]
-  pull_request:
   workflow_dispatch:
+  # pull_request is intentionally omitted: this is same-repo branch development,
+  # so the push event already runs CI and its commit checks show on the PR. That
+  # avoids running the heavy build matrix TWICE per push (a push to a branch with
+  # an open PR fires both push and pull_request). Re-add `pull_request:` if you
+  # want CI to run on PRs opened from forks.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -82,7 +86,7 @@ jobs:
             os: ubuntu-22.04
             platform_id: x86-linux
             acquire: linux32
-            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DBoost_ARCHITECTURE=-x32"
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
 
           # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
           #      notarized dylib is a separate release build (see header note). --
@@ -127,15 +131,17 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          # g++-multilib for -m32; the i386 Boost dev packages libtorrent's CMake
-          # find_package(Boost) needs (2.0.x uses Boost.Asio header-only + a couple
-          # of compiled libs). libtorrent itself is FetchContent-built -m32.
-          sudo apt-get install -y g++-multilib gcc-multilib ninja-build \
-            libboost-dev:i386 libboost-system-dev:i386 \
-            libboost-chrono-dev:i386 libboost-random-dev:i386 \
-            zlib1g-dev:i386 || true
-          # A second pass without versioned suffixes in case names differ.
-          sudo apt-get install -y libboost-tools-dev || true
+          # The 32-bit C/C++ toolchain MUST succeed on its OWN line — it provides
+          # Scrt1.o, crti.o, lib32stdc++, lib32gcc that -m32 needs. (The previous
+          # combined install lumped it with optional i386 Boost packages under
+          # `|| true`; apt installs atomically, so one unavailable package aborted
+          # the whole thing and g++-multilib never landed -> the -m32 compiler
+          # check failed at project().)
+          sudo apt-get install -y g++-multilib gcc-multilib ninja-build
+          # i386 Boost for libtorrent's find_package(Boost). Best-effort + isolated
+          # so a missing optional package cannot break the toolchain above.
+          sudo apt-get install -y libboost-dev:i386 libboost-system-dev:i386 || true
+          sudo apt-get install -y zlib1g-dev:i386 libssl-dev:i386 || true
 
       - name: Acquire libtorrent (Homebrew, macOS host arch)
         if: matrix.acquire == 'brew'
