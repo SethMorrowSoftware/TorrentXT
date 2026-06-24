@@ -71,12 +71,8 @@
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bitfield.hpp>
 #include <libtorrent/session_handle.hpp>      /* save_state_flags_t, session_state() */
-/* DHT routing-table (de)serialisation. These live under kademlia/ in 2.0; the
- * save_dht_state(entry)/read_dht_state(bdecode_node) pair is the documented way
- * to persist the DHT node table across runs. NOTE (lead/CI): the exact type of
- * session_params::dht_state and these two free-function signatures are the least
- * certain calls in this shim — see the report. */
-#include <libtorrent/kademlia/dht_state.hpp>
+#include <libtorrent/session_params.hpp>      /* read/write_session_params_buf (public, exported) */
+#include <libtorrent/kademlia/dht_state.hpp>  /* dht::dht_state type for set_dht_state() */
 
 /* ---- standard library ------------------------------------------------------ */
 #include <cstring>
@@ -1349,12 +1345,15 @@ extern "C" BTX_API int BTX_CALL btx_dht_save_state(int s, void *out, int cap) {
         if (!st || !st->ses) return 0;
 
         /* Opaque routing-table state for persistence across runs. In 2.0 the DHT
-         * state is part of the session_params; session_state() returns a
-         * session_params, and we bencode its dht_state entry. We keep this as raw
-         * bytes the app stores verbatim and feeds back to btx_dht_load_state. */
-        lt::session_params params = st->ses->session_state();
-        std::vector<char> buf;
-        lt::bencode(std::back_inserter(buf), lt::dht::save_dht_state(params.dht_state));
+         * state rides inside session_params; session_state(save_dht_state) returns
+         * just that subset, and write_session_params_buf serialises it to bytes the
+         * app stores verbatim and feeds back to btx_dht_load_state. Both calls are
+         * public/exported — the lower-level lt::dht::save_dht_state is NOT in the
+         * shared library's ABI. */
+        lt::session_params params =
+            st->ses->session_state(lt::session_handle::save_dht_state);
+        std::vector<char> buf =
+            lt::write_session_params_buf(params, lt::session_handle::save_dht_state);
 
         const size_t need = buf.size();
         if (out && cap > 0 && need <= static_cast<size_t>(cap))
@@ -1372,15 +1371,15 @@ extern "C" BTX_API int BTX_CALL btx_dht_load_state(int s, const void *data,
         if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
         if (!data || len <= 0) { set_error("empty DHT state"); return BTX_ERR_INVALID_ARG; }
 
-        /* Decode the bencoded blob we previously saved and hand the node list
-         * back to the running DHT. bdecode never throws on bad input under the
-         * ec-overload; it reports via ec. */
-        lt::error_code ec;
-        lt::bdecode_node node = lt::bdecode(
-            {reinterpret_cast<char const *>(data), len}, ec);
-        if (ec) { set_error("bad DHT state: " + ec.message()); return BTX_ERR_INVALID_ARG; }
-        lt::dht::dht_state ds = lt::dht::read_dht_state(node);
-        st->ses->set_dht_state(std::move(ds));
+        /* Re-hydrate the saved session_params (DHT subset) and hand the node
+         * table back to the running DHT. read_session_params is the public,
+         * exported inverse of write_session_params_buf; a malformed blob yields
+         * default (empty) params rather than crashing, and any throw is caught by
+         * the firewall above. */
+        lt::session_params params = lt::read_session_params(
+            {reinterpret_cast<char const *>(data), len},
+            lt::session_handle::save_dht_state);
+        st->ses->set_dht_state(std::move(params.dht_state));
         return BTX_OK;
     });
 }

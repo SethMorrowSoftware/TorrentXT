@@ -54,13 +54,16 @@ namespace test {
 
 /* Runs a body that always throws, through the production firewall helper.
  * Returns the error code the firewall produced (expected BTX_ERR_EXCEPTION) and
- * leaves the module-static last-error populated, exactly as a real throw would. */
-int force_throw(void);
+ * leaves the module-static last-error populated, exactly as a real throw would.
+ * BTX_API: exported with default visibility so the smoke test, which links the
+ * built shared library, can resolve it under -fvisibility=hidden. */
+BTX_API int force_throw(void);
 
 /* Number of sessions currently live in the session handle table (0 or 1, since
  * a second concurrent session is refused). Lets the test check the invariant
- * after new/free without poking internals. */
-int live_session_count(void);
+ * after new/free without poking internals. Exported (BTX_API) for the same
+ * visibility reason as force_throw above. */
+BTX_API int live_session_count(void);
 
 }  // namespace test
 }  // namespace btx
