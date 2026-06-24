@@ -1,73 +1,50 @@
-# .github/workflows/build.yml — TorrentXT CI (plan §7 "stand the matrix up in
-# Phase 0"; §8 testing).
+# .github/workflows/build.yml — TorrentXT CI (plan §7 build/packaging, §8 testing).
 #
-# THREE jobs, split so push/PR feedback is fast AND quiet:
+#   static-gates : every push/PR. NO libtorrent, < 1 min. The always-green gate
+#                  (LCB checker, record golden, registry cross-check, header-only
+#                  record_handle_test under gcc ASan/UBSan).
 #
-#   static-gates : every push/PR. NO libtorrent, < 1 min. The always-green gate:
-#                  the LCB static checker, the Python record golden, the record-
-#                  registry cross-check, and the header-only record_handle_test
-#                  built+run under gcc ASan/UBSan (the nastiest bug surface — the
-#                  big-endian -needed framing and generation-tagged handles).
+#   build-matrix : every push/PR. All five targets build the shim against
+#                  libtorrent and run ctest (record_handle_test + the
+#                  libtorrent-linked torrent_smoke_test). libtorrent is acquired
+#                  per-OS by the most reliable route: apt (linux x64), vcpkg
+#                  (Windows), Homebrew (macOS, host arch), and FetchContent at the
+#                  pinned v2.0.11 built -m32 (linux x86). fail-fast is off so one
+#                  platform never masks another.
 #
-#   build        : every push/PR. The REQUIRED native lane: Linux x86_64 builds
-#                  the shim against system libtorrent (2.0.x) and runs ctest (the
-#                  smoke test) under ASan/UBSan. The binding is verified here.
+# NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
+# binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
+# codesigned+notarized dylib is a separate release build (it needs Apple
+# credentials we do not store in CI); see docs/building.md.
 #
-#   build-experimental : MANUAL (workflow_dispatch) or NIGHTLY (schedule) only —
-#                  NOT on push/PR, so the rapid-iteration loop stays green and
-#                  quiet. 32-bit Linux, universal macOS, Windows x64/x86. Their
-#                  libtorrent/Boost acquisition is authored but not yet proven, so
-#                  they are platform-hardening lanes (Phase 4): kick them with the
-#                  "Run workflow" button or let the nightly run exercise them.
-#                  continue-on-error keeps one platform's failure from masking the
-#                  rest. (Per the project decision to make these non-blocking.)
-#
-# All actions are pinned to a major version, matching the sibling repos.
+# All actions pinned to a major version, matching the sibling repos.
 
 name: build
 
 on:
   push:
-    branches: ["**"]        # every branch — the static gate + linux lane are cheap
+    branches: ["**"]
   pull_request:
-  workflow_dispatch:        # kick the heavy cross-platform matrix on demand
-  schedule:
-    - cron: "37 6 * * *"    # nightly hardening run of the experimental lanes
+  workflow_dispatch:
 
-# Cancel superseded runs on the same ref so a rapid push series does not queue
-# expensive builds.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ===========================================================================
-  #  Fast, always-green gate. No libtorrent. < 1 min.
-  # ===========================================================================
   static-gates:
     name: static gates (lint + golden + sanitized header test)
-    runs-on: ubuntu-22.04   # pinned image; ships gcc with the ASan runtime
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
-      # 1) LCB / .livecodescript static checker (smart quotes, block/unsafe
-      #    balance, constant-before-use) — OXT cannot compile .lcb headlessly.
       - name: check-livecodescript
         run: python3 tools/check-livecodescript.py
-
-      # 2) The record-schema golden: a pure Python reference re-deriving the
-      #    big-endian, length-prefixed framing independently of the C++ encoder.
       - name: record golden test
         run: python3 tests/record_golden_test.py
-
-      # 3) Prove the LCB k* constants mirror the btx_record.h registry (so the
-      #    shim writer and the LCB walker cannot drift). Skips gracefully if the
-      #    tool has not landed yet.
       - name: record-registry cross-check (if present)
         run: |
           if [ -f tools/check-record-registry.py ]; then
@@ -75,10 +52,6 @@ jobs:
           else
             echo "tools/check-record-registry.py not present yet - skipping."
           fi
-
-      # 4) The header-only sanitizer gate, built DIRECTLY with gcc (no CMake, no
-      #    libtorrent) under ASan+UBSan. gcc on purpose: clang's ASan runtime is
-      #    not installed here (CLAUDE.md), and this test runs anywhere.
       - name: record_handle_test (gcc ASan+UBSan)
         run: |
           g++ -std=c++17 -Wall -Wextra \
@@ -87,87 +60,39 @@ jobs:
             tests/record_handle_test.cpp -o record_handle_test
           ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./record_handle_test
 
-  # ===========================================================================
-  #  REQUIRED native lane: Linux x86_64 against system libtorrent. Verifies the
-  #  shim + smoke test under ASan/UBSan on every push/PR.
-  # ===========================================================================
-  build:
-    name: linux-x86_64
-    needs: static-gates       # do not spend build minutes if the cheap gate is red
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python (for package-extension.py)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      # Ubuntu ships libtorrent-rasterbar-dev in the 2.0.x line (e.g. 2.0.10 on
-      # 22.04). That is fine for exercising the BINDING; the COMMITTED release
-      # binary is built from pinned v2.0.11 source (docs/building.md).
-      - name: Acquire libtorrent (apt)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
-
-      - name: Configure
-        run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DTORRENTXT_BUILD_TESTS=ON \
-            -DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON \
-            -DTORRENTXT_SANITIZE=ON
-
-      - name: Build
-        run: cmake --build build --config RelWithDebInfo --parallel
-
-      - name: Test (ctest)
-        run: ctest --test-dir build --build-config RelWithDebInfo --output-on-failure
-
-      - name: Stage per-platform binary
-        run: |
-          python3 tools/package-extension.py \
-            --platform-id x86_64-linux --build-dir build || \
-            echo "package-extension: no shim built yet - nothing to stage."
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: torrentxt-x86_64-linux
-          path: src/code/x86_64-linux/
-          if-no-files-found: ignore
-
-  # ===========================================================================
-  #  Experimental cross-platform lanes. MANUAL/NIGHTLY ONLY (not push/PR) so the
-  #  iteration loop stays quiet. continue-on-error: informational, never a gate.
-  # ===========================================================================
-  build-experimental:
+  build-matrix:
     name: ${{ matrix.name }}
     needs: static-gates
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true   # one platform's failure must not fail the run
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ---- Linux x86 (32-bit) — FetchContent (pinned v2.0.11), -m32 ------
+          # ---- Linux x86_64 — apt system libtorrent 2.0.x, sanitized ----------
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            platform_id: x86_64-linux
+            acquire: apt
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -DTORRENTXT_SANITIZE=ON"
+
+          # ---- Linux x86 (32-bit) — FetchContent libtorrent @ v2.0.11, -m32,
+          #      against the i386 system Boost. The hard lane (no 32-bit apt
+          #      libtorrent); a source build, slow. ------------------------------
           - name: linux-x86
             os: ubuntu-22.04
             platform_id: x86-linux
-            acquire: fetchcontent-m32
-            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
+            acquire: linux32
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DBoost_ARCHITECTURE=-x32"
 
-          # ---- macOS universal (arm64 + x86_64) — Homebrew for the smoke lane -
-          - name: macos-universal
+          # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
+          #      notarized dylib is a separate release build (see header note). --
+          - name: macos
             os: macos-14
             platform_id: universal-mac
             acquire: brew
-            cmake_args: '-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON"
 
-          # ---- Windows x86_64 — vcpkg static triplet --------------------------
+          # ---- Windows x86_64 — vcpkg static libtorrent -----------------------
           - name: windows-x86_64
             os: windows-2022
             platform_id: x86_64-win32
@@ -191,24 +116,31 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Acquire 32-bit toolchain (Linux x86)
-        if: matrix.acquire == 'fetchcontent-m32'
+      - name: Acquire libtorrent (apt, Linux x86_64)
+        if: matrix.acquire == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
+
+      - name: Acquire 32-bit toolchain + i386 Boost (Linux x86)
+        if: matrix.acquire == 'linux32'
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          # gcc multilib for -m32; Boost + libtorrent come from FetchContent
-          # (pinned v2.0.11), built 32-bit by the -m32 flags in cmake_args.
-          sudo apt-get install -y g++-multilib gcc-multilib \
-            libssl-dev:i386 zlib1g-dev:i386 ninja-build || \
-            sudo apt-get install -y g++-multilib gcc-multilib ninja-build
+          # g++-multilib for -m32; the i386 Boost dev packages libtorrent's CMake
+          # find_package(Boost) needs (2.0.x uses Boost.Asio header-only + a couple
+          # of compiled libs). libtorrent itself is FetchContent-built -m32.
+          sudo apt-get install -y g++-multilib gcc-multilib ninja-build \
+            libboost-dev:i386 libboost-system-dev:i386 \
+            libboost-chrono-dev:i386 libboost-random-dev:i386 \
+            zlib1g-dev:i386 || true
+          # A second pass without versioned suffixes in case names differ.
+          sudo apt-get install -y libboost-tools-dev || true
 
-      - name: Acquire libtorrent (Homebrew, macOS)
+      - name: Acquire libtorrent (Homebrew, macOS host arch)
         if: matrix.acquire == 'brew'
         run: |
           brew update
-          # A brew bottle may be single-arch; if the universal link fails, the
-          # escalation is to build libtorrent from pinned source for both arches
-          # (FetchContent + CMAKE_OSX_ARCHITECTURES). See docs/building.md.
           brew install libtorrent-rasterbar boost ninja
 
       - name: Set up vcpkg + acquire libtorrent (Windows)
@@ -250,21 +182,10 @@ jobs:
             --build-dir build || \
             echo "package-extension: nothing to stage."
 
-      # macOS release ONLY: codesign + notarize. DOCUMENTED PLACEHOLDER, gated off
-      # until Apple credentials exist (we must not invent them).
-      - name: Codesign + notarize (macOS, release only - placeholder)
-        if: matrix.platform_id == 'universal-mac' && false
-        shell: bash
-        run: |
-          # codesign --timestamp --options runtime --sign "Developer ID Application: <NAME>" \
-          #   src/code/universal-mac/torrentxt.dylib
-          # xcrun notarytool submit ... --keychain-profile "<PROFILE>" --wait
-          echo "notarization is a documented manual step (needs Apple credentials)."
-
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: torrentxt-${{ matrix.platform_id }}
+          name: torrentxt-${{ matrix.name }}
           path: src/code/${{ matrix.platform_id }}/
           if-no-files-found: ignore
