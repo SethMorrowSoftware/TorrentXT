@@ -25,7 +25,7 @@ can find their footing.
         |       walk records, set the module last-error, never throw to script
         |
   examples/torrent-helpers.livecodescript   the poll dispatcher (timer -> btPoll -> messages)
-  examples/torrent-demo.livecodescript      add-a-magnet, show progress, finish
+  examples/torrent-client.livecodescript    the flagship multi-torrent client (self-building UI)
         |
   your xTalk app              writes event handlers (metadataReceived, pieceFinished, ...)
 ```
@@ -88,6 +88,44 @@ handle is a harmless no-op (getters return 0/empty, actions do nothing) — neve
 a crash, never a recycled-slot alias. One table for sessions, one for torrents.
 The session handle and torrent handles are visible to script; everything else is
 bracketed inside a single LCB call.
+
+## Crossing the FFI: how bytes move (src/torrent.lcb)
+
+Scalars are easy: ints cross as `CInt`, booleans as `0/1`, reals as `double`,
+and short strings (magnet URI, save path, hex info-hash, last-error) as
+`ZStringUTF8`. There is **no 64-bit foreign int**, so 64-bit values, piece
+offsets, and info-hashes ride as decimal/hex **strings** inside the records.
+
+The one non-obvious primitive is the **byte buffer**, because *an LCB `Data`
+does not auto-bridge to a C `Pointer`* — it marshals as an opaque `MCDataRef`,
+and passing one where a `Pointer` is declared raises `expected type pointer` at
+runtime. So the binding uses the proven htmltidy/HIDAPI shape built on the
+engine `<builtin>` allocators (foreign handlers that bind by their exact engine
+name, so they carry no leading underscore):
+
+- **out** (the shim fills it — alert drain, status / peer / DHT / bitfield
+  snapshots, resume bytes, a created `.torrent`): the binding hands the shim a
+  raw block from `MCMemoryAllocate` as a real `Pointer` plus its capacity; the
+  shim writes into it and returns **bytes-written**, or **`-needed`** when the
+  block was too small. The binding then copies exactly the written bytes back
+  into a `Data` with `MCDataCreateWithBytes` and walks them.
+- **in** (the app supplies it — a `.torrent` file, resume data, a priorities
+  array): the binding passes `MCDataGetBytePtr(theData)` — the read-only pointer
+  to the `Data`'s own bytes — plus its length. The shim only reads it.
+
+Three buffers (`sDrainPtr`, `sStatusPtr`, `sScratchPtr`, each with a `*Cap`)
+are allocated once by `_ensureDrain` / `_ensureStatus` / `_ensureScratch` and
+**reused** every poll — rebuilding an N-byte buffer each frame is the O(N)
+interpreter cost the performance playbook forbids. A getter that returns
+`-needed` triggers exactly **one** grow-to-fit retry (the shim returned the
+precise size it needs), after which steady-state polling never reallocates. The
+drain additionally **never drops a record**: an overflowing record is stashed
+and emitted on the next call (ShowControl's MIDI rule).
+
+If a strict OXT build ever rejected the pointer path, the recorded fallback is
+to cross the (small) records as **hex-encoded `ZStringUTF8`** instead of raw
+bytes — viable precisely because only status records cross, never payload — at
+the cost of an ABI bump. It has not been needed.
 
 ## What is verifiable where
 

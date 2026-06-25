@@ -9,9 +9,11 @@ contract see `docs/api-reference.md`; for the *why* of the design see
 
 > **Honesty note.** OXT cannot compile or run `.lcb`/`.livecodescript` headlessly,
 > so the snippets here are "verified statically; needs an OXT pass." They mirror
-> `examples/torrent-demo.livecodescript` and `examples/torrent-helpers.livecodescript`,
-> which are the runnable reference; when something does not behave, trust the
-> running engine and `btLastError()` over this page.
+> the runnable examples — `examples/torrent-client.livecodescript` (the full
+> self-building client) plus the smaller `examples/torrent-demo.livecodescript`
+> and `examples/torrent-helpers.livecodescript` this guide walks through; when
+> something does not behave, trust the running engine and `btLastError()` over
+> this page.
 
 ---
 

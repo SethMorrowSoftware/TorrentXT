@@ -10,8 +10,8 @@ for the lifecycle you must follow; this file is the call-by-call contract.
 > **Honesty note (carried throughout the repo).** OXT has no headless way to
 > compile or run `.lcb`, so the runtime behaviour of these handlers is "verified
 > statically; needs an OXT pass." Where a value is plumbed through the schema but
-> not yet populated by a real engine (the shim is Phase-1+ work), it is flagged
-> in place rather than promised.
+> not yet populated by the shim (a few status fields, noted inline), that is
+> flagged in place rather than promised.
 
 ---
 
@@ -448,7 +448,8 @@ The full set of event-array key names available across all alerts (from
 `piece`, `state`, `prevState`, `tracker`, `numPeers`, `resumeData`, `infoHashV1`,
 `infoHashV2`, `torrentName`, `endpoint`. Which subset a given alert populates is
 the shim's choice per alert; the column above reflects the intended mapping and
-should be confirmed against `torrent_shim.cpp` once it is written.
+is implemented in `torrent_shim.cpp`, the source of truth for which subset each
+alert populates.
 
 ---
 
@@ -484,8 +485,8 @@ fails with `BTX_ERR_INVALID_ARG`.
 ## Return codes (action / setter handlers)
 
 From `src/btx_abi.h`. Getters do **not** use these - they return
-bytes-written / `-needed` / empty (the buffer convention; see
-phase0-ffi-spike.md). Action codes:
+bytes-written / `-needed` / empty (the buffer convention; see the FFI section of
+`docs/architecture.md`). Action codes:
 
 | code | name | meaning |
 |---|---|---|

@@ -137,7 +137,7 @@ pass" and let the user confirm.
 1. **Exceptions must never cross `extern "C"`** (the firewall, above) — asserted by a
    smoke test that forces a throw and checks it surfaces as an error code.
 2. **No deterministic LCB unload hook.** Session threads cannot be torn down
-   automatically. Expose `btShutdown` (pause → flush resume data → destroy → join) and
+   automatically. Expose `btStopSession` (pause → flush resume data → destroy → join) and
    **document that the app must call it** (e.g. on `closeStack`). Make it **idempotent**
    and **refuse a second concurrent session** while one is live.
 3. **Never touch script from a libtorrent thread** — restated rule 1 for the C++ context;
