@@ -230,7 +230,11 @@ command tcEnsureSession
       set the uSession of this stack to sSession
    end if
    btSetBool sSession, "enable_lsd", true
-   tcLogMsg "Session ready (handle" && sSession & "). DHT/LSD on."
+   -- seed the DHT with well-known routers so it bootstraps reliably on first run
+   btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
+   btDhtAddBootstrap sSession, "router.utorrent.com", 6881
+   btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
+   tcLogMsg "Session ready (handle" && sSession & "). DHT/LSD on, routers seeded."
    put "true" into sPolling
    send "tcPollOnce" to me in 0 milliseconds
    send "tcRefreshLoop" to me in 600 milliseconds
@@ -276,8 +280,10 @@ command tcAddInput
    else if tInput begins with "http://" or tInput begins with "https://" then
       tcLogMsg "Downloading .torrent from" && tInput && "..."
       put url tInput into tData
-      if the result is not empty or tData is empty then
+      if the result is not empty then
          tcLogMsg "Download failed:" && the result
+      else if tData is empty then
+         tcLogMsg "Download returned no data from" && tInput
       else
          tcReportAdd btAddTorrentFile(sSession, tData, field "tcSavePath"), ".torrent (URL)"
       end if
@@ -334,8 +340,18 @@ command tcCreateAndSeed
       tcLogMsg "Create failed:" && btLastError()
       exit tcCreateAndSeed
    end if
+   -- compute the folder's PARENT, separator-agnostically: answer folder returns
+   -- back-slash paths on Windows, where splitting on "/" alone would leave tPath
+   -- unchanged and break the save-path -> existing-files mapping (seeding fails).
+   replace "\" with "/" in tPath
+   if the last char of tPath is "/" then
+      delete the last char of tPath
+   end if
    set the itemDelimiter to "/"
    put item 1 to -2 of tPath into tParent
+   if tParent is empty then
+      put "/" into tParent
+   end if
    tcReportAdd btAddTorrentFile(sSession, tData, tParent), "seed of" && tPath
 end tcCreateAndSeed
 
@@ -347,6 +363,7 @@ function tcDupCheck pHash
    if tH is not 0 then
       tcLogMsg "Already in the list (handle" && tH & ") - selecting it."
       tcSelectHandle tH
+      put empty into field "tcInput"
    end if
    return tH
 end tcDupCheck
@@ -422,6 +439,10 @@ command tcControlSelected pAction
          tcLogMsg "Removed torrent" && tH && "(kept files)"
          break
       case "removeData"
+         answer "Delete the downloaded files for torrent" && tH & "?" with "Cancel" or "Delete"
+         if it is not "Delete" then
+            exit tcControlSelected
+         end if
          btRemoveTorrent sSession, tH, true
          tcLogMsg "Removed torrent" && tH && "AND deleted its files"
          break
@@ -538,7 +559,7 @@ command tcApplyUpLimit
    if not tcHaveSession() then
       exit tcApplyUpLimit
    end if
-   put field "tcUpLimit" into tKB
+   put tcTrim(field "tcUpLimit") into tKB
    if tKB is empty or tKB is not a number then
       put 0 into tKB
    end if
@@ -570,11 +591,11 @@ command tcHandleEvent pEvent
          tcRefreshOnce
          break
       case "metadataReceived"
-         tcLogMsg "  metadata:" && pEvent["torrentName"]
+         tcLogMsg "  metadata received:" && tcTorrentName(pEvent["torrent"])
          tcRefreshOnce
          break
       case "torrentFinished"
-         tcLogMsg "* FINISHED torrent" && pEvent["torrent"] && "- now seeding"
+         tcLogMsg "* FINISHED:" && tcTorrentName(pEvent["torrent"]) && "- now seeding"
          tcRefreshOnce
          break
       case "torrentError"
@@ -586,6 +607,9 @@ command tcHandleEvent pEvent
       case "resumeDataReady"
          tcLogMsg "  resume data ready for torrent" && pEvent["torrent"] && \
             "(" & (the number of bytes in pEvent["resumeData"]) && "bytes)"
+         break
+      case "dhtBootstrap"
+         tcLogMsg "  DHT bootstrapped."
          break
       default
          -- stateChanged / pieceFinished etc. are reflected in the table, not logged
@@ -605,7 +629,7 @@ command tcRefreshLoop
 end tcRefreshLoop
 
 command tcRefreshOnce
-   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tSelH, tSelLine, tNewMap, tLineNum, tNodes
+   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tSelH, tSelLine, tNewMap, tLineNum, tNodes, tDht
    if sSession is 0 or sSession is empty then
       exit tcRefreshOnce
    end if
@@ -643,21 +667,29 @@ command tcRefreshOnce
    if tSelLine is not empty then
       set the hilitedLines of field "tcTorrents" to tSelLine
    end if
-   -- DHT nodes (best-effort; the shim reports 0 until node counts are wired)
+   -- per-torrent buttons are usable only when a row is selected
+   tcEnableControls (tSelLine is not empty)
+   -- DHT status: show the real node count if the shim reports one, else on/off.
+   -- (The current shim hardcodes the count to 0 but DOES report a running flag;
+   -- once the shim wires dht.dht_nodes, the real count appears here automatically.)
    put btDhtState(sSession) into tS
    put tS["globalNodes"] into tNodes
-   if tNodes is empty then
-      put 0 into tNodes
+   if tNodes is a number and tNodes > 0 then
+      put ("DHT:" && tNodes && "nodes") into tDht
+   else if tS["nodes"] is "1" then
+      put "DHT: on" into tDht
+   else
+      put "DHT: off" into tDht
    end if
    put tLineNum && "torrents     down" && tcFmtBytes(tDown) & "/s     up" && tcFmtBytes(tUp) & "/s" \
-      && "    DHT:" && tNodes && "nodes" into field "tcTotals"
+      && "    " & tDht into field "tcTotals"
    tcUpdateDetail tSelH
 end tcRefreshOnce
 
 -- A one-line detail readout for the selected torrent: info-hash, save path, ETA,
 -- seeds. Shows off the richer btTorrentStatus / btInfoHash fields.
 command tcUpdateDetail pHandle
-   local tS
+   local tS, tLine
    if pHandle is 0 then
       put "Select a torrent to see its details." into field "tcDetail"
       exit tcUpdateDetail
@@ -665,8 +697,34 @@ command tcUpdateDetail pHandle
    put btTorrentStatus(pHandle) into tS
    put "hash:" && tcShortHash(btInfoHash(pHandle)) && "|  save:" && tS["savePath"] \
       && "|  ETA:" && tcFmtEta(tS["eta"]) && "|  seeds:" && tS["numSeeds"] \
-      && "|  done:" && tcFmtBytes(tS["totalDone"]) into field "tcDetail"
+      && "|  done:" && tcFmtBytes(tS["totalDone"]) into tLine
+   if tS["error"] is not empty then
+      put tLine && "|  ERROR:" && tS["error"] into tLine
+   end if
+   put tLine into field "tcDetail"
 end tcUpdateDetail
+
+-- Resolve a torrent's display name (falls back to "torrent N" before metadata).
+function tcTorrentName pHandle
+   local tS
+   if pHandle is 0 or pHandle is empty then
+      return "?"
+   end if
+   put btTorrentStatus(pHandle) into tS
+   if tS["name"] is empty then
+      return ("torrent" && pHandle)
+   end if
+   return tS["name"]
+end tcTorrentName
+
+-- Enable/disable the nine per-torrent control buttons in one pass.
+command tcEnableControls pOn
+   local tBtn
+   set the itemDelimiter to comma
+   repeat for each item tBtn in "tcPause,tcResume,tcRecheck,tcReannounce,tcRemove,tcRemoveData,tcOpenFolder,tcCopyMagnet,tcSaveResume"
+      set the disabled of button tBtn to (not pOn)
+   end repeat
+end tcEnableControls
 
 -- ---- small helpers -----------------------------------------------------------
 function tcStateName pState
