@@ -149,6 +149,11 @@ jobs:
           # arch-independent header-only discovery is left untouched). Boost is
           # header-only for libtorrent's use, so no :i386 Boost is needed.
           sudo apt-get install -y libssl-dev:i386 zlib1g-dev:i386
+          # libtorrent's find_package(Boost) needs the Boost HEADERS. They are
+          # header-only for libtorrent's use and arch-independent, so the amd64
+          # libboost-dev provides /usr/include/boost for the -m32 build too. (The
+          # runner image ships no Boost, so this MUST be installed explicitly.)
+          sudo apt-get install -y libboost-dev
 
       - name: Acquire libtorrent (Homebrew, macOS host arch)
         if: matrix.acquire == 'brew'
