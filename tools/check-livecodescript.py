@@ -44,6 +44,10 @@ class Problem:
 
 
 def find_smart_quotes(path, text):
+    """Flag any non-ASCII byte. Smart quotes (the common case) fail OXT
+    compilation outright; the broader rule is that OXT source is pure ASCII -
+    the proven sibling extensions contain zero non-ASCII bytes - so even a stray
+    en-dash or section sign in a comment is off-convention and is reported."""
     out = []
     for i, line in enumerate(text.splitlines(), 1):
         for col, ch in enumerate(line, 1):
@@ -51,6 +55,10 @@ def find_smart_quotes(path, text):
                 out.append(Problem(path, i,
                            "smart quote %s (U+%04X) at col %d - OXT rejects it; use ASCII"
                            % (SMART_QUOTES[ch], ord(ch), col)))
+            elif ord(ch) > 127:
+                out.append(Problem(path, i,
+                           "non-ASCII character %r (U+%04X) at col %d - OXT source "
+                           "must be pure ASCII; replace it" % (ch, ord(ch), col)))
     return out
 
 
@@ -152,6 +160,8 @@ def check_lcb_blocks(path, cleaned):
         # ---- closers ----
         if t0 == "end" and len(toks) >= 2:
             kind = toks[1]
+            if kind in ("library", "module", "widget"):
+                continue  # module-level closer (validated by check_lcb_module)
             if kind in ("handler", "if", "repeat", "unsafe", "foreach"):
                 want = "foreach" if kind == "foreach" else kind
                 if not stack:
@@ -316,6 +326,51 @@ def check_lcb_antipatterns(path, cleaned):
     return problems
 
 
+def check_lcb_module(path, cleaned):
+    """A library/module/widget must be explicitly closed with the matching
+    `end library`/`end module`/`end widget`. OXT otherwise consumes the whole
+    file looking for the closer and reports a syntax error at end-of-file."""
+    problems = []
+    opener = None  # (kind, lineno)
+    closed = False
+    for lineno, line in cleaned:
+        if opener is None:
+            mo = re.match(r"\s*(library|module|widget)\s+[A-Za-z_][\w.]*", line)
+            if mo:
+                opener = (mo.group(1), lineno)
+                continue
+        mc = re.match(r"\s*end\s+(library|module|widget)\b", line)
+        if mc:
+            closed = True
+            if opener and mc.group(1) != opener[0]:
+                problems.append(Problem(path, lineno,
+                    "`end %s` does not match the opening `%s`" % (mc.group(1), opener[0])))
+    if opener and not closed:
+        problems.append(Problem(path, opener[1],
+            "`%s` opened here is never closed - add `end %s` at the very end of "
+            "the file (OXT reports a syntax error at end-of-file otherwise)"
+            % (opener[0], opener[0])))
+    return problems
+
+
+def check_lcb_lowercase_names(path, cleaned):
+    """OXT warns that all-lowercase identifiers may become reserved words
+    ('All-lowercase name X may cause future syntax error'). The project naming
+    convention prefixes every name (t/p/s/k + CamelCase), so an all-lowercase
+    `variable` declaration is both a convention break and a future-error risk."""
+    problems = []
+    pat = re.compile(r"\bvariable\s+([a-z][a-z0-9_]*)\s+as\b")
+    for lineno, line in cleaned:
+        m = pat.search(line)
+        if m:
+            name = m.group(1)
+            problems.append(Problem(path, lineno,
+                "all-lowercase variable name `%s` - OXT warns it may cause a future "
+                "syntax error; use a prefixed CamelCase name (e.g. t%s)"
+                % (name, name.capitalize())))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -333,9 +388,11 @@ def check_file(path):
     problems += cprob
 
     if is_lcb:
+        problems += check_lcb_module(path, cleaned)
         problems += check_lcb_blocks(path, cleaned)
         problems += check_lcb_constants(path, cleaned)
         problems += check_lcb_antipatterns(path, cleaned)
+        problems += check_lcb_lowercase_names(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
     return problems

@@ -38,6 +38,10 @@ metadata title is "TorrentXT"
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
 constant kABIVersion is 1
 
+-- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
+-- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
+constant kEncodingUtf8 is 4
+
 -- Reusable buffer capacities (the single-thread performance playbook: allocate
 -- once, reuse every poll, never rebuild). Grown on demand if the shim reports a
 -- bigger -needed.
@@ -191,7 +195,7 @@ private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSi
 -- ===================================================================== --
 
 -- Throw a clear error if the loaded native library's ABI does not match this
--- binding (plan §4.5). Better a legible throw at startup than a crash later.
+-- binding (plan section 4.5). Better a legible throw at startup than a crash.
 private handler _checkABI()
    variable tABI as Integer
    unsafe
@@ -206,9 +210,9 @@ end handler
 -- once per buffer). Mirrors midi.lcb's ensureDrainBuf seeding.
 private handler _makeZeroData(in pSize as Integer) returns Data
    variable tBuf as Data
-   variable i as Integer
+   variable tI as Integer
    put the empty data into tBuf
-   repeat with i from 1 up to 256
+   repeat with tI from 1 up to 256
       put the byte with code (0) after tBuf
    end repeat
    repeat while the number of bytes in tBuf < pSize
@@ -241,12 +245,29 @@ private handler _readU16(in pData as Data, in pOffset as Integer) returns Intege
    return tHi * 256 + tLo
 end handler
 
--- Decode pLen bytes of UTF-8 starting at 1-based pStart into a String.
+-- Decode pLen bytes of UTF-8 (1-based pStart) into a String. LCB has no
+-- `textDecode` handler, so we call the engine Foundation's MCStringDecode via
+-- the same `<builtin>` foreign binding midi.lcb/HIDAPI use for MCDataGetBytePtr.
+-- Signature + UTF-8 constant taken verbatim from libfoundation/foundation.h:
+--   bool MCStringDecode(MCDataRef, MCStringEncoding, bool isExternalRep, MCStringRef&)
+private foreign handler _MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+
 private handler _decodeText(in pData as Data, in pStart as Integer, in pLen as Integer) returns String
+   variable tSub as Data
+   variable tStr as String
+   variable tOk as Boolean
    if pLen <= 0 then
       return ""
    end if
-   return textDecode(byte pStart to (pStart + pLen - 1) of pData, "UTF-8")
+   put byte pStart to (pStart + pLen - 1) of pData into tSub
+   put "" into tStr
+   unsafe
+      put _MCStringDecode(tSub, kEncodingUtf8, false, tStr) into tOk
+   end unsafe
+   if tOk then
+      return tStr
+   end if
+   return ""
 end handler
 
 -- Map a record field id to its script-facing array key. "" means "skip"
@@ -419,7 +440,7 @@ private handler _parseRecord(in pData as Data, in pStart as Integer) returns Arr
    variable tRec as Array
    variable tOffset as Integer
    variable tCount as Integer
-   variable i as Integer
+   variable tI as Integer
    variable tId as Integer
    variable tType as Integer
    variable tLen as Integer
@@ -428,7 +449,7 @@ private handler _parseRecord(in pData as Data, in pStart as Integer) returns Arr
    put pStart into tOffset
    put _readU16(pData, tOffset) into tCount
    add 2 to tOffset
-   repeat with i from 1 up to tCount
+   repeat with tI from 1 up to tCount
       put the code of (byte tOffset of pData) into tId
       put the code of (byte (tOffset + 1) of pData) into tType
       add 2 to tOffset
@@ -775,7 +796,7 @@ public handler btPeerList(in pTorrent as Integer) returns List
    variable tPeerCount as Integer
    variable tBodyLen as Integer
    variable tPeer as Array
-   variable i as Integer
+   variable tI as Integer
    put [] into tPeers
    _ensureBuffers()
    unsafe
@@ -793,7 +814,7 @@ public handler btPeerList(in pTorrent as Integer) returns List
    put 1 into tOffset
    put _readU16(sStatus, tOffset) into tPeerCount
    add 2 to tOffset
-   repeat with i from 1 up to tPeerCount
+   repeat with tI from 1 up to tPeerCount
       -- entry := [bodyLen:u16][kvrecord]; advance by the on-wire bodyLen
       put _readU16(sStatus, tOffset) into tBodyLen
       put _parseRecord(sStatus, tOffset + 2) into tPeer
@@ -819,7 +840,7 @@ public handler btPoll(in pSession as Integer) returns List
    variable tType as Integer
    variable tBodyLen as Integer
    variable tEvent as Array
-   variable i as Integer
+   variable tI as Integer
    put [] into tEvents
    _ensureBuffers()
    unsafe
@@ -838,7 +859,7 @@ public handler btPoll(in pSession as Integer) returns List
    put 1 into tOffset
    put _readU16(sDrain, tOffset) into tAlertCount
    add 2 to tOffset
-   repeat with i from 1 up to tAlertCount
+   repeat with tI from 1 up to tAlertCount
       -- entry := [alertType:u16][bodyLen:u16][kvrecord]
       put _readU16(sDrain, tOffset) into tType
       put _readU16(sDrain, tOffset + 2) into tBodyLen
@@ -925,3 +946,7 @@ public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integ
    end if
    return byte 1 to tCount of sStatus
 end handler
+
+-- A library module must be closed with `end library` (matching the opening
+-- `library ...` declaration) or OXT reports a syntax error at end-of-file.
+end library
