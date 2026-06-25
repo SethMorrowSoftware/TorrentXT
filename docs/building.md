@@ -123,14 +123,20 @@ MODULE-style find that yields plain `*_LIBRARIES`). Boost is required ≥ 1.70.
 
 ### Linux — the glibc floor
 
-For binaries that load on the older distros the OXT user base runs, build the
-**release** `.so` against an **old glibc (~2.17)**, matching the sibling extension
-Box2Dxt. CMake already statically links libstdc++/libgcc; the glibc floor itself is
-a property of the *build host*, so produce the committed `x86_64-linux` / `x86-linux`
-binaries inside a **manylinux2014-style image** (glibc 2.17) rather than on a modern
-runner. This is a build-environment choice, not a CMake flag — the CI lanes here use
-stock runners (good enough to test the binding), and the release binaries are the
-manylinux build (not yet wired into this workflow; flagged for Phase 4).
+**Current floor (what the committed libs require):** the bundled Linux `.so`s come
+straight from CI's stock `ubuntu-22.04` runners, so they require that host's
+**glibc (~2.35)** and **OpenSSL 3** (`libssl.so.3` / `libcrypto.so.3`) — i.e. they
+load on **Ubuntu 22.04+ and equally-recent distros**, *not* on older ones (Ubuntu
+20.04, CentOS 7, …). libtorrent is static-linked in and libstdc++/libgcc are static
+(CMake `-static-libstdc++ -static-libgcc`), so glibc + OpenSSL are the only remaining
+dynamic floor, and that floor is a property of the *build host*.
+
+**For broad portability (Phase 4, not yet wired):** build the **release** `.so`
+inside a **manylinux2014-style image** (glibc ~2.17, matching the sibling extension
+Box2Dxt) so it loads on the older distros the OXT user base runs. This is a
+build-environment choice, not a CMake flag — when that lane lands, `commit-binaries`
+ships its output instead of the stock-runner build. Until then, ship/expect the
+modern-distro floor above (a deliberate "ship now, perfect in Phase 4" choice).
 
 ### macOS — universal + codesign/notarize
 
@@ -244,7 +250,8 @@ The jobs:
   libtorrent, or any `.dylib`, is skipped. All four `.so`/`.dll` lanes static-link
   libtorrent (Windows via vcpkg `*-static`; both Linux lanes via FetchContent at the
   pinned v2.0.11), so `x86_64-linux`, `x86-linux`, `x86_64-win32` and `x86-win32` are
-  committed. **macOS is the one platform not shipped from CI**: the lane builds the
+  committed. (The two Linux libs are built on stock runners, so they carry the glibc/
+  OpenSSL floor noted under *Linux — the glibc floor* until the manylinux lane lands.) **macOS is the one platform not shipped from CI**: the lane builds the
   host arch (arm64) against Homebrew, which is neither universal nor self-contained;
   the real universal + codesigned + notarized dylib is a separate release build (see
   the `README.md` in `src/code/universal-mac/` and the macOS section above). Gated to
