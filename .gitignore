@@ -1,0 +1,22 @@
+# CMake build output (the native libs are built here, then copied into
+# src/code/<arch>-<platform>/ by tools/package-extension.py and committed there).
+/build/
+/build-*/
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.pyc
+
+# OXT/extension packaging scratch
+*.lce
+/dist/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# NOTE: the bundled per-platform native libraries under src/code/<id>/
+# (torrentxt.so/.dll/.dylib) ARE committed deliberately (plan §7) and must
+# NOT be ignored - that is why there is no global *.so/*.dll/*.dylib rule here.

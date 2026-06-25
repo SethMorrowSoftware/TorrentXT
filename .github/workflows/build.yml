@@ -1,0 +1,211 @@
+# .github/workflows/build.yml — TorrentXT CI (plan §7 build/packaging, §8 testing).
+#
+#   static-gates : every push/PR. NO libtorrent, < 1 min. The always-green gate
+#                  (LCB checker, record golden, registry cross-check, header-only
+#                  record_handle_test under gcc ASan/UBSan).
+#
+#   build-matrix : every push/PR. All five targets build the shim against
+#                  libtorrent and run ctest (record_handle_test + the
+#                  libtorrent-linked torrent_smoke_test). libtorrent is acquired
+#                  per-OS by the most reliable route: apt (linux x64), vcpkg
+#                  (Windows), Homebrew (macOS, host arch), and FetchContent at the
+#                  pinned v2.0.11 built -m32 (linux x86). fail-fast is off so one
+#                  platform never masks another.
+#
+# NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
+# binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
+# codesigned+notarized dylib is a separate release build (it needs Apple
+# credentials we do not store in CI); see docs/building.md.
+#
+# All actions pinned to a major version, matching the sibling repos.
+
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+  # pull_request is intentionally omitted: this is same-repo branch development,
+  # so the push event already runs CI and its commit checks show on the PR. That
+  # avoids running the heavy build matrix TWICE per push (a push to a branch with
+  # an open PR fires both push and pull_request). Re-add `pull_request:` if you
+  # want CI to run on PRs opened from forks.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-gates:
+    name: static gates (lint + golden + sanitized header test)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: check-livecodescript
+        run: python3 tools/check-livecodescript.py
+      - name: record golden test
+        run: python3 tests/record_golden_test.py
+      - name: record-registry cross-check (if present)
+        run: |
+          if [ -f tools/check-record-registry.py ]; then
+            python3 tools/check-record-registry.py
+          else
+            echo "tools/check-record-registry.py not present yet - skipping."
+          fi
+      - name: record_handle_test (gcc ASan+UBSan)
+        run: |
+          g++ -std=c++17 -Wall -Wextra \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer \
+            tests/record_handle_test.cpp -o record_handle_test
+          ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./record_handle_test
+
+  build-matrix:
+    name: ${{ matrix.name }}
+    needs: static-gates
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux x86_64 — apt system libtorrent 2.0.x, sanitized ----------
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            platform_id: x86_64-linux
+            acquire: apt
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -DTORRENTXT_SANITIZE=ON"
+
+          # ---- Linux x86 (32-bit) — FetchContent libtorrent @ v2.0.11, -m32,
+          #      against the i386 system Boost. The hard lane (no 32-bit apt
+          #      libtorrent); a source build, slow. ------------------------------
+          - name: linux-x86
+            os: ubuntu-22.04
+            platform_id: x86-linux
+            acquire: linux32
+            # Cap build parallelism: this is the only lane that compiles
+            # libtorrent itself (from source, -m32). libtorrent's heaviest TUs
+            # (add_torrent_params.cpp et al.) each peak at multiple GB, and the
+            # default `--parallel` (= 4 cores) ran the 16 GB runner out of RAM at
+            # ~96%, taking the runner agent down ("received a shutdown signal").
+            # Two at a time keeps the peak well under the limit.
+            build_jobs: 2
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so -DOPENSSL_INCLUDE_DIR=/usr/include -DZLIB_LIBRARY=/usr/lib/i386-linux-gnu/libz.so -DZLIB_INCLUDE_DIR=/usr/include"
+
+          # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
+          #      notarized dylib is a separate release build (see header note). --
+          - name: macos
+            os: macos-14
+            platform_id: universal-mac
+            acquire: brew
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON"
+
+          # ---- Windows x86_64 — vcpkg static libtorrent -----------------------
+          - name: windows-x86_64
+            os: windows-2022
+            platform_id: x86_64-win32
+            acquire: vcpkg
+            vcpkg_triplet: x64-windows-static
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON"
+
+          # ---- Windows x86 (32-bit) — vcpkg static + the generated .def -------
+          - name: windows-x86
+            os: windows-2022
+            platform_id: x86-win32
+            acquire: vcpkg
+            vcpkg_triplet: x86-windows-static
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -A Win32"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for package-extension.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Acquire libtorrent (apt, Linux x86_64)
+        if: matrix.acquire == 'apt'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
+
+      - name: Acquire 32-bit toolchain + i386 OpenSSL/zlib (Linux x86)
+        if: matrix.acquire == 'linux32'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          # The 32-bit C/C++ toolchain MUST succeed on its OWN line — it provides
+          # Scrt1.o, crti.o, lib32stdc++, lib32gcc that -m32 needs.
+          sudo apt-get install -y g++-multilib gcc-multilib ninja-build
+          # libtorrent's find_package(OpenSSL)/(ZLIB) must resolve the i386 libs,
+          # not the host amd64 ones, or the -m32 link fails with "file in wrong
+          # format" (it pulled /usr/lib/x86_64-linux-gnu/libssl.so). Install them
+          # REQUIRED; the lane's cmake_args point OPENSSL_*_LIBRARY / ZLIB_LIBRARY
+          # explicitly at /usr/lib/i386-linux-gnu (a targeted override, so Boost's
+          # arch-independent header-only discovery is left untouched). Boost is
+          # header-only for libtorrent's use, so no :i386 Boost is needed.
+          sudo apt-get install -y libssl-dev:i386 zlib1g-dev:i386
+          # libtorrent's find_package(Boost) needs the Boost HEADERS. They are
+          # header-only for libtorrent's use and arch-independent, so the amd64
+          # libboost-dev provides /usr/include/boost for the -m32 build too. (The
+          # runner image ships no Boost, so this MUST be installed explicitly.)
+          sudo apt-get install -y libboost-dev
+
+      - name: Acquire libtorrent (Homebrew, macOS host arch)
+        if: matrix.acquire == 'brew'
+        run: |
+          brew update
+          brew install libtorrent-rasterbar boost ninja
+
+      - name: Set up vcpkg + acquire libtorrent (Windows)
+        if: matrix.acquire == 'vcpkg'
+        shell: pwsh
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          & "$vcpkg\vcpkg.exe" install "libtorrent:${{ matrix.vcpkg_triplet }}"
+          echo "CMAKE_TOOLCHAIN_FILE=$vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+          echo "VCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+            if [ -n "${VCPKG_TARGET_TRIPLET:-}" ]; then
+              EXTRA="$EXTRA -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+            fi
+          fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTORRENTXT_BUILD_TESTS=ON \
+            ${{ matrix.cmake_args }} \
+            $EXTRA
+
+      - name: Build
+        # matrix.build_jobs caps parallelism on the from-source lane to avoid OOM;
+        # the other lanes (prebuilt libtorrent) default to all cores.
+        run: cmake --build build --config Release --parallel ${{ matrix.build_jobs || '4' }}
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Stage per-platform binary
+        shell: bash
+        run: |
+          python3 tools/package-extension.py \
+            --platform-id ${{ matrix.platform_id }} \
+            --build-dir build || \
+            echo "package-extension: nothing to stage."
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: torrentxt-${{ matrix.name }}
+          path: src/code/${{ matrix.platform_id }}/
+          if-no-files-found: ignore
