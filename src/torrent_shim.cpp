@@ -52,6 +52,7 @@
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/alert.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/session_stats.hpp>      /* find_metric_idx + session_stats_alert counters */
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -151,6 +152,21 @@ struct SessionState {
      * btx_pop_alerts that did not fit the caller's buffer, to be emitted FIRST
      * next call. FIFO order preserved (we always drain stash before fresh). */
     std::vector<PendingAlert> stash;
+
+    /* DHT health, refreshed from session_stats. btx_pop_alerts fires
+     * post_session_stats() each poll; the resulting session_stats_alert arrives
+     * on a later drain (captured in extract_alert) and updates these cached
+     * counters, which btx_dht_state then reports synchronously — no blocking
+     * stats round-trip on the getter. A metric index of -1 means this libtorrent
+     * build does not define that counter, so the field stays 0 (graceful). */
+    int statsIdxDhtNodes       = -1;
+    int statsIdxDhtNodeCache   = -1;
+    int statsIdxDhtTorrents    = -1;
+    int statsIdxDhtGlobalNodes = -1;
+    long long dhtNodes       = 0;
+    long long dhtNodeCache   = 0;
+    long long dhtTorrents    = 0;
+    long long dhtGlobalNodes = 0;
 };
 
 /* The two handle tables (plan §5: one for sessions, one for torrents). Sessions
@@ -326,6 +342,7 @@ extern "C" BTX_API int BTX_CALL btx_session_new(void) {
             | lt::alert_category::storage
             | lt::alert_category::tracker
             | lt::alert_category::dht
+            | lt::alert_category::stats          /* session_stats_alert -> DHT counts */
             | lt::alert_category::performance_warning;
         sp.set_int(lt::settings_pack::alert_mask, mask);
 
@@ -342,6 +359,15 @@ extern "C" BTX_API int BTX_CALL btx_session_new(void) {
          * and disk threads — which is exactly why teardown must be explicit. */
         auto state = std::make_unique<SessionState>();
         state->ses = std::make_unique<lt::session>(lt::session_params(sp));
+
+        /* Resolve the session_stats metric indices once, up front; btx_pop_alerts
+         * then keeps the cached DHT counters fresh (see SessionState +
+         * btx_dht_state). find_metric_idx returns -1 for a name this libtorrent
+         * build does not define, which the capture handles gracefully. */
+        state->statsIdxDhtNodes       = lt::find_metric_idx("dht.dht_nodes");
+        state->statsIdxDhtNodeCache   = lt::find_metric_idx("dht.dht_node_cache");
+        state->statsIdxDhtTorrents    = lt::find_metric_idx("dht.dht_torrents");
+        state->statsIdxDhtGlobalNodes = lt::find_metric_idx("dht.dht_global_nodes");
 
         int h = g_sessions.alloc(std::move(state));
         if (h == 0) {
@@ -1008,18 +1034,44 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
      * scalars, and set out.type to our code. Order: most specific first does not
      * matter since alert_cast is exact. */
 
+    /* session_stats_alert is our own post_session_stats() response (see
+     * btx_pop_alerts): capture the DHT counters into the session cache and do
+     * NOT surface it as a user event. */
+    if (auto *p = lt::alert_cast<lt::session_stats_alert>(a)) {
+        auto c = p->counters();
+        auto grab = [&](int idx, long long &dst) {
+            if (idx >= 0 && idx < static_cast<int>(c.size()))
+                dst = static_cast<long long>(c[idx]);
+        };
+        grab(st->statsIdxDhtNodes,       st->dhtNodes);
+        grab(st->statsIdxDhtNodeCache,   st->dhtNodeCache);
+        grab(st->statsIdxDhtTorrents,    st->dhtTorrents);
+        grab(st->statsIdxDhtGlobalNodes, st->dhtGlobalNodes);
+        return false;
+    }
+
     if (auto *p = lt::alert_cast<lt::add_torrent_alert>(a)) {
         out.type = btx::A_TORRENT_ADDED;
         out.torrentId = idForHandle(p->handle);
         out.hasMessage = true; out.message = p->message();
         if (p->error) { out.hasErrorCode = true; out.errorCode = p->error.value();
                         out.hasErrorMessage = true; out.errorMessage = p->error.message(); }
+        else if (auto ti = p->handle.torrent_file()) {
+            /* A .torrent or resume add already has metadata -> surface the name
+             * immediately (a magnet has none yet; it fills in on metadata). */
+            out.hasName = true; out.name = ti->name();
+        }
         return true;
     }
     if (auto *p = lt::alert_cast<lt::metadata_received_alert>(a)) {
         out.type = btx::A_METADATA_RECEIVED;
         out.torrentId = idForHandle(p->handle);
         out.hasMessage = true; out.message = p->message();
+        /* Metadata just arrived: the torrent_info — and thus the real name — is
+         * now available, so a magnet add can stop showing "(pending)". */
+        if (auto ti = p->handle.torrent_file()) {
+            out.hasName = true; out.name = ti->name();
+        }
         return true;
     }
     if (auto *p = lt::alert_cast<lt::piece_finished_alert>(a)) {
@@ -1253,6 +1305,12 @@ extern "C" BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap) {
         SessionState *st = session_for(s);
         if (!st || !st->ses) return 0;  /* no session -> no alerts, harmless */
 
+        /* Drive a session_stats refresh: post now, capture the resulting
+         * session_stats_alert on a later drain (extract_alert), so btx_dht_state
+         * always has fresh DHT counters without a synchronous stats round-trip.
+         * The alert is consumed internally and never surfaced to script. */
+        st->ses->post_session_stats();
+
         /* Build: [alertCount:u16] then alertCount x entry. We backpatch the
          * count, so a buffer that fits only some entries still reports an honest
          * count of what it CONTAINS, and the rest are stashed for next call. */
@@ -1355,18 +1413,18 @@ extern "C" BTX_API int BTX_CALL btx_dht_state(int s, void *out, int cap) {
         SessionState *st = session_for(s);
         if (!st || !st->ses) return 0;  /* no session -> empty record */
 
-        /* A small KV snapshot of DHT health. The authoritative numbers live in
-         * session_stats counters; rather than wire the whole stats machinery for
-         * Phase 2 we emit the fields we can cheaply derive and leave the counts
-         * at 0 where we have no synchronous source. The LCB layer treats absent/
-         * zero gracefully. NOTE (for CI/lead): wiring real node counts needs a
-         * session_stats_alert round-trip or dht_stats — flagged as a follow-up. */
+        /* A small KV snapshot of DHT health, reporting the REAL session_stats
+         * counters cached by btx_pop_alerts (which fires post_session_stats each
+         * poll). The values are 0 until the first stats alert lands a moment after
+         * startup, or where this libtorrent build lacks a given metric; the LCB
+         * layer treats absent/zero gracefully. F_DHT_NODES is the live routing-
+         * table node count (no longer a 0/1 running flag). */
         btx::RecordWriter w(out, cap);
         btx::KVRecord r(w);
-        r.put_int(btx::F_DHT_NODES, st->ses->is_dht_running() ? 1 : 0);
-        r.put_int(btx::F_DHT_NODE_CACHE, 0);
-        r.put_int(btx::F_DHT_GLOBAL_NODES, 0);
-        r.put_int(btx::F_DHT_TORRENTS, 0);
+        r.put_int(btx::F_DHT_NODES, st->dhtNodes);
+        r.put_int(btx::F_DHT_NODE_CACHE, st->dhtNodeCache);
+        r.put_int(btx::F_DHT_GLOBAL_NODES, st->dhtGlobalNodes);
+        r.put_int(btx::F_DHT_TORRENTS, st->dhtTorrents);
         r.finish();
         if (w.overflow()) return -static_cast<int>(w.pos());
         return static_cast<int>(w.pos());
@@ -1446,6 +1504,7 @@ extern "C" BTX_API int BTX_CALL btx_save_resume(int t) {
 
 extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
                                                    int pieceSize, int flags,
+                                                   const char *trackers,
                                                    void *out, int cap) {
     BTX_GUARD_BUFFER({
         if (!contentPath || !*contentPath) { set_error("empty content path"); return 0; }
@@ -1462,6 +1521,26 @@ extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
          * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose. */
         lt::create_torrent ct(fs, pieceSize, lt::create_flags_t{
             static_cast<std::uint32_t>(static_cast<unsigned>(flags))});
+
+        /* Optional announce URLs: a newline-separated list. Each non-empty,
+         * trimmed line becomes its own tracker tier (so they are tried in order);
+         * an absent/empty list yields a trackerless, DHT-only torrent. */
+        if (trackers && *trackers) {
+            std::string all(trackers);
+            size_t start = 0;
+            int tier = 0;
+            while (start <= all.size()) {
+                size_t nl = all.find('\n', start);
+                std::string line = all.substr(
+                    start, nl == std::string::npos ? std::string::npos : nl - start);
+                size_t b = line.find_first_not_of(" \t\r");
+                size_t e = line.find_last_not_of(" \t\r");
+                if (b != std::string::npos)
+                    ct.add_tracker(line.substr(b, e - b + 1), tier++);
+                if (nl == std::string::npos) break;
+                start = nl + 1;
+            }
+        }
 
         /* set_piece_hashes needs the PARENT directory of the content so it can
          * open the files; derive it from contentPath. */

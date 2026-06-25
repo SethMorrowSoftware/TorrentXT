@@ -404,13 +404,24 @@ static void test_drain_oversized_makes_progress() {
     int s = btx_session_new();
     CHECK(s > 0);
 
-    /* Build a .torrent for the file, then add it. */
+    /* btx_dht_state on a LIVE session returns a non-empty record (the four DHT
+     * count fields); the counts may be 0 until the first session_stats lands, but
+     * the record itself must be present and well-formed. */
+    {
+        char dbuf[256];
+        CHECK(btx_dht_state(s, dbuf, sizeof dbuf) > 0);
+    }
+
+    /* Build a .torrent for the file (with a couple of announce URLs, exercising
+     * the newline-separated tracker list), then add it. */
+    const char *trackers = "udp://tracker.example.com:1337/announce\n"
+                           "http://tracker2.example.com/announce";
     std::vector<char> tbuf(65536);
-    int n = btx_create_torrent(file.string().c_str(), 16384, 0,
+    int n = btx_create_torrent(file.string().c_str(), 16384, 0, trackers,
                                tbuf.data(), static_cast<int>(tbuf.size()));
     if (n < 0) {
         tbuf.resize(static_cast<size_t>(-n));
-        n = btx_create_torrent(file.string().c_str(), 16384, 0,
+        n = btx_create_torrent(file.string().c_str(), 16384, 0, trackers,
                                tbuf.data(), static_cast<int>(tbuf.size()));
     }
     CHECK(n > 0);

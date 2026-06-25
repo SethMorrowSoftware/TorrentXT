@@ -274,12 +274,13 @@ Add a DHT bootstrap node (host + UDP port) to seed the routing table.
  6881`.
 
 ### `btDhtState(in pSession as Integer) returns Array`
-A snapshot of DHT routing-table state as an `Array` keyed `nodes`, `nodeCache`,
-`globalNodes`, `torrents`. Empty array if DHT is off or on a bad handle.
-- **Note:** these keys exist in the record schema (field ids `100..103`), but
- whether they carry **real** counts depends on the shim populating them from
- libtorrent's `dht_stats` / `session_stats`; treat the populated values as
- shim-dependent until confirmed in an OXT pass.
+A snapshot of DHT health as an `Array` keyed `nodes`, `nodeCache`, `globalNodes`,
+`torrents`. Empty array only on a bad/dead session handle (when DHT is simply
+idle the counts read `0`).
+- **Note:** `nodes` is the live routing-table node count — it climbs from `0` as
+ the DHT bootstraps after the first add. All four come from libtorrent's
+ `session_stats` counters, which the shim refreshes once per `btPoll`; a counter
+ a given libtorrent build does not expose stays `0`.
 - **Usage:** function - `put btDhtState(sSession) into tDht`.
 
 ### `btDhtSaveState(in pSession as Integer) returns Data`
@@ -296,13 +297,14 @@ Restore DHT routing-table state from bytes previously produced by
 
 ## Create (seeding side)
 
-### `btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer) returns Data`
+### `btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer, in pTrackers as String) returns Data`
 Build a `.torrent` for `pContentPath` (a file or a directory) and return its
 bencoded bytes as `Data`. `pPieceSize` of `0` means **auto**. `pFlags` is passed
-through to libtorrent's create-torrent flags. An optional `"creator"` / `"comment"`
-can be set via the string settings before the call. Empty `Data` on failure
-(`btLastError()`).
-- **Usage:** function - `put btCreateTorrent(tPath, 0, 0) into tTorrentBytes`,
+through to libtorrent's create-torrent flags. `pTrackers` is an optional
+newline-separated list of announce URLs (empty = a trackerless, DHT-only
+torrent); each non-empty line becomes its own tracker tier, in order. Empty
+`Data` on failure (`btLastError()`).
+- **Usage:** function - `put btCreateTorrent(tPath, 0, 0, "udp://tr.example:1337/announce") into tTorrentBytes`,
  then `put tTorrentBytes into url ("binfile:" & tOut)`.
 
 ---
@@ -390,9 +392,9 @@ arithmetic.
 | `globalNodes` | 102 | int (64-bit) | estimated DHT size |
 | `torrents` | 103 | int | torrents tracked in the DHT |
 
-> These four keys are defined in the schema but their population is
-> shim-dependent (see `btDhtState` above) - confirm with an OXT pass before
-> relying on exact counts.
+> These four keys are populated from libtorrent's `session_stats` counters,
+> refreshed once per `btPoll`; `nodes` is the routing-table count (no longer a
+> 0/1 flag). A counter a given libtorrent build omits stays `0`.
 
 ### State int -> label (`btStateName`)
 
