@@ -128,6 +128,9 @@ command tcBuildUI
    set the textFont of field "tcTorrents" to "Courier"
    set the textSize of field "tcHeader" to 11
    set the textSize of field "tcTorrents" to 11
+   -- a pale selection color keeps the state-colored row text legible when a row
+   -- is hilited; the default system hilite is too dark for the colored text.
+   set the hiliteColor of field "tcTorrents" to "200,221,242"
    -- per-torrent controls (row 1)
    tcMakeButton "tcPause", "Pause", "16,364,104,390"
    tcMakeButton "tcResume", "Resume", "108,364,196,390"
@@ -660,6 +663,9 @@ command tcRefreshOnce
    if sSession is 0 or sSession is empty then
       exit tcRefreshOnce
    end if
+   -- collapse the whole rebuild (text + per-line colors + hilite + totals) into
+   -- a single repaint; without this the list visibly flickers on every poll.
+   lock screen
    put tcSelectedHandle() into tSelH      -- remember the selection across the rebuild
    put btTorrentCount(sSession) into tCount
    put "" into tRows
@@ -722,6 +728,7 @@ command tcRefreshOnce
    put tLineNum && "torrents     down" && tcFmtBytes(tDown) & "/s     up" && tcFmtBytes(tUp) & "/s" \
       && "    " & tDht into field "tcTotals"
    tcUpdateDetail tSelH
+   unlock screen
 end tcRefreshOnce
 
 -- A one-line detail readout for the selected torrent: info-hash, save path, ETA,
