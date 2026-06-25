@@ -14,31 +14,59 @@ local sActiveTorrent    -- the torrent we are tracking in the dashboard
 
 -- ------------------------------------------------------------ lifecycle
 on openStack
-   -- btStartSession verifies the ABI internally and refuses a 2nd session.
-   btStartSession
-   put the result into sSession
-   if sSession is 0 then
-      answer "TorrentXT failed to start:" && btLastError()
+   -- The native library stays loaded across stack opens and permits only ONE live
+   -- session (there is no deterministic unload hook - plan section 4.2). So
+   -- re-opening this stack without a clean close would otherwise hit "a session is
+   -- already live". ensureSession adopts the session we started last time instead
+   -- of blindly starting a second one.
+   ensureSession
+   if sSession is empty or sSession is 0 then
       exit openStack
    end if
-   -- a couple of sane defaults; keys map to libtorrent settings_pack names
-   btSetBool sSession, "enable_dht", true
-   btSetBool sSession, "enable_lsd", true
    -- drive events to this card; 250 ms drain is plenty for a UI
    btStartPolling sSession, the long id of this card, 250
    -- low-rate dashboard refresh (<= 4 Hz), the cheap way to show progress
    send "refreshDashboard" to me in 500 milliseconds
 end openStack
 
+-- Acquire THE session: reuse the one we remember if it is still live in the
+-- loaded library, otherwise start a fresh one. The handle is kept in the stack
+-- custom property `uSession` so it survives a script-local reset (e.g. an edit +
+-- recompile that does not fire closeStack). A remembered handle is probed with a
+-- cheap setting write - btSetBool returns 0 only for a live session - so a stale
+-- handle from a previous IDE run is harmlessly rejected and we start clean.
+command ensureSession
+   local tRemembered
+   put the uSession of this stack into tRemembered
+   if tRemembered is a number and tRemembered > 0 \
+         and btSetBool(tRemembered, "enable_dht", true) is 0 then
+      put tRemembered into sSession
+   else
+      btStartSession  -- verifies the ABI; returns 0 + sets btLastError on failure
+      put the result into sSession
+      if sSession is 0 then
+         answer "TorrentXT failed to start:" && btLastError()
+         set the uSession of this stack to empty
+         exit ensureSession
+      end if
+      btSetBool sSession, "enable_dht", true
+      set the uSession of this stack to sSession
+   end if
+   -- a sane default that is cheap to (re)assert whether adopted or fresh
+   btSetBool sSession, "enable_lsd", true
+end ensureSession
+
 on closeStack
    -- MUST shut down explicitly: there is no deterministic extension-unload hook
-   -- (plan section 4.2). Stop polling first, then pause/flush/destroy the session.
+   -- (plan section 4.2). Stop polling first, then pause/flush/destroy the session,
+   -- and forget the remembered handle so the next open starts clean.
    btStopPolling
    if sSession is not empty and sSession is not 0 then
       btStopSession sSession
    end if
    put empty into sSession
    put empty into sActiveTorrent
+   set the uSession of this stack to empty
 end closeStack
 
 -- ------------------------------------------------------------ commands

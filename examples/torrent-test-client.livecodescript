@@ -125,27 +125,41 @@ end mouseUp
 
 -- ---- session lifecycle ------------------------------------------------------
 command ttEnsureSession
-   local tErr
+   local tErr, tRemembered
    if sSession is not empty and sSession is not 0 then
       exit ttEnsureSession
    end if
-   try
-      btStartSession
-      put the result into sSession
-   catch tErr
-      ttLogMsg "Could not start TorrentXT:" && tErr
-      ttLogMsg "The native library is missing. Place torrentxt.dll in src/code/x86_64-win32/ (see docs/building.md)."
-      put 0 into sSession
-      exit ttEnsureSession
-   end try
-   if sSession is 0 or sSession is empty then
-      ttLogMsg "btStartSession returned 0:" && btLastError()
-      put 0 into sSession
-      exit ttEnsureSession
+   -- The library stays loaded across stack opens and permits only ONE live
+   -- session, so adopt the one we started last time (remembered in the stack
+   -- custom property `uSession`) rather than wedging on "a session is already
+   -- live". Probe it first - btSetBool returns 0 only for a live session - so a
+   -- stale handle from a previous IDE run is rejected and we start clean.
+   put the uSession of this stack into tRemembered
+   if tRemembered is a number and tRemembered > 0 \
+         and btSetBool(tRemembered, "enable_dht", true) is 0 then
+      put tRemembered into sSession
+      ttLogMsg "Re-adopted the still-live session (handle" && sSession & ")."
+   else
+      try
+         btStartSession
+         put the result into sSession
+      catch tErr
+         ttLogMsg "Could not start TorrentXT:" && tErr
+         ttLogMsg "The native library is missing. Place torrentxt.dll in src/code/x86_64-win32/ (see docs/building.md)."
+         put 0 into sSession
+         exit ttEnsureSession
+      end try
+      if sSession is 0 or sSession is empty then
+         ttLogMsg "btStartSession returned 0:" && btLastError()
+         put 0 into sSession
+         set the uSession of this stack to empty
+         exit ttEnsureSession
+      end if
+      btSetBool sSession, "enable_dht", true
+      set the uSession of this stack to sSession
+      ttLogMsg "Session started (handle" && sSession & "). DHT/LSD on."
    end if
-   btSetBool sSession, "enable_dht", true
    btSetBool sSession, "enable_lsd", true
-   ttLogMsg "Session started (handle" && sSession & "). DHT/LSD on."
    put "true" into sPolling
    send "ttPollOnce" to me in 0 milliseconds
    send "ttRefreshDashboard" to me in 500 milliseconds
@@ -158,6 +172,7 @@ command ttShutdown
    end if
    put empty into sSession
    put empty into sActiveTorrent
+   set the uSession of this stack to empty
 end ttShutdown
 
 -- ---- add a magnet -----------------------------------------------------------
