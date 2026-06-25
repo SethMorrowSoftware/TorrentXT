@@ -32,7 +32,7 @@ end openStack
 
 on closeStack
    -- MUST shut down explicitly: there is no deterministic extension-unload hook
-   -- (plan §4.2). Stop polling first, then pause/flush/destroy the session.
+   -- (plan section 4.2). Stop polling first, then pause/flush/destroy the session.
    btStopPolling
    if sSession is not empty and sSession is not 0 then
       btStopSession sSession

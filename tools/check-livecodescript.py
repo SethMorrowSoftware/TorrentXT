@@ -44,6 +44,10 @@ class Problem:
 
 
 def find_smart_quotes(path, text):
+    """Flag any non-ASCII byte. Smart quotes (the common case) fail OXT
+    compilation outright; the broader rule is that OXT source is pure ASCII -
+    the proven sibling extensions contain zero non-ASCII bytes - so even a stray
+    en-dash or section sign in a comment is off-convention and is reported."""
     out = []
     for i, line in enumerate(text.splitlines(), 1):
         for col, ch in enumerate(line, 1):
@@ -51,6 +55,10 @@ def find_smart_quotes(path, text):
                 out.append(Problem(path, i,
                            "smart quote %s (U+%04X) at col %d - OXT rejects it; use ASCII"
                            % (SMART_QUOTES[ch], ord(ch), col)))
+            elif ord(ch) > 127:
+                out.append(Problem(path, i,
+                           "non-ASCII character %r (U+%04X) at col %d - OXT source "
+                           "must be pure ASCII; replace it" % (ch, ord(ch), col)))
     return out
 
 

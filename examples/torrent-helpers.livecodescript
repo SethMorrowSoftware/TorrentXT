@@ -1,11 +1,11 @@
 script "torrentHelpers"
 
 -- torrent-helpers.livecodescript - the script-side poll dispatcher and sugar
--- for TorrentXT (plan §3). Insert this script into the message path (e.g.
+-- for TorrentXT (plan section 3). Insert this script into the message path (e.g.
 -- `start using stack "torrentHelpers"` or as a behavior) so any stack can drive
 -- the engine with plain event handlers instead of a manual poll loop.
 --
--- The model (plan §3, carried verbatim from ShowControl): the engine NEVER
+-- The model (plan section 3, carried verbatim from ShowControl): the engine NEVER
 -- calls back into script. libtorrent buffers every event on its own threads;
 -- we drain that buffer on a timer with ONE FFI round-trip (btPoll), then `send`
 -- one semantic message per event. Throughput and event integrity are

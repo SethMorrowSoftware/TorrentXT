@@ -195,7 +195,7 @@ private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSi
 -- ===================================================================== --
 
 -- Throw a clear error if the loaded native library's ABI does not match this
--- binding (plan §4.5). Better a legible throw at startup than a crash later.
+-- binding (plan section 4.5). Better a legible throw at startup than a crash.
 private handler _checkABI()
    variable tABI as Integer
    unsafe
