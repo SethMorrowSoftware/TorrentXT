@@ -16,9 +16,13 @@
 #                     one platform never masks another. Each lane uploads its
 #                     built lib as the artifact native-<platform-id>.
 #
-#   commit-binaries : on push, gather every built lib and commit it into its
-#                     src/code/<arch-platform>/ folder ([skip ci], so no loop) so
-#                     the repo ships ready-to-use native libraries.
+#   commit-binaries : on push TO main, gather every built lib and commit it into
+#                     its src/code/<arch-platform>/ folder ([skip ci], so no loop)
+#                     so the repo ships ready-to-use native libraries. Gated to
+#                     main on purpose: CI builds are not byte-reproducible, so
+#                     committing them on every feature branch makes each branch's
+#                     binaries collide with main's (an add/add binary conflict that
+#                     blocks the merge). Binaries land once, on main, after merge.
 #
 # NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
 # binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
@@ -258,14 +262,16 @@ jobs:
     #
     # NOTE: requires the repo's Actions setting "Workflow permissions" =
     # "Read and write permissions" (Settings > Actions > General) for the
-    # GITHUB_TOKEN push to succeed. To reduce churn you can gate this to one
-    # branch by changing the `if:` below to e.g.
-    #   github.ref == 'refs/heads/main'.
+    # GITHUB_TOKEN push to succeed.
+    # Gated to main (not every branch): CI builds are not byte-reproducible, so a
+    # per-branch binary commit collides with main's binaries and blocks the PR
+    # merge with an unresolvable add/add binary conflict. Binaries are refreshed
+    # once, on main, right after a merge.
     # macOS note: the staged universal-mac lib is the CI HOST arch (arm64) only;
     # the true universal+notarized dylib is a separate release build.
     name: commit native libs to src/code
     needs: build-matrix
-    if: always() && github.event_name == 'push'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
