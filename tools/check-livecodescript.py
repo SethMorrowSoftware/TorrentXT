@@ -294,6 +294,28 @@ def check_lcb_constants(path, cleaned):
     return problems
 
 
+# LCB-only constructs that look like LiveCode Script but are NOT valid LCB.
+# `the empty data` IS valid (used in the sibling midi.lcb); the list/array empties
+# are NOT - LCB requires the literals `[]` and `{}` (confirmed against the LCB
+# Language Reference). This catches the class locally so it never reaches an OXT
+# compile again.
+LCB_ANTIPATTERNS = [
+    (re.compile(r"\bthe\s+empty\s+list\b"),
+     "`the empty list` is not valid LCB - use the list literal `[]`"),
+    (re.compile(r"\bthe\s+empty\s+array\b"),
+     "`the empty array` is not valid LCB - use the array literal `{}`"),
+]
+
+
+def check_lcb_antipatterns(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        for pat, msg in LCB_ANTIPATTERNS:
+            if pat.search(line):
+                problems.append(Problem(path, lineno, msg))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -313,6 +335,7 @@ def check_file(path):
     if is_lcb:
         problems += check_lcb_blocks(path, cleaned)
         problems += check_lcb_constants(path, cleaned)
+        problems += check_lcb_antipatterns(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
     return problems
