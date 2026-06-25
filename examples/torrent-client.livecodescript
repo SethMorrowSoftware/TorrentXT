@@ -357,7 +357,7 @@ function tcFindByHash pHash
       return 0
    end if
    put btTorrentCount(sSession) into tCount
-   repeat with tI from 0 to (tCount - 1)
+   repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is not 0 and toLower(btInfoHash(tH)) is toLower(pHash) then
          return tH
@@ -436,7 +436,7 @@ command tcAllTorrents pAction
       exit tcAllTorrents
    end if
    put btTorrentCount(sSession) into tCount
-   repeat with tI from 0 to (tCount - 1)
+   repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is not 0 then
          if pAction is "pause" then
@@ -617,7 +617,7 @@ command tcRefreshOnce
    put empty into tNewMap
    put 0 into tLineNum
    put empty into tSelLine
-   repeat with tI from 0 to (tCount - 1)
+   repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is 0 then
          next repeat
