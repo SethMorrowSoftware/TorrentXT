@@ -53,6 +53,9 @@ on mouseUp
       case "tcAddFile"
          tcAddTorrentFile
          break
+      case "tcBrowse"
+         tcBrowseSave
+         break
       case "tcSeed"
          tcCreateAndSeed
          break
@@ -152,6 +155,8 @@ command tcBuildUI
       exit tcBuildUI
    end if
    lock screen
+   set the backgroundColor of this card to "237,239,243"
+   set the title of this stack to "TorrentXT Client"
    set the width of this stack to 860
    -- vertically resizable: lock the width, remember the user's height across runs,
    -- and let the table + log share the extra space (see resizeStack / tcRelayout).
@@ -163,14 +168,23 @@ command tcBuildUI
    else
       set the height of this stack to 712
    end if
-   tcMakeLabel "tcTitle", "TorrentXT Client - multi-torrent demo", "16,8,600,30", 16
+   -- a full-width brand title bar
+   tcMakeLabel "tcTitle", "  TorrentXT Client", "0,0,860,34", 16
+   set the opaque of field "tcTitle" to true
+   set the backgroundColor of field "tcTitle" to "44,90,160"
+   set the foregroundColor of field "tcTitle" to "255,255,255"
+   set the textStyle of field "tcTitle" to "bold"
+   tcMakeLabel "tcSubtitle", "BitTorrent for OpenXTalk - powered by libtorrent  ", "440,9,840,29", 11
+   set the foregroundColor of field "tcSubtitle" to "208,221,240"
+   set the textAlign of field "tcSubtitle" to "right"
    -- add row
    tcMakeField "tcInput", "16,38,560,64", false
    tcMakeButton "tcAdd", "Add", "568,38,650,64"
    tcMakeButton "tcAddFile", "Open .torrent", "658,38,844,64"
-   -- save + seed row
+   -- save + seed row (Browse picks the download folder)
    tcMakeLabel "tcSaveLabel", "Save to:", "16,72,66,92", 11
-   tcMakeField "tcSavePath", "70,70,560,94", false
+   tcMakeField "tcSavePath", "70,70,470,94", false
+   tcMakeButton "tcBrowse", "Browse...", "474,70,558,94"
    tcMakeButton "tcSeed", "Create + Seed Folder", "568,70,844,94"
    -- table header + selectable list (double-click a row to open its folder)
    tcMakeLabel "tcHeader", \
@@ -188,6 +202,11 @@ command tcBuildUI
    -- a pale selection color keeps the state-colored row text legible when a row
    -- is hilited; the default system hilite is too dark for the colored text.
    set the hiliteColor of field "tcTorrents" to "200,221,242"
+   -- a styled header bar frames the table
+   set the opaque of field "tcHeader" to true
+   set the backgroundColor of field "tcHeader" to "216,221,230"
+   set the foregroundColor of field "tcHeader" to "28,38,58"
+   set the textStyle of field "tcHeader" to "bold"
    -- per-torrent controls (row 1)
    tcMakeButton "tcPause", "Pause", "16,364,104,390"
    tcMakeButton "tcResume", "Resume", "108,364,196,390"
@@ -208,6 +227,9 @@ command tcBuildUI
    -- detail line for the selected torrent, then session totals
    tcMakeLabel "tcDetail", "Select a torrent to see its details.", "16,430,844,450", 10
    tcMakeLabel "tcTotals", "", "16,454,844,474", 11
+   set the opaque of field "tcTotals" to true
+   set the backgroundColor of field "tcTotals" to "224,228,235"
+   set the textStyle of field "tcTotals" to "bold"
    -- event log
    tcMakeList "tcLog", "16,480,844,702", true
    -- defaults (restore the remembered save path + upload cap if present)
@@ -222,6 +244,27 @@ command tcBuildUI
    else
       put "0" into field "tcUpLimit"
    end if
+   -- tooltips: an affordance hint on every control
+   set the tooltip of field "tcInput" to "Paste a magnet link, an http(s) .torrent URL, a local .torrent path, or a 40-char info-hash"
+   set the tooltip of button "tcAdd" to "Add the torrent in the box (or press Enter)"
+   set the tooltip of button "tcAddFile" to "Choose a .torrent file from disk"
+   set the tooltip of field "tcSavePath" to "Folder where downloads are saved"
+   set the tooltip of button "tcBrowse" to "Choose the download folder"
+   set the tooltip of button "tcSeed" to "Build a .torrent from a folder and start seeding it"
+   set the tooltip of button "tcPause" to "Pause the selected torrent (or press Space)"
+   set the tooltip of button "tcResume" to "Resume the selected torrent (or press Space)"
+   set the tooltip of button "tcRecheck" to "Re-verify the selected torrent's files on disk"
+   set the tooltip of button "tcReannounce" to "Re-announce the selected torrent to its trackers"
+   set the tooltip of button "tcRemove" to "Remove the selected torrent, keeping files (or press Delete)"
+   set the tooltip of button "tcRemoveData" to "Remove the selected torrent AND delete its files"
+   set the tooltip of button "tcOpenFolder" to "Open the selected torrent's folder (or double-click a row)"
+   set the tooltip of button "tcCopyMagnet" to "Copy a magnet link for the selected torrent"
+   set the tooltip of button "tcSaveResume" to "Flush fast-resume data for the selected torrent"
+   set the tooltip of button "tcPauseAll" to "Pause every torrent"
+   set the tooltip of button "tcResumeAll" to "Resume every torrent"
+   set the tooltip of field "tcUpLimit" to "Global upload cap in KB/s (0 = unlimited)"
+   set the tooltip of button "tcApplyLimit" to "Apply the upload cap"
+   set the tooltip of field "tcTorrents" to "Select a torrent. Space pauses/resumes, Delete removes, double-click opens its folder."
    tcRelayout
    unlock screen
    tcLogMsg "Client built. Add takes a magnet, a .torrent path, an http(s) .torrent URL, or a 40-hex info-hash."
@@ -483,6 +526,18 @@ command tcCreateAndSeed
    tcReportAdd btAddTorrentFile(sSession, tData, tParent), "seed of" && tPath
 end tcCreateAndSeed
 
+-- Pick the download folder with the native chooser; update the field and
+-- remember it for next launch.
+command tcBrowseSave
+   answer folder "Choose the download folder:"
+   if it is empty then
+      exit tcBrowseSave
+   end if
+   put it into field "tcSavePath"
+   set the uSavePath of this stack to it
+   tcLogMsg "Save folder set to" && it
+end tcBrowseSave
+
 -- Look for an existing torrent with this (v1, hex) info-hash. If found, select it
 -- and return its handle; else return 0. "" hash -> 0 (cannot pre-check).
 function tcDupCheck pHash
@@ -580,7 +635,7 @@ command tcControlSelected pAction
    -- after a removal the row indices shift; keep a neighbouring row selected so
    -- the per-torrent buttons stay live and the user keeps their place.
    if pAction is "remove" or pAction is "removeData" then
-      put the number of lines of field "tcTorrents" into tLeft
+      put btTorrentCount(sSession) into tLeft
       if tLeft > 0 then
          if tLine is not a number then
             put 1 into tLine
@@ -862,6 +917,11 @@ command tcRefreshOnce
       delete the last char of tRows
    end if
    set the text of field "tcTorrents" to tRows
+   if tLineNum is 0 then
+      set the text of field "tcTorrents" to \
+         "   No torrents yet - paste a magnet or .torrent above, or Create + Seed a folder."
+      set the foregroundColor of line 1 of field "tcTorrents" to "130,130,130"
+   end if
    if tSelLine is not empty then
       set the hilitedLines of field "tcTorrents" to tSelLine
    end if
