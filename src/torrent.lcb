@@ -963,7 +963,13 @@ public handler btPoll(in pSession as Integer) returns List
    if tCount <= 0 then
       return tEvents
    end if
-   put _bufToData(sDrainPtr, tCount) into tBuf
+   -- IMPORTANT: btx_pop_alerts is the ONE buffer call that returns the ALERT
+   -- COUNT on success, not a byte length (every other btx_* returns bytes). So
+   -- copy the WHOLE buffer and let the on-wire framing bound the walk - the
+   -- [alertCount:u16] header below is the loop count and each record carries its
+   -- own bodyLen. The records sit at the front, so the loop stops after
+   -- alertCount of them and the unused tail is never touched.
+   put _bufToData(sDrainPtr, sDrainCap) into tBuf
    put 1 into tOffset
    put _readU16(tBuf, tOffset) into tAlertCount
    add 2 to tOffset
