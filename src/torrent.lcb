@@ -415,7 +415,7 @@ end handler
 -- field-id -> key mapping. Raw fields become Data; everything else a String
 -- (which keeps 64-bit ints and hashes lossless). pEndOut returns the offset
 -- just past the record so callers can chain.
-private handler _parseRecord(in pData as Data, in pStart as Integer, out rEnd as Integer) returns Array
+private handler _parseRecord(in pData as Data, in pStart as Integer) returns Array
    variable tRec as Array
    variable tOffset as Integer
    variable tCount as Integer
@@ -424,7 +424,7 @@ private handler _parseRecord(in pData as Data, in pStart as Integer, out rEnd as
    variable tType as Integer
    variable tLen as Integer
    variable tKey as String
-   put the empty array into tRec
+   put {} into tRec
    put pStart into tOffset
    put _readU16(pData, tOffset) into tCount
    add 2 to tOffset
@@ -448,7 +448,6 @@ private handler _parseRecord(in pData as Data, in pStart as Integer, out rEnd as
       end if
       add tLen to tOffset
    end repeat
-   put tOffset into rEnd
    return tRec
 end handler
 
@@ -698,7 +697,6 @@ end handler
 -- totalDone, numPeers, savePath, infoHashV1, ...). Empty array on a bad handle.
 public handler btTorrentStatus(in pTorrent as Integer) returns Array
    variable tCount as Integer
-   variable tEnd as Integer
    _ensureBuffers()
    unsafe
       put _btx_torrent_status(pTorrent, sStatus, the number of bytes in sStatus) into tCount
@@ -710,9 +708,9 @@ public handler btTorrentStatus(in pTorrent as Integer) returns Array
       end unsafe
    end if
    if tCount <= 0 then
-      return the empty array
+      return {}
    end if
-   return _parseRecord(sStatus, 1, tEnd)
+   return _parseRecord(sStatus, 1)
 end handler
 
 public handler btTorrentCount(in pSession as Integer) returns Integer
@@ -775,10 +773,10 @@ public handler btPeerList(in pTorrent as Integer) returns List
    variable tCount as Integer
    variable tOffset as Integer
    variable tPeerCount as Integer
-   variable tEnd as Integer
+   variable tBodyLen as Integer
    variable tPeer as Array
    variable i as Integer
-   put the empty list into tPeers
+   put [] into tPeers
    _ensureBuffers()
    unsafe
       put _btx_peer_list(pTorrent, sStatus, the number of bytes in sStatus) into tCount
@@ -796,11 +794,11 @@ public handler btPeerList(in pTorrent as Integer) returns List
    put _readU16(sStatus, tOffset) into tPeerCount
    add 2 to tOffset
    repeat with i from 1 up to tPeerCount
-      -- each entry is [bodyLen:u16][kvrecord]; skip the bodyLen, parse the body
-      add 2 to tOffset
-      put _parseRecord(sStatus, tOffset, tEnd) into tPeer
+      -- entry := [bodyLen:u16][kvrecord]; advance by the on-wire bodyLen
+      put _readU16(sStatus, tOffset) into tBodyLen
+      put _parseRecord(sStatus, tOffset + 2) into tPeer
       push tPeer onto tPeers
-      put tEnd into tOffset
+      add (2 + tBodyLen) to tOffset
    end repeat
    return tPeers
 end handler
@@ -819,10 +817,10 @@ public handler btPoll(in pSession as Integer) returns List
    variable tOffset as Integer
    variable tAlertCount as Integer
    variable tType as Integer
-   variable tEnd as Integer
+   variable tBodyLen as Integer
    variable tEvent as Array
    variable i as Integer
-   put the empty list into tEvents
+   put [] into tEvents
    _ensureBuffers()
    unsafe
       put _btx_pop_alerts(pSession, sDrain, the number of bytes in sDrain) into tCount
@@ -843,12 +841,12 @@ public handler btPoll(in pSession as Integer) returns List
    repeat with i from 1 up to tAlertCount
       -- entry := [alertType:u16][bodyLen:u16][kvrecord]
       put _readU16(sDrain, tOffset) into tType
-      add 4 to tOffset
-      put _parseRecord(sDrain, tOffset, tEnd) into tEvent
+      put _readU16(sDrain, tOffset + 2) into tBodyLen
+      put _parseRecord(sDrain, tOffset + 4) into tEvent
       put tType into tEvent["code"]
       put _alertName(tType) into tEvent["name"]
       push tEvent onto tEvents
-      put tEnd into tOffset
+      add (4 + tBodyLen) to tOffset
    end repeat
    return tEvents
 end handler
@@ -867,15 +865,14 @@ end handler
 
 public handler btDhtState(in pSession as Integer) returns Array
    variable tCount as Integer
-   variable tEnd as Integer
    _ensureBuffers()
    unsafe
       put _btx_dht_state(pSession, sStatus, the number of bytes in sStatus) into tCount
    end unsafe
    if tCount <= 0 then
-      return the empty array
+      return {}
    end if
-   return _parseRecord(sStatus, 1, tEnd)
+   return _parseRecord(sStatus, 1)
 end handler
 
 -- Opaque DHT routing-table state for persistence across runs.
