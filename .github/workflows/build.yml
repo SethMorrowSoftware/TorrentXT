@@ -16,9 +16,17 @@
 #                     one platform never masks another. Each lane uploads its
 #                     built lib as the artifact native-<platform-id>.
 #
-#   commit-binaries : on push, gather every built lib and commit it into its
-#                     src/code/<arch-platform>/ folder ([skip ci], so no loop) so
-#                     the repo ships ready-to-use native libraries.
+#   commit-binaries : on push TO main, gather the built libs and commit the
+#                     SELF-CONTAINED ones into src/code/<arch-platform>/ ([skip ci],
+#                     so no loop) so the repo ships ready-to-use native libraries.
+#                     Two gates: (1) main only - CI builds are not byte-reproducible,
+#                     so a per-branch binary commit collides with main's (an add/add
+#                     binary conflict that blocks the merge); binaries land once, on
+#                     main, after merge. (2) self-contained only - a lib that
+#                     dynamically links system/Homebrew libtorrent (the apt-linux-x64
+#                     and host-arch macOS lanes) would NOT load on a user machine, so
+#                     it is skipped; the macOS universal/notarized dylib and any
+#                     static x64-linux lib come from the release build (building.md).
 #
 # NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
 # binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
@@ -258,14 +266,16 @@ jobs:
     #
     # NOTE: requires the repo's Actions setting "Workflow permissions" =
     # "Read and write permissions" (Settings > Actions > General) for the
-    # GITHUB_TOKEN push to succeed. To reduce churn you can gate this to one
-    # branch by changing the `if:` below to e.g.
-    #   github.ref == 'refs/heads/main'.
+    # GITHUB_TOKEN push to succeed.
+    # Gated to main (not every branch): CI builds are not byte-reproducible, so a
+    # per-branch binary commit collides with main's binaries and blocks the PR
+    # merge with an unresolvable add/add binary conflict. Binaries are refreshed
+    # once, on main, right after a merge.
     # macOS note: the staged universal-mac lib is the CI HOST arch (arm64) only;
     # the true universal+notarized dylib is a separate release build.
     name: commit native libs to src/code
     needs: build-matrix
-    if: always() && github.event_name == 'push'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -278,22 +288,47 @@ jobs:
         with:
           path: _artifacts
           pattern: native-*
-      - name: Place each lib into its src/code/<arch-platform>/ folder
+      - name: Place each SELF-CONTAINED lib into its src/code/<arch-platform>/ folder
         run: |
+          # Only commit libraries that actually load standalone on a user machine.
+          # A lane that dynamically links system/Homebrew libtorrent produces a
+          # NON-distributable artifact (it needs that exact dev package installed),
+          # so we refuse to ship it. Decided per-file by inspection, not by a
+          # platform allow-list, so a lane that later static-links is picked up
+          # automatically:
+          #   *.dll  : Windows uses the vcpkg *-static triplet -> self-contained.
+          #   *.so   : commit only if it does NOT dynamically NEED libtorrent
+          #            (OpenSSL/libc are fine - present on every target).
+          #   *.dylib: never from CI. The macOS artifact is the host arch (arm64)
+          #            linked against Homebrew; the real universal + codesigned +
+          #            notarized dylib is a separate release build that owns the
+          #            Apple credentials (docs/building.md "macOS - universal +
+          #            codesign/notarize").
           shopt -s nullglob
           placed=0
           for dir in _artifacts/native-*/; do
             id="${dir#_artifacts/native-}"; id="${id%/}"
-            mkdir -p "src/code/$id"
             for f in "$dir"*; do
+              base="$(basename "$f")"
+              case "$base" in
+                *.dylib)
+                  echo "SKIP src/code/$id/$base - macOS CI artifact is host-arch + Homebrew-linked, not a distributable universal/notarized build (see docs/building.md)."
+                  continue ;;
+                *.so)
+                  if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libtorrent'; then
+                    echo "SKIP src/code/$id/$base - dynamically links system libtorrent (not self-contained); static-link this lane to ship it."
+                    continue
+                  fi ;;
+              esac
+              mkdir -p "src/code/$id"
               cp "$f" "src/code/$id/"
-              echo "placed src/code/$id/$(basename "$f")"
+              echo "placed src/code/$id/$base"
               placed=1
             done
           done
           rm -rf _artifacts
           if [ "$placed" = 0 ]; then
-            echo "No native-lib artifacts found (all builds may have failed)."
+            echo "No self-contained native-lib artifacts to commit (skipped non-distributable ones above)."
           fi
       - name: Commit refreshed binaries (skip CI to avoid a loop)
         run: |

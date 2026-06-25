@@ -6,10 +6,16 @@ library org.openxtalk.library.torrent
 -- that hides every handle, pre-sizes and reuses the poll/status buffers, walks
 -- the big-endian KV records by byte arithmetic, and never throws into script.
 --
--- The FFI idiom here is the PROVEN ShowControl/midi.lcb pattern (confirmed):
---   * a pre-sized `Data` passed positionally where a `Pointer` is expected
---     bridges to the pointer to its bytes; C fills it and returns bytes-written
---     (or the negative of the capacity it needed, so we grow and retry).
+-- The FFI idiom for byte buffers. An LCB Data does NOT auto-bridge to a C
+-- `void*` (the Language Reference is explicit: "No automatic bridging from Data
+-- or String to Pointer exists" - a Data marshals as an MCDataRef). So, matching
+-- the proven htmltidy/HIDAPI bindings:
+--   * OUTPUT buffers (C fills them) are raw blocks from the engine <builtin>
+--     MCMemoryAllocate, passed as a real Pointer. C returns bytes-written (or the
+--     negative of the capacity it needed, so we grow and retry), then we copy the
+--     written bytes back into a Data with MCDataCreateWithBytes and walk them.
+--   * INPUT buffers (C reads them) pass MCDataGetBytePtr(theData) - the read-only
+--     pointer to a Data's own bytes - together with `the number of bytes in` it.
 --   * records are walked with `the code of (byte I of D)` (big-endian u16) and
 --     `byte X to Y of D` for sub-ranges - exactly midi.lcb's `midiPoll`.
 --   * every foreign call sits inside `unsafe ... end unsafe`; all `variable`s
@@ -137,13 +143,22 @@ constant kAlertScrapeReply is 21
 --  Module state: the reusable poll/status buffers
 -- ===================================================================== --
 
-variable sDrain as Data
-variable sStatus as Data
-variable sScratch as Data
+-- Reusable raw buffers for the fill-a-buffer FFI (allocated via the verified
+-- engine <builtin> MCMemoryAllocate; an LCB Data does not bridge to a void*).
+-- Each pairs a Pointer with its current byte capacity. They persist for the
+-- process - bounded reuse, the single-thread playbook - because there is no
+-- deterministic library-unload hook to free them at (plan section 4.2).
+variable sDrainPtr as Pointer
+variable sDrainCap as Integer
+variable sStatusPtr as Pointer
+variable sStatusCap as Integer
+variable sScratchPtr as Pointer
+variable sScratchCap as Integer
 
 -- ===================================================================== --
 --  Foreign handlers (one per btx_* symbol in btx_abi.h). Buffer params are
---  `Pointer` (a pre-sized Data bridges to them); short strings are ZStringUTF8;
+--  `Pointer` - we hand them MCMemoryAllocate blocks (output) or MCDataGetBytePtr
+--  pointers (input), never a Data value; short strings are ZStringUTF8;
 --  64-bit values ride as ZStringUTF8. All cdecl. Never rename these binds.
 -- ===================================================================== --
 
@@ -191,6 +206,32 @@ private foreign handler _btx_save_resume(in pT as CInt) returns CInt binds to "c
 private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
 
 -- ===================================================================== --
+--  Engine Foundation <builtin> foreign handlers
+-- ===================================================================== --
+-- These bind to the engine's own libfoundation, not to our shim. They are the
+-- sanctioned bridge between LCB Data/Pointer and raw C buffers - an LCB Data does
+-- NOT auto-bridge to a void* (Language Reference: "No automatic bridging from
+-- Data or String to Pointer exists"). Verified against the htmltidy and HIDAPI
+-- bindings and libfoundation/foundation.h. Declared here, before any helper uses
+-- them (OXT resolves identifiers by lexical position).
+--
+-- NOTE: a `<builtin>` handler resolves by its NAME matching the engine symbol, so
+-- these - unlike every other private handler in this file - carry NO leading `_`.
+-- Renaming any of them breaks the binding.
+--   * MCStringDecode: bytes -> String (UTF-8); kEncodingUtf8 == 4.
+--   * MCMemoryAllocate/Deallocate: a raw writable block for the OUTPUT buffers C
+--     fills. The size is pointer-width (UIntSize).
+--   * MCDataCreateWithBytes: copy the C-written bytes back into a Data we walk.
+--     A Data's byte count is uindex_t == uint32 (CUInt).
+--   * MCDataGetBytePtr: the read-only pointer to a Data's own bytes, for the
+--     INPUT buffers C reads (never written through - it is a const byte_t*).
+private foreign handler MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+
+-- ===================================================================== --
 --  Private helpers
 -- ===================================================================== --
 
@@ -206,33 +247,85 @@ private handler _checkABI()
    end if
 end handler
 
--- Build a Data of pSize zero bytes by doubling a small seed chunk (cheap, done
--- once per buffer). Mirrors midi.lcb's ensureDrainBuf seeding.
-private handler _makeZeroData(in pSize as Integer) returns Data
-   variable tBuf as Data
-   variable tI as Integer
-   put the empty data into tBuf
-   repeat with tI from 1 up to 256
-      put the byte with code (0) after tBuf
-   end repeat
-   repeat while the number of bytes in tBuf < pSize
-      put tBuf after tBuf
-   end repeat
-   return byte 1 to pSize of tBuf
+-- Ensure the reusable drain buffer is allocated to at least pNeed bytes. A grow
+-- frees the old block and allocates a fresh one (MCMemoryReallocate is not a
+-- confirmed <builtin>); a grow only happens when the shim reports a -needed past
+-- the current capacity, which is rare. The capacity (0 until first allocation)
+-- doubles as the "is it allocated?" flag, so we never read an unset Pointer.
+private handler _ensureDrain(in pNeed as Integer)
+   variable tOk as Boolean
+   if sDrainCap < pNeed then
+      if sDrainCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sDrainPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sDrainPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "TorrentXT: failed to allocate the drain buffer."
+      end if
+      put pNeed into sDrainCap
+   end if
 end handler
 
--- Lazily allocate the reusable buffers. Module Data variables default to empty,
--- so the size check both initialises and (after a grow) keeps them sized.
-private handler _ensureBuffers()
-   if the number of bytes in sDrain < kDrainCap then
-      put _makeZeroData(kDrainCap) into sDrain
+private handler _ensureStatus(in pNeed as Integer)
+   variable tOk as Boolean
+   if sStatusCap < pNeed then
+      if sStatusCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sStatusPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sStatusPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "TorrentXT: failed to allocate the status buffer."
+      end if
+      put pNeed into sStatusCap
    end if
-   if the number of bytes in sStatus < kStatusCap then
-      put _makeZeroData(kStatusCap) into sStatus
+end handler
+
+private handler _ensureScratch(in pNeed as Integer)
+   variable tOk as Boolean
+   if sScratchCap < pNeed then
+      if sScratchCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sScratchPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sScratchPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "TorrentXT: failed to allocate the scratch buffer."
+      end if
+      put pNeed into sScratchCap
    end if
-   if the number of bytes in sScratch < kScratchCap then
-      put _makeZeroData(kScratchCap) into sScratch
+end handler
+
+-- Copy the pLen bytes the shim wrote into our raw buffer back into a fresh Data
+-- the record walkers can index by byte (MCDataCreateWithBytes, verified
+-- <builtin>). Empty Data on a non-positive length or an allocation failure.
+private handler _bufToData(in pPtr as Pointer, in pLen as Integer) returns Data
+   variable tData as Data
+   variable tOk as Boolean
+   put the empty data into tData
+   if pLen > 0 then
+      put false into tOk
+      unsafe
+         put MCDataCreateWithBytes(pPtr, pLen, tData) into tOk
+      end unsafe
+      if not tOk then
+         put the empty data into tData
+      end if
    end if
+   return tData
 end handler
 
 -- Read a big-endian u16 at 1-based byte offset pOffset (the wire is network
@@ -245,13 +338,8 @@ private handler _readU16(in pData as Data, in pOffset as Integer) returns Intege
    return tHi * 256 + tLo
 end handler
 
--- Decode pLen bytes of UTF-8 (1-based pStart) into a String. LCB has no
--- `textDecode` handler, so we call the engine Foundation's MCStringDecode via
--- the same `<builtin>` foreign binding midi.lcb/HIDAPI use for MCDataGetBytePtr.
--- Signature + UTF-8 constant taken verbatim from libfoundation/foundation.h:
---   bool MCStringDecode(MCDataRef, MCStringEncoding, bool isExternalRep, MCStringRef&)
-private foreign handler _MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
-
+-- Decode pLen bytes of UTF-8 (1-based pStart) into a String via the engine's
+-- MCStringDecode (declared above); LCB has no `textDecode` handler.
 private handler _decodeText(in pData as Data, in pStart as Integer, in pLen as Integer) returns String
    variable tSub as Data
    variable tStr as String
@@ -262,7 +350,7 @@ private handler _decodeText(in pData as Data, in pStart as Integer, in pLen as I
    put byte pStart to (pStart + pLen - 1) of pData into tSub
    put "" into tStr
    unsafe
-      put _MCStringDecode(tSub, kEncodingUtf8, false, tStr) into tOk
+      put MCStringDecode(tSub, kEncodingUtf8, false, tStr) into tOk
    end unsafe
    if tOk then
       return tStr
@@ -499,20 +587,20 @@ end handler
 -- The module-static last-error string ("" when there is no error).
 public handler btLastError() returns String
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureScratch(kScratchCap)
    unsafe
-      put _btx_last_error(sScratch, the number of bytes in sScratch) into tCount
+      put _btx_last_error(sScratchPtr, sScratchCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sScratch
+      _ensureScratch(-tCount)
       unsafe
-         put _btx_last_error(sScratch, the number of bytes in sScratch) into tCount
+         put _btx_last_error(sScratchPtr, sScratchCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return ""
    end if
-   return _decodeText(sScratch, 1, tCount)
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
 end handler
 
 public handler btClearError()
@@ -559,20 +647,20 @@ end handler
 -- Read a setting back as text (diagnostics; not on the hot path).
 public handler btGetSetting(in pSession as Integer, in pKey as String) returns String
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureScratch(kScratchCap)
    unsafe
-      put _btx_get_setting(pSession, pKey, sScratch, the number of bytes in sScratch) into tCount
+      put _btx_get_setting(pSession, pKey, sScratchPtr, sScratchCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sScratch
+      _ensureScratch(-tCount)
       unsafe
-         put _btx_get_setting(pSession, pKey, sScratch, the number of bytes in sScratch) into tCount
+         put _btx_get_setting(pSession, pKey, sScratchPtr, sScratchCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return ""
    end if
-   return _decodeText(sScratch, 1, tCount)
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
 end handler
 
 -- MSE / protocol encryption. in/out policy: 0=forced 1=enabled 2=disabled;
@@ -597,21 +685,32 @@ public handler btAddMagnet(in pSession as Integer, in pURI as String, in pSavePa
    return tHandle
 end handler
 
--- Add from .torrent BYTES (an input buffer: the Data bridges to the Pointer,
--- with its length). Only the metainfo crosses; payload never does.
+-- Add from .torrent BYTES (an input buffer: MCDataGetBytePtr hands C the
+-- read-only pointer to the bytes, with their length). Only the metainfo
+-- crosses; payload never does.
 public handler btAddTorrentFile(in pSession as Integer, in pData as Data, in pSavePath as String) returns Integer
    variable tHandle as Integer
-   unsafe
-      put _btx_add_torrent_file(pSession, pData, the number of bytes in pData, pSavePath) into tHandle
-   end unsafe
+   variable tPtr as Pointer
+   put 0 into tHandle
+   if the number of bytes in pData > 0 then
+      unsafe
+         put MCDataGetBytePtr(pData) into tPtr
+         put _btx_add_torrent_file(pSession, tPtr, the number of bytes in pData, pSavePath) into tHandle
+      end unsafe
+   end if
    return tHandle
 end handler
 
 public handler btAddTorrentWithResume(in pSession as Integer, in pResume as Data, in pSavePath as String) returns Integer
    variable tHandle as Integer
-   unsafe
-      put _btx_add_with_resume(pSession, pResume, the number of bytes in pResume, pSavePath) into tHandle
-   end unsafe
+   variable tPtr as Pointer
+   put 0 into tHandle
+   if the number of bytes in pResume > 0 then
+      unsafe
+         put MCDataGetBytePtr(pResume) into tPtr
+         put _btx_add_with_resume(pSession, tPtr, the number of bytes in pResume, pSavePath) into tHandle
+      end unsafe
+   end if
    return tHandle
 end handler
 
@@ -677,9 +776,14 @@ end handler
 -- Bulk file priorities: one priority byte per file, in file order.
 public handler btSetFilePriorities(in pTorrent as Integer, in pPriorities as Data) returns Integer
    variable tR as Integer
-   unsafe
-      put _btx_set_file_priorities(pTorrent, pPriorities, the number of bytes in pPriorities) into tR
-   end unsafe
+   variable tPtr as Pointer
+   put 0 into tR
+   if the number of bytes in pPriorities > 0 then
+      unsafe
+         put MCDataGetBytePtr(pPriorities) into tPtr
+         put _btx_set_file_priorities(pTorrent, tPtr, the number of bytes in pPriorities) into tR
+      end unsafe
+   end if
    return tR
 end handler
 
@@ -718,20 +822,20 @@ end handler
 -- totalDone, numPeers, savePath, infoHashV1, ...). Empty array on a bad handle.
 public handler btTorrentStatus(in pTorrent as Integer) returns Array
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_torrent_status(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_torrent_status(pTorrent, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sStatus
+      _ensureStatus(-tCount)
       unsafe
-         put _btx_torrent_status(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+         put _btx_torrent_status(pTorrent, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return {}
    end if
-   return _parseRecord(sStatus, 1)
+   return _parseRecord(_bufToData(sStatusPtr, tCount), 1)
 end handler
 
 public handler btTorrentCount(in pSession as Integer) returns Integer
@@ -753,39 +857,39 @@ end handler
 -- The v1 (or, absent v1, v2) info-hash as a hex string.
 public handler btInfoHash(in pTorrent as Integer) returns String
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureScratch(kScratchCap)
    unsafe
-      put _btx_info_hash_hex(pTorrent, sScratch, the number of bytes in sScratch) into tCount
+      put _btx_info_hash_hex(pTorrent, sScratchPtr, sScratchCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sScratch
+      _ensureScratch(-tCount)
       unsafe
-         put _btx_info_hash_hex(pTorrent, sScratch, the number of bytes in sScratch) into tCount
+         put _btx_info_hash_hex(pTorrent, sScratchPtr, sScratchCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return ""
    end if
-   return _decodeText(sScratch, 1, tCount)
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
 end handler
 
 -- The packed piece have-bitfield as raw Data (1 bit per piece, MSB first).
 public handler btPieceBitfield(in pTorrent as Integer) returns Data
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_piece_bitfield(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_piece_bitfield(pTorrent, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sStatus
+      _ensureStatus(-tCount)
       unsafe
-         put _btx_piece_bitfield(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+         put _btx_piece_bitfield(pTorrent, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return the empty data
    end if
-   return byte 1 to tCount of sStatus
+   return _bufToData(sStatusPtr, tCount)
 end handler
 
 -- Connected peers as a List of Arrays (keys: endpoint, client, downRate, ...).
@@ -797,27 +901,29 @@ public handler btPeerList(in pTorrent as Integer) returns List
    variable tBodyLen as Integer
    variable tPeer as Array
    variable tI as Integer
+   variable tBuf as Data
    put [] into tPeers
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_peer_list(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_peer_list(pTorrent, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sStatus
+      _ensureStatus(-tCount)
       unsafe
-         put _btx_peer_list(pTorrent, sStatus, the number of bytes in sStatus) into tCount
+         put _btx_peer_list(pTorrent, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return tPeers
    end if
+   put _bufToData(sStatusPtr, tCount) into tBuf
    put 1 into tOffset
-   put _readU16(sStatus, tOffset) into tPeerCount
+   put _readU16(tBuf, tOffset) into tPeerCount
    add 2 to tOffset
    repeat with tI from 1 up to tPeerCount
       -- entry := [bodyLen:u16][kvrecord]; advance by the on-wire bodyLen
-      put _readU16(sStatus, tOffset) into tBodyLen
-      put _parseRecord(sStatus, tOffset + 2) into tPeer
+      put _readU16(tBuf, tOffset) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 2) into tPeer
       push tPeer onto tPeers
       add (2 + tBodyLen) to tOffset
    end repeat
@@ -841,29 +947,31 @@ public handler btPoll(in pSession as Integer) returns List
    variable tBodyLen as Integer
    variable tEvent as Array
    variable tI as Integer
+   variable tBuf as Data
    put [] into tEvents
-   _ensureBuffers()
+   _ensureDrain(kDrainCap)
    unsafe
-      put _btx_pop_alerts(pSession, sDrain, the number of bytes in sDrain) into tCount
+      put _btx_pop_alerts(pSession, sDrainPtr, sDrainCap) into tCount
    end unsafe
    if tCount < 0 then
       -- even the first record did not fit; grow to the needed size and retry once
-      put _makeZeroData(-tCount) into sDrain
+      _ensureDrain(-tCount)
       unsafe
-         put _btx_pop_alerts(pSession, sDrain, the number of bytes in sDrain) into tCount
+         put _btx_pop_alerts(pSession, sDrainPtr, sDrainCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return tEvents
    end if
+   put _bufToData(sDrainPtr, tCount) into tBuf
    put 1 into tOffset
-   put _readU16(sDrain, tOffset) into tAlertCount
+   put _readU16(tBuf, tOffset) into tAlertCount
    add 2 to tOffset
    repeat with tI from 1 up to tAlertCount
       -- entry := [alertType:u16][bodyLen:u16][kvrecord]
-      put _readU16(sDrain, tOffset) into tType
-      put _readU16(sDrain, tOffset + 2) into tBodyLen
-      put _parseRecord(sDrain, tOffset + 4) into tEvent
+      put _readU16(tBuf, tOffset) into tType
+      put _readU16(tBuf, tOffset + 2) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 4) into tEvent
       put tType into tEvent["code"]
       put _alertName(tType) into tEvent["name"]
       push tEvent onto tEvents
@@ -886,40 +994,45 @@ end handler
 
 public handler btDhtState(in pSession as Integer) returns Array
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_dht_state(pSession, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_dht_state(pSession, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount <= 0 then
       return {}
    end if
-   return _parseRecord(sStatus, 1)
+   return _parseRecord(_bufToData(sStatusPtr, tCount), 1)
 end handler
 
 -- Opaque DHT routing-table state for persistence across runs.
 public handler btDhtSaveState(in pSession as Integer) returns Data
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_dht_save_state(pSession, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_dht_save_state(pSession, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sStatus
+      _ensureStatus(-tCount)
       unsafe
-         put _btx_dht_save_state(pSession, sStatus, the number of bytes in sStatus) into tCount
+         put _btx_dht_save_state(pSession, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return the empty data
    end if
-   return byte 1 to tCount of sStatus
+   return _bufToData(sStatusPtr, tCount)
 end handler
 
 public handler btDhtLoadState(in pSession as Integer, in pData as Data) returns Integer
    variable tR as Integer
-   unsafe
-      put _btx_dht_load_state(pSession, pData, the number of bytes in pData) into tR
-   end unsafe
+   variable tPtr as Pointer
+   put 0 into tR
+   if the number of bytes in pData > 0 then
+      unsafe
+         put MCDataGetBytePtr(pData) into tPtr
+         put _btx_dht_load_state(pSession, tPtr, the number of bytes in pData) into tR
+      end unsafe
+   end if
    return tR
 end handler
 
@@ -931,20 +1044,20 @@ end handler
 -- pPieceSize 0 == auto. Empty Data on failure (see btLastError).
 public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer) returns Data
    variable tCount as Integer
-   _ensureBuffers()
+   _ensureStatus(kStatusCap)
    unsafe
-      put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatus, the number of bytes in sStatus) into tCount
+      put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
-      put _makeZeroData(-tCount) into sStatus
+      _ensureStatus(-tCount)
       unsafe
-         put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatus, the number of bytes in sStatus) into tCount
+         put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then
       return the empty data
    end if
-   return byte 1 to tCount of sStatus
+   return _bufToData(sStatusPtr, tCount)
 end handler
 
 -- A library module must be closed with `end library` (matching the opening

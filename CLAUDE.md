@@ -99,12 +99,19 @@ pass" and let the user confirm.
 - **Reals cross as `double`, booleans as `int` (0/1).** Exported C ABI symbols keep the
   stable `btx_` prefix — never rename them; the `.lcb` `binds to "c:torrentxt>…"`
   strings reference them.
-- **Byte buffers cross as `Pointer` + `CInt` length.** Inbound `Data` (.torrent file,
-  resume data) bridges to a pointer to its first byte; an **out** buffer is a
-  **pre-sized `Data`** the shim fills in place, returning bytes written or `-needed`.
-  The byte-buffer marshalling is the **Phase-0 unknown** — confirm it in OXT first
-  (`docs/phase0-ffi-spike.md`); it is low-stakes here because only status records
-  cross, never payload.
+- **Byte buffers cross as `Pointer` + `CInt` length — an LCB `Data` does NOT
+  auto-bridge to a `void*`.** This was the hard-won FFI lesson (it cost a runtime
+  `expected type pointer` error): the Language Reference is explicit that "No
+  automatic bridging from Data or String to Pointer exists" — a `Data` marshals as
+  an opaque `MCDataRef`. So, matching the proven htmltidy/HIDAPI bindings: an
+  **out** buffer (the shim fills it) is a raw block from the engine `<builtin>`
+  `MCMemoryAllocate`, passed as a real `Pointer`, returning bytes written or
+  `-needed`; we then copy the written bytes back with `MCDataCreateWithBytes`. An
+  **in** buffer (.torrent file, resume data) passes `MCDataGetBytePtr(theData)` —
+  the read-only pointer to the Data's own bytes — plus its length. A `<builtin>`
+  handler resolves by its **name** matching the engine symbol, so those handlers
+  carry **no leading `_`** (renaming them breaks the bind). Low-stakes overall
+  because only status records cross, never payload.
 - **There is no 64-bit foreign int.** 64-bit values, info-hashes, and piece offsets
   cross as **decimal/hex `ZStringUTF8`** strings.
 - **Never return a library-owned `const char*`** of unknown lifetime — fill a caller

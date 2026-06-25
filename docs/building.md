@@ -223,19 +223,32 @@ binary reports "unchanged" and writes nothing). **A native-library change is onl
 
 ## CI (`.github/workflows/build.yml`)
 
-Two jobs:
+The jobs:
 
 - **`static-gates`** (ubuntu, every push/PR, < 1 min, **no libtorrent**): runs
   `check-livecodescript.py`, `tests/record_golden_test.py`,
   `tools/check-record-registry.py` (if present), and builds + runs
   `record_handle_test` directly with gcc ASan+UBSan. This is the gate that must
   always stay green.
-- **`build-matrix`** (Linux x64 + x86, macOS universal, Windows x64 + x86):
+- **`sanitize`** (ubuntu): builds the shim + smoke test under gcc ASan+UBSan against
+  the apt libtorrent and runs them — the memory-safety gate, kept separate so the
+  committed binaries stay clean Release builds.
+- **`build-matrix`** (Linux x64 + x86, macOS host arch, Windows x64 + x86):
   configures + builds the library with `TORRENTXT_BUILD_TESTS=ON` and runs `ctest`,
   acquiring libtorrent per-OS (apt / Homebrew / vcpkg, FetchContent for 32-bit
   Linux). Each lane stages its binary via `package-extension.py` and uploads it as
-  an artifact for a maintainer to commit. **This matrix is authored, not yet proven
-  by a run** — treat a first green as the confirmation, and expect the 32-bit Linux
-  and macOS-universal lanes to need hand-tuning (noted inline in the workflow).
+  the artifact `native-<platform-id>`.
+- **`commit-binaries`** (ubuntu, push to **`main`** only): downloads those artifacts
+  and commits the **self-contained** ones into `src/code/<arch-platform>/`
+  (`[skip ci]`). It deliberately does **not** commit a lib that dynamically links
+  system/Homebrew libtorrent: the apt **`x86_64-linux`** lane (dynamic
+  `libtorrent-rasterbar.so`) and the **macOS** lane (host-arch arm64 + Homebrew
+  rpaths) both fail that check, so those two are not shipped from CI — they come from
+  a release build (a statically linked x64-linux lane, and the universal +
+  codesigned + notarized macOS dylib described above; see the `README.md` left in
+  each of those `src/code/` folders). The Windows (vcpkg static) and 32-bit Linux
+  (static libtorrent) libs are self-contained and are committed. Gated to `main`
+  because CI builds are not byte-reproducible, so a per-branch binary commit would
+  collide with main's and block PR merges.
 
 All actions are pinned to a major version (`actions/checkout@v4`, …).
