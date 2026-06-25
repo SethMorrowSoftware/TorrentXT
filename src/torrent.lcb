@@ -26,6 +26,13 @@ library org.openxtalk.library.torrent
 -- build, add `use com.livecode.byte` alongside the foreign import below.
 
 use com.livecode.foreign
+-- byte/binary modules provide the Data<->String conversion handler textDecode
+-- (used in _decodeText). The byte-chunk operators (`the code of`, `byte X to Y
+-- of`, `the empty data`) are in the prelude, but textDecode is a named handler
+-- that must be imported. If OXT still reports textDecode undeclared, it lives in
+-- a sibling module - adjust _decodeText (the single call site).
+use com.livecode.byte
+use com.livecode.binary
 
 metadata version is "0.1.0"
 metadata author is "Seth Morrow Software"
@@ -925,3 +932,7 @@ public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integ
    end if
    return byte 1 to tCount of sStatus
 end handler
+
+-- A library module must be closed with `end library` (matching the opening
+-- `library ...` declaration) or OXT reports a syntax error at end-of-file.
+end library

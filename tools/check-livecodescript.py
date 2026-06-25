@@ -152,6 +152,8 @@ def check_lcb_blocks(path, cleaned):
         # ---- closers ----
         if t0 == "end" and len(toks) >= 2:
             kind = toks[1]
+            if kind in ("library", "module", "widget"):
+                continue  # module-level closer (validated by check_lcb_module)
             if kind in ("handler", "if", "repeat", "unsafe", "foreach"):
                 want = "foreach" if kind == "foreach" else kind
                 if not stack:
@@ -316,6 +318,33 @@ def check_lcb_antipatterns(path, cleaned):
     return problems
 
 
+def check_lcb_module(path, cleaned):
+    """A library/module/widget must be explicitly closed with the matching
+    `end library`/`end module`/`end widget`. OXT otherwise consumes the whole
+    file looking for the closer and reports a syntax error at end-of-file."""
+    problems = []
+    opener = None  # (kind, lineno)
+    closed = False
+    for lineno, line in cleaned:
+        if opener is None:
+            mo = re.match(r"\s*(library|module|widget)\s+[A-Za-z_][\w.]*", line)
+            if mo:
+                opener = (mo.group(1), lineno)
+                continue
+        mc = re.match(r"\s*end\s+(library|module|widget)\b", line)
+        if mc:
+            closed = True
+            if opener and mc.group(1) != opener[0]:
+                problems.append(Problem(path, lineno,
+                    "`end %s` does not match the opening `%s`" % (mc.group(1), opener[0])))
+    if opener and not closed:
+        problems.append(Problem(path, opener[1],
+            "`%s` opened here is never closed - add `end %s` at the very end of "
+            "the file (OXT reports a syntax error at end-of-file otherwise)"
+            % (opener[0], opener[0])))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -333,6 +362,7 @@ def check_file(path):
     problems += cprob
 
     if is_lcb:
+        problems += check_lcb_module(path, cleaned)
         problems += check_lcb_blocks(path, cleaned)
         problems += check_lcb_constants(path, cleaned)
         problems += check_lcb_antipatterns(path, cleaned)
