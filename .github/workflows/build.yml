@@ -93,7 +93,7 @@ jobs:
             # ~96%, taking the runner agent down ("received a shutdown signal").
             # Two at a time keeps the peak well under the limit.
             build_jobs: 2
-            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_LIBRARY_ARCHITECTURE=i386-linux-gnu"
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so -DOPENSSL_INCLUDE_DIR=/usr/include -DZLIB_LIBRARY=/usr/lib/i386-linux-gnu/libz.so -DZLIB_INCLUDE_DIR=/usr/include"
 
           # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
           #      notarized dylib is a separate release build (see header note). --
@@ -144,10 +144,10 @@ jobs:
           # libtorrent's find_package(OpenSSL)/(ZLIB) must resolve the i386 libs,
           # not the host amd64 ones, or the -m32 link fails with "file in wrong
           # format" (it pulled /usr/lib/x86_64-linux-gnu/libssl.so). Install them
-          # REQUIRED; CMAKE_LIBRARY_ARCHITECTURE (in the lane's cmake_args) points
-          # find_library at /usr/lib/i386-linux-gnu. Boost is header-only for
-          # libtorrent's use, so the arch-independent libboost-dev headers already
-          # suffice — no :i386 Boost needed.
+          # REQUIRED; the lane's cmake_args point OPENSSL_*_LIBRARY / ZLIB_LIBRARY
+          # explicitly at /usr/lib/i386-linux-gnu (a targeted override, so Boost's
+          # arch-independent header-only discovery is left untouched). Boost is
+          # header-only for libtorrent's use, so no :i386 Boost is needed.
           sudo apt-get install -y libssl-dev:i386 zlib1g-dev:i386
 
       - name: Acquire libtorrent (Homebrew, macOS host arch)
