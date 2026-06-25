@@ -23,10 +23,11 @@
 #                     so a per-branch binary commit collides with main's (an add/add
 #                     binary conflict that blocks the merge); binaries land once, on
 #                     main, after merge. (2) self-contained only - a lib that
-#                     dynamically links system/Homebrew libtorrent (the apt-linux-x64
-#                     and host-arch macOS lanes) would NOT load on a user machine, so
-#                     it is skipped; the macOS universal/notarized dylib and any
-#                     static x64-linux lib come from the release build (building.md).
+#                     dynamically links libtorrent (e.g. the host-arch macOS lane,
+#                     Homebrew-rpathed) would NOT load on a user machine, so it is
+#                     skipped per-file by readelf; only the macOS universal/
+#                     notarized dylib still comes from the release build
+#                     (building.md). The Linux/Windows lanes static-link libtorrent.
 #
 # NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
 # binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
@@ -117,14 +118,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- Linux x86_64 — apt system libtorrent 2.0.x, sanitized ----------
+          # ---- Linux x86_64 — FetchContent libtorrent @ v2.0.11, STATICALLY
+          #      linked into our .so so the committed binary is self-contained (no
+          #      system libtorrent at load). A source build: slow + RAM-heavy, so
+          #      build_jobs: 2 like the 32-bit lane. The apt/dynamic build is NOT
+          #      distributable (readelf shows NEEDED libtorrent-rasterbar.so), so
+          #      commit-binaries would skip it; source-static is the shippable one.
           - name: linux-x86_64
             os: ubuntu-22.04
             platform_id: x86_64-linux
-            acquire: apt
-            # Release build (NOT sanitized) so the committed binary is
-            # distributable; the ASan/UBSan shim test runs in the `sanitize` job.
-            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON"
+            acquire: linux64src
+            # Cap parallelism: this lane compiles libtorrent from source and its
+            # heaviest TUs each peak at multiple GB; 4 cores ran the 16 GB runner
+            # out of RAM on the 32-bit lane, so keep it at 2 here too.
+            build_jobs: 2
+            # No TORRENTXT_USE_SYSTEM_LIBTORRENT -> FetchContent builds libtorrent
+            # with BUILD_SHARED_LIBS OFF and static-links it in (Release, NOT
+            # sanitized; the ASan/UBSan shim test runs against apt in `sanitize`).
+            cmake_args: ""
 
           # ---- Linux x86 (32-bit) — FetchContent libtorrent @ v2.0.11, -m32,
           #      against the i386 system Boost. The hard lane (no 32-bit apt
@@ -174,11 +185,16 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Acquire libtorrent (apt, Linux x86_64)
-        if: matrix.acquire == 'apt'
+      - name: Acquire deps for the 64-bit static source build (Linux x86_64)
+        if: matrix.acquire == 'linux64src'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
+          # No system libtorrent: CMake FetchContent builds it from source at the
+          # pinned tag and static-links it into our one .so. We need the C++
+          # toolchain, CMake/Ninja, Boost headers, and OpenSSL/zlib dev. OpenSSL
+          # stays a dynamic NEEDED dep (as on the 32-bit lane) - it is present on
+          # every Linux target, unlike libtorrent.
+          sudo apt-get install -y g++ cmake ninja-build libboost-dev libssl-dev zlib1g-dev
 
       - name: Acquire 32-bit toolchain + i386 OpenSSL/zlib (Linux x86)
         if: matrix.acquire == 'linux32'
