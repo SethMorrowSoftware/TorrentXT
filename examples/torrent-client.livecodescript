@@ -12,9 +12,11 @@ script "torrentClient"
 -- Features: smart Add (magnet / http(s) .torrent / local .torrent / 40-hex
 -- info-hash) with DUPLICATE DETECTION; per-torrent Pause/Resume/Recheck/
 -- Reannounce/Remove(+Data), Open Folder, Copy Magnet, Save Resume; session
--- Pause All / Resume All; a global upload cap; a live table; a detail line
--- (info-hash, save path, ETA, seeds); session totals incl. DHT nodes; an
--- event log.
+-- Pause All / Resume All; a global upload cap; a live colour-coded table with
+-- inline progress bars; keyboard shortcuts (Enter adds, Space toggles
+-- pause/resume, Delete removes); a detail line with share ratio; session totals
+-- with a state breakdown and ratio; remembered settings + a resizable window;
+-- an event log.
 --
 -- Design (single-thread playbook): one 250 ms poll loop drains events with a
 -- single btPoll; one 800 ms refresh enumerates the torrents and repaints. The
@@ -35,6 +37,12 @@ end openStack
 on closeStack
    tcShutdown
 end closeStack
+
+-- the window is vertically resizable; reflow the table/log and remember the size
+on resizeStack
+   tcRelayout
+   set the uHeight of this stack to the height of this stack
+end resizeStack
 
 -- ---- button routing (every control lives in this one stack script) -----------
 on mouseUp
@@ -98,6 +106,46 @@ on mouseDoubleUp
    end if
 end mouseDoubleUp
 
+-- Enter/Return in the Add field adds the torrent.
+on returnInField
+   if the short name of the target is "tcInput" then
+      tcAddInput
+   else
+      pass returnInField
+   end if
+end returnInField
+
+on enterInField
+   if the short name of the target is "tcInput" then
+      tcAddInput
+   else
+      pass enterInField
+   end if
+end enterInField
+
+-- Table shortcuts: Space toggles pause/resume, Delete/Backspace removes. Scoped
+-- to when the TABLE itself has focus and a row is selected, so they never disturb
+-- typing in the Add / Save-path / limit fields.
+on rawKeyDown pKey
+   if the focusedObject is not the long id of field "tcTorrents" then
+      pass rawKeyDown
+   end if
+   if tcSelectedHandle() is 0 then
+      pass rawKeyDown
+   end if
+   switch pKey
+      case 32            -- space
+         tcToggleSelected
+         break
+      case 65288         -- backspace
+      case 65535         -- forward delete
+         tcControlSelected "remove"
+         break
+      default
+         pass rawKeyDown
+   end switch
+end rawKeyDown
+
 -- ---- self-building UI (idempotent: re-opening does not duplicate) ------------
 command tcBuildUI
    if there is a field "tcTorrents" then
@@ -105,7 +153,16 @@ command tcBuildUI
    end if
    lock screen
    set the width of this stack to 860
-   set the height of this stack to 712
+   -- vertically resizable: lock the width, remember the user's height across runs,
+   -- and let the table + log share the extra space (see resizeStack / tcRelayout).
+   set the minWidth of this stack to 860
+   set the maxWidth of this stack to 860
+   set the minHeight of this stack to 600
+   if the uHeight of this stack is a number and the uHeight of this stack >= 600 then
+      set the height of this stack to (the uHeight of this stack)
+   else
+      set the height of this stack to 712
+   end if
    tcMakeLabel "tcTitle", "TorrentXT Client - multi-torrent demo", "16,8,600,30", 16
    -- add row
    tcMakeField "tcInput", "16,38,560,64", false
@@ -153,10 +210,19 @@ command tcBuildUI
    tcMakeLabel "tcTotals", "", "16,454,844,474", 11
    -- event log
    tcMakeList "tcLog", "16,480,844,702", true
-   -- defaults
-   put tcDefaultSavePath() into field "tcSavePath"
+   -- defaults (restore the remembered save path + upload cap if present)
+   if the uSavePath of this stack is not empty then
+      put the uSavePath of this stack into field "tcSavePath"
+   else
+      put tcDefaultSavePath() into field "tcSavePath"
+   end if
    put empty into field "tcInput"
-   put "0" into field "tcUpLimit"
+   if the uUpLimit of this stack is not empty then
+      put the uUpLimit of this stack into field "tcUpLimit"
+   else
+      put "0" into field "tcUpLimit"
+   end if
+   tcRelayout
    unlock screen
    tcLogMsg "Client built. Add takes a magnet, a .torrent path, an http(s) .torrent URL, or a 40-hex info-hash."
    tcLogMsg "Duplicates are detected. Double-click a row to open its folder. Create + Seed a folder to seed."
@@ -209,6 +275,48 @@ command tcMakeList pName, pRect, pIsLog
    end if
 end tcMakeList
 
+-- Reflow the table, the two control rows, the detail/totals lines, and the log
+-- for the current (resizable) height. The width is locked, so only vertical space
+-- is shared: the table takes ~52% of the free space and the log the rest. Called
+-- on build and on every resize; a no-op until the UI exists.
+command tcRelayout
+   local tH, tRight, tTableTop, tBottom, tAvail, tTableBot, tCtrlTop, tLogTop
+   if there is no field "tcLog" then   -- the last control built; UI not ready yet
+      exit tcRelayout
+   end if
+   put the height of this stack into tH
+   put (the width of this stack) - 16 into tRight
+   put 122 into tTableTop                 -- table top is fixed (header sits above)
+   put tH - 10 into tBottom               -- bottom margin
+   -- free vertical space the table + log share, after the fixed 116px control
+   -- block (two button rows + detail + totals) and the inter-section gaps.
+   put (tH - 254) into tAvail
+   if tAvail < 240 then
+      put 240 into tAvail
+   end if
+   put tTableTop + (the round of (tAvail * 0.52)) into tTableBot
+   put tTableBot + 6 into tCtrlTop
+   put tCtrlTop + 116 into tLogTop
+   set the rect of field "tcTorrents" to ("16," & tTableTop & comma & tRight & comma & tTableBot)
+   tcRowTop "tcPause,tcResume,tcRecheck,tcReannounce,tcRemove,tcRemoveData", tCtrlTop
+   tcRowTop "tcOpenFolder,tcCopyMagnet,tcSaveResume,tcPauseAll,tcResumeAll", (tCtrlTop + 32)
+   set the top of field "tcLimitLabel" to (tCtrlTop + 36)
+   set the top of field "tcUpLimit" to (tCtrlTop + 34)
+   set the top of button "tcApplyLimit" to (tCtrlTop + 34)
+   set the top of field "tcDetail" to (tCtrlTop + 66)
+   set the top of field "tcTotals" to (tCtrlTop + 90)
+   set the rect of field "tcLog" to ("16," & tLogTop & comma & tRight & comma & tBottom)
+end tcRelayout
+
+-- Move a comma-list of buttons to a common top (x / width / height preserved).
+command tcRowTop pNames, pTop
+   local tBtn
+   set the itemDelimiter to comma
+   repeat for each item tBtn in pNames
+      set the top of button tBtn to pTop
+   end repeat
+end tcRowTop
+
 -- ---- session lifecycle (adopts a still-live session, like the demo) ----------
 command tcEnsureSession
    local tErr, tRemembered
@@ -256,6 +364,11 @@ command tcShutdown
    end if
    put empty into sSession
    set the uSession of this stack to empty
+   -- remember the user's settings for next launch
+   if there is a field "tcSavePath" then
+      set the uSavePath of this stack to tcTrim(field "tcSavePath")
+      set the uUpLimit of this stack to tcTrim(field "tcUpLimit")
+   end if
 end tcShutdown
 
 function tcHaveSession
@@ -485,6 +598,24 @@ command tcControlSelected pAction
    end if
 end tcControlSelected
 
+-- Space-bar handler: pause a running torrent, resume a paused one.
+command tcToggleSelected
+   local tH, tS
+   put tcSelectedHandle() into tH
+   if tH is 0 then
+      exit tcToggleSelected
+   end if
+   put btTorrentStatus(tH) into tS
+   if tS["isPaused"] is "1" then
+      btResume tH
+      tcLogMsg "Resumed torrent" && tH
+   else
+      btPause tH
+      tcLogMsg "Paused torrent" && tH
+   end if
+   tcRefreshOnce
+end tcToggleSelected
+
 -- Pause or resume every torrent in the session.
 command tcAllTorrents pAction
    local tCount, tI, tH
@@ -600,6 +731,7 @@ command tcApplyUpLimit
    end if
    -- value crosses as a STRING (settings can be 64-bit); 0 == unlimited
    btSetInt sSession, "upload_rate_limit", (trunc(tKB * 1024) & "")
+   set the uUpLimit of this stack to tKB
    tcLogMsg "Upload limit set to" && tKB && "KB/s"
 end tcApplyUpLimit
 
@@ -672,6 +804,7 @@ end tcRefreshLoop
 command tcRefreshOnce
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tSelH, tSelLine, tNewMap, tLineNum, tNodes, tDht
    local tColors, tErr
+   local tSeed, tDl, tPause, tCheck, tAllUp, tAllDown, tRatio, tSummary2
    if sSession is 0 or sSession is empty then
       exit tcRefreshOnce
    end if
@@ -683,6 +816,12 @@ command tcRefreshOnce
    put "" into tRows
    put 0 into tDown
    put 0 into tUp
+   put 0 into tSeed
+   put 0 into tDl
+   put 0 into tPause
+   put 0 into tCheck
+   put 0 into tAllUp
+   put 0 into tAllDown
    put empty into tNewMap
    put 0 into tLineNum
    put empty into tSelLine
@@ -702,6 +841,18 @@ command tcRefreshOnce
           tS["numPeers"] & tab & tcFmtBytes(tS["totalSize"]) & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
+      -- session tallies: one mutually-exclusive state bucket + all-time bytes
+      if tS["isPaused"] is "1" then
+         add 1 to tPause
+      else if tS["isSeeding"] is "1" then
+         add 1 to tSeed
+      else if tS["state"] is 3 then
+         add 1 to tDl
+      else
+         add 1 to tCheck
+      end if
+      add tS["allTimeUpload"] to tAllUp
+      add tS["allTimeDownload"] to tAllDown
       if tSelH is not 0 and tH is tSelH then
          put tLineNum into tSelLine
       end if
@@ -736,8 +887,15 @@ command tcRefreshOnce
    else
       put "DHT: on" into tDht
    end if
-   put tLineNum && "torrents     down" && tcFmtBytes(tDown) & "/s     up" && tcFmtBytes(tUp) & "/s" \
-      && "    " & tDht into field "tcTotals"
+   -- session summary: state breakdown + aggregate rates + share ratio + DHT
+   put tcRatio(tAllUp, tAllDown) into tRatio
+   put "(" & tSeed && "seeding," && tDl && "dl," && tPause && "paused" into tSummary2
+   if tCheck > 0 then
+      put tSummary2 & "," && tCheck && "checking" into tSummary2
+   end if
+   put tSummary2 & ")" into tSummary2
+   put tLineNum && "torrents" && tSummary2 && " down" && (tcFmtBytes(tDown) & "/s") \
+      && " up" && (tcFmtBytes(tUp) & "/s") && " ratio" && tRatio && "  " & tDht into field "tcTotals"
    tcUpdateDetail tSelH
    unlock screen
 end tcRefreshOnce
@@ -753,6 +911,8 @@ command tcUpdateDetail pHandle
    put btTorrentStatus(pHandle) into tS
    put "hash:" && tcShortHash(btInfoHash(pHandle)) && "|  save:" && tS["savePath"] \
       && "|  ETA:" && tcFmtEta(tS["eta"]) && "|  seeds:" && tS["numSeeds"] \
+      && "|  peers:" && tS["numPeers"] \
+      && "|  ratio:" && tcRatio(tS["allTimeUpload"], tS["allTimeDownload"]) \
       && "|  done:" && tcFmtBytes(tS["totalDone"]) into tLine
    if tS["error"] is not empty then
       put tLine && "|  ERROR:" && tS["error"] into tLine
@@ -870,6 +1030,15 @@ function tcFmtEta pSecs
    put trunc(tMin / 60) into tHrs
    return tHrs & "h" && (tMin mod 60) & "m"
 end tcFmtEta
+
+-- A share ratio (uploaded / downloaded) to two decimals, "-" when nothing has
+-- been downloaded yet. Shared by the detail line and the session totals.
+function tcRatio pUp, pDown
+   if pDown is not a number or pDown <= 0 then
+      return "-"
+   end if
+   return (the round of (pUp / pDown * 100)) / 100
+end tcRatio
 
 function tcShortHash pHash
    if pHash is empty then
