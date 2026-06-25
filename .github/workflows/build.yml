@@ -93,7 +93,7 @@ jobs:
             # ~96%, taking the runner agent down ("received a shutdown signal").
             # Two at a time keeps the peak well under the limit.
             build_jobs: 2
-            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_LIBRARY_ARCHITECTURE=i386-linux-gnu"
 
           # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
           #      notarized dylib is a separate release build (see header note). --
@@ -133,22 +133,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
 
-      - name: Acquire 32-bit toolchain + i386 Boost (Linux x86)
+      - name: Acquire 32-bit toolchain + i386 OpenSSL/zlib (Linux x86)
         if: matrix.acquire == 'linux32'
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
           # The 32-bit C/C++ toolchain MUST succeed on its OWN line — it provides
-          # Scrt1.o, crti.o, lib32stdc++, lib32gcc that -m32 needs. (The previous
-          # combined install lumped it with optional i386 Boost packages under
-          # `|| true`; apt installs atomically, so one unavailable package aborted
-          # the whole thing and g++-multilib never landed -> the -m32 compiler
-          # check failed at project().)
+          # Scrt1.o, crti.o, lib32stdc++, lib32gcc that -m32 needs.
           sudo apt-get install -y g++-multilib gcc-multilib ninja-build
-          # i386 Boost for libtorrent's find_package(Boost). Best-effort + isolated
-          # so a missing optional package cannot break the toolchain above.
-          sudo apt-get install -y libboost-dev:i386 libboost-system-dev:i386 || true
-          sudo apt-get install -y zlib1g-dev:i386 libssl-dev:i386 || true
+          # libtorrent's find_package(OpenSSL)/(ZLIB) must resolve the i386 libs,
+          # not the host amd64 ones, or the -m32 link fails with "file in wrong
+          # format" (it pulled /usr/lib/x86_64-linux-gnu/libssl.so). Install them
+          # REQUIRED; CMAKE_LIBRARY_ARCHITECTURE (in the lane's cmake_args) points
+          # find_library at /usr/lib/i386-linux-gnu. Boost is header-only for
+          # libtorrent's use, so the arch-independent libboost-dev headers already
+          # suffice — no :i386 Boost needed.
+          sudo apt-get install -y libssl-dev:i386 zlib1g-dev:i386
 
       - name: Acquire libtorrent (Homebrew, macOS host arch)
         if: matrix.acquire == 'brew'
