@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 1
+constant kABIVersion is 2
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -203,7 +203,7 @@ private foreign handler _btx_dht_save_state(in pS as CInt, in pOut as Pointer, i
 private foreign handler _btx_dht_load_state(in pS as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_dht_load_state!cdecl"
 
 private foreign handler _btx_save_resume(in pT as CInt) returns CInt binds to "c:torrentxt>btx_save_resume!cdecl"
-private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
+private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pTrackers as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
 
 -- ===================================================================== --
 --  Engine Foundation <builtin> foreign handlers
@@ -1047,17 +1047,19 @@ end handler
 -- ===================================================================== --
 
 -- Build a .torrent for pContentPath (file or directory) and return its bytes.
--- pPieceSize 0 == auto. Empty Data on failure (see btLastError).
-public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer) returns Data
+-- pPieceSize 0 == auto. pTrackers is an optional newline-separated list of
+-- announce URLs (empty = trackerless / DHT-only). Empty Data on failure (see
+-- btLastError).
+public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer, in pTrackers as String) returns Data
    variable tCount as Integer
    _ensureStatus(kStatusCap)
    unsafe
-      put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatusPtr, sStatusCap) into tCount
+      put _btx_create_torrent(pContentPath, pPieceSize, pFlags, pTrackers, sStatusPtr, sStatusCap) into tCount
    end unsafe
    if tCount < 0 then
       _ensureStatus(-tCount)
       unsafe
-         put _btx_create_torrent(pContentPath, pPieceSize, pFlags, sStatusPtr, sStatusCap) into tCount
+         put _btx_create_torrent(pContentPath, pPieceSize, pFlags, pTrackers, sStatusPtr, sStatusCap) into tCount
       end unsafe
    end if
    if tCount <= 0 then

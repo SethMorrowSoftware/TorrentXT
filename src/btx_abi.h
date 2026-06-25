@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 1
+#define BTX_ABI_VERSION 2
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -231,10 +231,12 @@ BTX_API int BTX_CALL btx_save_resume(int t);
 
 /* Build a .torrent for `contentPath` (file or directory) with the given piece
  * size (0 == auto) and flags, writing the bencoded .torrent bytes into `out`.
- * bytes-written / -needed. An optional comment/creator can be set via the
- * btx_set_* string keys "creator"/"comment" before the call. */
+ * bytes-written / -needed. `trackers` is an optional newline-separated list of
+ * announce URLs (NULL or "" => a trackerless, DHT-only torrent); each non-empty
+ * line is added as its own tracker tier, in order. */
 BTX_API int BTX_CALL btx_create_torrent(const char *contentPath, int pieceSize,
-                                        int flags, void *out, int cap);
+                                        int flags, const char *trackers,
+                                        void *out, int cap);
 
 #ifdef __cplusplus
 }  /* extern "C" */

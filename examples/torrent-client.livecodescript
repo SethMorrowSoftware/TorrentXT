@@ -334,7 +334,7 @@ end tcAddTorrentFile
 -- Build a .torrent from a folder, then add it pointing at that folder's PARENT
 -- so libtorrent rechecks the existing files, finds them complete, and seeds.
 command tcCreateAndSeed
-   local tPath, tData, tParent
+   local tPath, tData, tParent, tTrackers
    if not tcHaveSession() then
       exit tcCreateAndSeed
    end if
@@ -343,8 +343,14 @@ command tcCreateAndSeed
    if tPath is empty then
       exit tcCreateAndSeed
    end if
+   -- optional announce URLs (one per line). Blank = trackerless, DHT-only
+   -- seeding, which works because this client runs the DHT; a tracker just
+   -- adds another way for peers to find the swarm.
+   ask "Tracker announce URLs to embed (one per line; blank = DHT-only):" \
+      with "udp://tracker.opentrackr.org:1337/announce"
+   put it into tTrackers
    tcLogMsg "Creating torrent for" && tPath && "..."
-   put btCreateTorrent(tPath, 0, 0) into tData
+   put btCreateTorrent(tPath, 0, 0, tTrackers) into tData
    if tData is empty then
       tcLogMsg "Create failed:" && btLastError()
       exit tcCreateAndSeed
@@ -620,7 +626,13 @@ command tcHandleEvent pEvent
          tcRefreshOnce
          break
       case "metadataReceived"
-         tcLogMsg "  metadata received:" && tcTorrentName(pEvent["torrent"])
+         -- the event now carries the resolved name directly (F_EVT_NAME); fall
+         -- back to a status lookup if an older native lib leaves it empty.
+         if pEvent["torrentName"] is not empty then
+            tcLogMsg "  metadata received:" && pEvent["torrentName"]
+         else
+            tcLogMsg "  metadata received:" && tcTorrentName(pEvent["torrent"])
+         end if
          tcRefreshOnce
          break
       case "torrentFinished"
@@ -713,17 +725,16 @@ command tcRefreshOnce
    end try
    -- per-torrent buttons are usable only when a row is selected
    tcEnableControls (tSelLine is not empty)
-   -- DHT status: show the real node count if the shim reports one, else on/off.
-   -- (The current shim hardcodes the count to 0 but DOES report a running flag;
-   -- once the shim wires dht.dht_nodes, the real count appears here automatically.)
+   -- DHT status: show the real routing-table node count from the shim's
+   -- session_stats. This client always enables DHT at startup, so a 0 count just
+   -- means it is still bootstrapping into the swarm (the count climbs within a
+   -- few seconds of the first add).
    put btDhtState(sSession) into tS
-   put tS["globalNodes"] into tNodes
+   put tS["nodes"] into tNodes
    if tNodes is a number and tNodes > 0 then
       put ("DHT:" && tNodes && "nodes") into tDht
-   else if tS["nodes"] is "1" then
-      put "DHT: on" into tDht
    else
-      put "DHT: off" into tDht
+      put "DHT: on" into tDht
    end if
    put tLineNum && "torrents     down" && tcFmtBytes(tDown) & "/s     up" && tcFmtBytes(tUp) & "/s" \
       && "    " & tDht into field "tcTotals"
