@@ -320,6 +320,8 @@ jobs:
           #            notarized dylib is a separate release build that owns the
           #            Apple credentials (docs/building.md "macOS - universal +
           #            codesign/notarize").
+          #   other  : never - a stray README or other non-lib file that rode along
+          #            in an artifact folder is not a library and is not committed.
           shopt -s nullglob
           placed=0
           for dir in _artifacts/native-*/; do
@@ -335,6 +337,11 @@ jobs:
                     echo "SKIP src/code/$id/$base - dynamically links system libtorrent (not self-contained); static-link this lane to ship it."
                     continue
                   fi ;;
+                *.dll)
+                  : ;;  # vcpkg *-static -> self-contained; ship as-is
+                *)
+                  echo "SKIP src/code/$id/$base - not a library file; only .so/.dll are committed (a stray README or other file that rode along in an artifact must never be committed)."
+                  continue ;;
               esac
               mkdir -p "src/code/$id"
               cp "$f" "src/code/$id/"
