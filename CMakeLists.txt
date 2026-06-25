@@ -60,6 +60,17 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)  # a shared lib statically linking deps needs -fPIC throughout
 
+# On MSVC, match the CRT that vcpkg's *-windows-static triplet links libtorrent
+# and Boost against: the STATIC runtime (/MT). Our shim defaults to the dynamic
+# runtime (/MD), and mixing the two pulls in both LIBCMT and MSVCRT, which then
+# multiply-define the CRT symbols (LNK4098 -> fatal LNK1169). A self-contained
+# torrentxt.dll with statically-linked deps wants the static CRT regardless.
+# CMP0091 is NEW for cmake_minimum_required >= 3.15 (we require 3.16), so
+# CMAKE_MSVC_RUNTIME_LIBRARY is honored without touching compile flags directly.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # --------------------------------------------------- our warning/flag set ----
 # Applied ONLY to our translation units (the shim + tests), never to libtorrent
 # or Boost — those ride in as SYSTEM includes (below) so their warnings are mute.
