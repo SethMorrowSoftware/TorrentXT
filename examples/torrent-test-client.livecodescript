@@ -69,7 +69,8 @@ end ttBuildUI
 
 command ttMakeField pName, pRect, pLocked
    if there is no field pName then
-      create field pName
+      create field
+      set the name of the last field to pName
    end if
    set the rect of field pName to pRect
    set the lockText of field pName to pLocked
@@ -78,7 +79,8 @@ end ttMakeField
 
 command ttMakeButton pName, pLabel, pRect
    if there is no button pName then
-      create button pName
+      create button
+      set the name of the last button to pName
    end if
    set the rect of button pName to pRect
    set the label of button pName to pLabel
