@@ -210,9 +210,9 @@ end handler
 -- once per buffer). Mirrors midi.lcb's ensureDrainBuf seeding.
 private handler _makeZeroData(in pSize as Integer) returns Data
    variable tBuf as Data
-   variable i as Integer
+   variable tI as Integer
    put the empty data into tBuf
-   repeat with i from 1 up to 256
+   repeat with tI from 1 up to 256
       put the byte with code (0) after tBuf
    end repeat
    repeat while the number of bytes in tBuf < pSize
@@ -440,7 +440,7 @@ private handler _parseRecord(in pData as Data, in pStart as Integer) returns Arr
    variable tRec as Array
    variable tOffset as Integer
    variable tCount as Integer
-   variable i as Integer
+   variable tI as Integer
    variable tId as Integer
    variable tType as Integer
    variable tLen as Integer
@@ -449,7 +449,7 @@ private handler _parseRecord(in pData as Data, in pStart as Integer) returns Arr
    put pStart into tOffset
    put _readU16(pData, tOffset) into tCount
    add 2 to tOffset
-   repeat with i from 1 up to tCount
+   repeat with tI from 1 up to tCount
       put the code of (byte tOffset of pData) into tId
       put the code of (byte (tOffset + 1) of pData) into tType
       add 2 to tOffset
@@ -796,7 +796,7 @@ public handler btPeerList(in pTorrent as Integer) returns List
    variable tPeerCount as Integer
    variable tBodyLen as Integer
    variable tPeer as Array
-   variable i as Integer
+   variable tI as Integer
    put [] into tPeers
    _ensureBuffers()
    unsafe
@@ -814,7 +814,7 @@ public handler btPeerList(in pTorrent as Integer) returns List
    put 1 into tOffset
    put _readU16(sStatus, tOffset) into tPeerCount
    add 2 to tOffset
-   repeat with i from 1 up to tPeerCount
+   repeat with tI from 1 up to tPeerCount
       -- entry := [bodyLen:u16][kvrecord]; advance by the on-wire bodyLen
       put _readU16(sStatus, tOffset) into tBodyLen
       put _parseRecord(sStatus, tOffset + 2) into tPeer
@@ -840,7 +840,7 @@ public handler btPoll(in pSession as Integer) returns List
    variable tType as Integer
    variable tBodyLen as Integer
    variable tEvent as Array
-   variable i as Integer
+   variable tI as Integer
    put [] into tEvents
    _ensureBuffers()
    unsafe
@@ -859,7 +859,7 @@ public handler btPoll(in pSession as Integer) returns List
    put 1 into tOffset
    put _readU16(sDrain, tOffset) into tAlertCount
    add 2 to tOffset
-   repeat with i from 1 up to tAlertCount
+   repeat with tI from 1 up to tAlertCount
       -- entry := [alertType:u16][bodyLen:u16][kvrecord]
       put _readU16(sDrain, tOffset) into tType
       put _readU16(sDrain, tOffset + 2) into tBodyLen

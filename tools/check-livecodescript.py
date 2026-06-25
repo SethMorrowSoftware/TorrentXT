@@ -353,6 +353,24 @@ def check_lcb_module(path, cleaned):
     return problems
 
 
+def check_lcb_lowercase_names(path, cleaned):
+    """OXT warns that all-lowercase identifiers may become reserved words
+    ('All-lowercase name X may cause future syntax error'). The project naming
+    convention prefixes every name (t/p/s/k + CamelCase), so an all-lowercase
+    `variable` declaration is both a convention break and a future-error risk."""
+    problems = []
+    pat = re.compile(r"\bvariable\s+([a-z][a-z0-9_]*)\s+as\b")
+    for lineno, line in cleaned:
+        m = pat.search(line)
+        if m:
+            name = m.group(1)
+            problems.append(Problem(path, lineno,
+                "all-lowercase variable name `%s` - OXT warns it may cause a future "
+                "syntax error; use a prefixed CamelCase name (e.g. t%s)"
+                % (name, name.capitalize())))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -374,6 +392,7 @@ def check_file(path):
         problems += check_lcb_blocks(path, cleaned)
         problems += check_lcb_constants(path, cleaned)
         problems += check_lcb_antipatterns(path, cleaned)
+        problems += check_lcb_lowercase_names(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
     return problems
