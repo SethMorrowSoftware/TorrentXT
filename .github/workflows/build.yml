@@ -86,6 +86,13 @@ jobs:
             os: ubuntu-22.04
             platform_id: x86-linux
             acquire: linux32
+            # Cap build parallelism: this is the only lane that compiles
+            # libtorrent itself (from source, -m32). libtorrent's heaviest TUs
+            # (add_torrent_params.cpp et al.) each peak at multiple GB, and the
+            # default `--parallel` (= 4 cores) ran the 16 GB runner out of RAM at
+            # ~96%, taking the runner agent down ("received a shutdown signal").
+            # Two at a time keeps the peak well under the limit.
+            build_jobs: 2
             cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
 
           # ---- macOS (host arch arm64) — brew system libtorrent. Universal +
@@ -175,7 +182,9 @@ jobs:
             $EXTRA
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        # matrix.build_jobs caps parallelism on the from-source lane to avoid OOM;
+        # the other lanes (prebuilt libtorrent) default to all cores.
+        run: cmake --build build --config Release --parallel ${{ matrix.build_jobs || '4' }}
 
       - name: Test (ctest)
         run: ctest --test-dir build --build-config Release --output-on-failure
