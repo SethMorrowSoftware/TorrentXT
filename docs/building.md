@@ -240,15 +240,15 @@ The jobs:
   the artifact `native-<platform-id>`.
 - **`commit-binaries`** (ubuntu, push to **`main`** only): downloads those artifacts
   and commits the **self-contained** ones into `src/code/<arch-platform>/`
-  (`[skip ci]`). It deliberately does **not** commit a lib that dynamically links
-  system/Homebrew libtorrent: the apt **`x86_64-linux`** lane (dynamic
-  `libtorrent-rasterbar.so`) and the **macOS** lane (host-arch arm64 + Homebrew
-  rpaths) both fail that check, so those two are not shipped from CI — they come from
-  a release build (a statically linked x64-linux lane, and the universal +
-  codesigned + notarized macOS dylib described above; see the `README.md` left in
-  each of those `src/code/` folders). The Windows (vcpkg static) and 32-bit Linux
-  (static libtorrent) libs are self-contained and are committed. Gated to `main`
-  because CI builds are not byte-reproducible, so a per-branch binary commit would
-  collide with main's and block PR merges.
+  (`[skip ci]`), deciding per file with `readelf` — a `.so` that dynamically `NEEDED`s
+  libtorrent, or any `.dylib`, is skipped. All four `.so`/`.dll` lanes static-link
+  libtorrent (Windows via vcpkg `*-static`; both Linux lanes via FetchContent at the
+  pinned v2.0.11), so `x86_64-linux`, `x86-linux`, `x86_64-win32` and `x86-win32` are
+  committed. **macOS is the one platform not shipped from CI**: the lane builds the
+  host arch (arm64) against Homebrew, which is neither universal nor self-contained;
+  the real universal + codesigned + notarized dylib is a separate release build (see
+  the `README.md` in `src/code/universal-mac/` and the macOS section above). Gated to
+  `main` because CI builds are not byte-reproducible, so a per-branch binary commit
+  would collide with main's and block PR merges.
 
 All actions are pinned to a major version (`actions/checkout@v4`, …).
