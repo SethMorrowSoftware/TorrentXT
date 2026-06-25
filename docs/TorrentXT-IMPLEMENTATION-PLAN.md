@@ -3,10 +3,16 @@
 > **Working name:** TorrentXT · **LCB module:** `org.openxtalk.library.torrent` ·
 > **Native lib (bare token):** `torrentxt` · **C ABI prefix:** `btx_` · **Public LCB prefix:** `bt`
 >
-> **Status:** pre-implementation plan. This is the brief for the coding agent(s) who
-> will build this extension. It predates the code. Where it specifies an exact
-> upstream signature it says *confirm against the libtorrent 2.0.x reference* — do
-> not trust a signature in this doc over the real header.
+> **Status:** *historical design brief* — preserved for the rationale (the engine
+> choice, the C-ABI design, the risk register), not as a description of the current
+> state. The extension is built: the shim, the LCB binding, the tests, and four of
+> five platform binaries ship today. Where this brief differs from the as-built
+> code, **the code and the current docs win** — most notably the teardown handler
+> shipped as **`btStopSession`** (not the `btStopSession` this brief sometimes names),
+> and the out-buffer marshalling shipped via the engine `<builtin>`
+> `MCMemoryAllocate` path (not a pre-sized `Data` bridged to a `Pointer`; see the
+> FFI section of `docs/architecture.md`). For the call-by-call contract read
+> `docs/api-reference.md`; for the as-built shape, `docs/architecture.md`.
 >
 > **Honesty convention (carried from ShowControl):** OXT is a GUI runtime with **no
 > headless way to compile or run `.lcb`/`.livecodescript`**. Anything you cannot
@@ -177,10 +183,10 @@ This is what the next agent designs first and treats as a locked, versioned cont
 2. **Clean shutdown, explicitly.** libtorrent's session runs background threads; it
    must be paused, given a moment to write resume data, and destroyed in order. OXT
    has **no deterministic extension-unload hook**, so cleanup cannot be automatic:
-   expose `btStopSession`/`btShutdown` and **document that the app must call it**
+   expose `btStopSession` and **document that the app must call it**
    (e.g. on `closeStack`/`shutdown`). A session leaked at quit is the expected failure
    if the app forgets — design `btStartSession` to refuse a second session while one
-   is live, and make `btShutdown` idempotent.
+   is live, and make `btStopSession` idempotent.
 
 ### 4.3 Symbol families (illustrative surface — confirm exact upstream signatures)
 
@@ -311,15 +317,18 @@ recycled slot.
 ## 6. Crossing the FFI — marshalling (carry the ShowControl lessons)
 
 - **Byte buffers cross as (Pointer, length).** An inbound `Data` (a .torrent file, resume
-  data) bridges to a pointer to its first byte. For an **out** buffer (alert drain,
-  status snapshot, resume bytes), the LCB layer **pre-sizes a `Data`** to capacity and
-  passes it as the `Pointer` the shim fills; the shim returns bytes written or
-  `-needed` so the caller can grow and retry.
-- **Run the Phase-0 `Data`⇄`Pointer` spike FIRST** (ShowControl's `docs/phase0-ffi-spike.md`
-  is the template). It is the one empirically-unconfirmed FFI primitive. **Good news:**
-  it is *lower-stakes here* than for a hand-rolled engine, because we cross **status
-  records, not payload** — but confirm it before building on it. Document the
-  hex-over-string fallback if it resolves badly.
+  data) passes the read-only pointer to its own bytes (`MCDataGetBytePtr`) plus a length.
+  For an **out** buffer (alert drain, status snapshot, resume bytes), the LCB layer hands
+  the shim a raw `MCMemoryAllocate` block as the `Pointer` to fill; the shim returns bytes
+  written or `-needed`, and the binding copies the written bytes back with
+  `MCDataCreateWithBytes`. *(As-built note: an LCB `Data` does **not** auto-bridge to a
+  `Pointer`, so the pre-sized-`Data` idiom this brief originally proposed was replaced by
+  the `<builtin>` allocator path above — see the FFI section of `docs/architecture.md`.)*
+- **The `Data`⇄`Pointer` marshalling was the one empirically-unconfirmed FFI primitive.**
+  It is *lower-stakes here* than for a hand-rolled engine, because we cross **status
+  records, not payload**. It is now implemented and statically gated; it still wants the
+  human OXT pass, and the **hex-over-string fallback** is recorded in
+  `docs/architecture.md` if a strict build resolves it badly.
 - **Reuse a persistent drain/status buffer in the poll hot path.** Rebuilding an N-byte
   `Data` every poll is O(N) interpreter work; allocate `sDrain` / `sStatus` once at a
   sane cap and reuse (the proven `midi.lcb` pattern).
@@ -449,10 +458,10 @@ re-derived here — they are **load-bearing constraints** for this project too. 
 - **Exception firewall:** `try/catch(...)` at every `extern "C"` entry; no exception
   ever crosses into LCB.
 - **Explicit, idempotent shutdown:** no deterministic LCB unload hook, so the app must
-  call `btShutdown`; refuse a second concurrent session; flush resume data and join
+  call `btStopSession`; refuse a second concurrent session; flush resume data and join
   threads on teardown.
 - **Thread lifecycle / static init:** libtorrent's threads must outlive no LCB call and
-  must be torn down only via `btShutdown`; never touch script from any libtorrent
+  must be torn down only via `btStopSession`; never touch script from any libtorrent
   thread (that is the §3 rule, restated for the C++ context).
 
 ---
@@ -462,12 +471,20 @@ re-derived here — they are **load-bearing constraints** for this project too. 
 Each phase ends at a **gate** with a concrete "done" definition. Do not start a phase
 before its predecessor's gate is green.
 
+> **As-built status.** Phases 0–3 are implemented in `src/torrent_shim.cpp` +
+> `src/torrent.lcb` and gated by the test suite — pending only the human OXT pass
+> noted throughout the repo. Phase 4 is largely done: four of five platform
+> binaries are built and committed under `src/code/`, leaving only the macOS
+> universal dylib + notarization. Phase 5 (the visual widget) is the remaining
+> optional work. The phase list below is the original plan, kept for its gate
+> definitions.
+
 - **Phase 0 — Spike & skeleton.** Stand up the CMake build of libtorrent+Boost on at
   least Linux x64; produce a `torrentxt` lib exporting `btx_abi_version`; wire the LCB
   `checkABI()`; run the **Data⇄Pointer + abi_version round-trip in OXT**. Stand up CI.
   *Gate:* the human confirms the round-trip compiles and runs in OXT.
 - **Phase 1 — Download-only, end to end.** Session lifecycle (`btStartSession`/
-  `btShutdown`), `btAddMagnet` + `btAddTorrentFile`, the **alert drain** + record schema
+  `btStopSession`), `btAddMagnet` + `btAddTorrentFile`, the **alert drain** + record schema
   + golden test, the **poll dispatcher**, and a minimal `btTorrentStatus`. *Gate:* add a
   magnet for a legal Linux ISO, receive `metadataReceived`, watch `pieceFinished` events
   and progress climb, get `torrentFinished`, and the file verifies against its published
@@ -508,10 +525,10 @@ TorrentXT/
 │   └── package-extension.py        refresh the committed code/<platform>/ trees
 ├── examples/
 │   ├── torrent-helpers.livecodescript   the poll dispatcher + sugar
-│   └── torrent-demo.livecodescript      add-a-magnet, show progress, finish
+│   ├── torrent-client.livecodescript    the flagship multi-torrent client
+│   └── torrent-demo.livecodescript      minimal add-a-magnet walkthrough
 ├── docs/
-│   ├── architecture.md  building.md  getting-started.md  api-reference.md
-│   └── phase0-ffi-spike.md
+│   └── architecture.md  building.md  getting-started.md  api-reference.md
 ├── CMakeLists.txt
 ├── CLAUDE.md                       as-built record + the carried-forward lessons (shipped with this plan)
 └── .github/workflows/build.yml     static + golden + ASan/UBSan gate, then the build matrix
@@ -528,7 +545,7 @@ TorrentXT/
 - **`Data`⇄`Pointer` marshalling unknown.** Mitigation: Phase-0 spike first; and the
   payload-doesn't-cross design makes it low-stakes (status records only).
 - **No deterministic LCB unload → leaked session/threads.** Mitigation: explicit,
-  idempotent `btShutdown`; refuse double sessions; document the app's obligation.
+  idempotent `btStopSession`; refuse double sessions; document the app's obligation.
 - **C++ exceptions crossing the FFI.** Mitigation: the `catch(...)` firewall at every
   entry point, asserted by a smoke test.
 - **Binary size / macOS notarization friction.** Mitigation: budget Phase 4 for it; it

@@ -47,7 +47,7 @@ All are plain `-D` flags. Defaults favour a portable, reproducible build.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `TORRENTXT_BUILD_TESTS` | `OFF` | Build + register the ctest suite (`record_handle_test`, and `torrent_smoke_test` once the shim/test exist). |
+| `TORRENTXT_BUILD_TESTS` | `OFF` | Build + register the ctest suite (`record_handle_test` and `torrent_smoke_test`). |
 | `TORRENTXT_USE_SYSTEM_LIBTORRENT` | `OFF` | Use `find_package(LibtorrentRasterbar)` + `find_package(Boost)` (vcpkg / apt / system install) instead of FetchContent. Fast — no upstream rebuild. |
 | `TORRENTXT_SANITIZE` | `OFF` | Build **all** our C++ under gcc ASan+UBSan (`-fno-sanitize-recover=all`). Ignored on MSVC. (`record_handle_test` is sanitized even without this — see below.) |
 | `TORRENTXT_LIBTORRENT_TAG` | `v2.0.11` | The pinned libtorrent git tag for the FetchContent path. Change only deliberately. |
@@ -233,7 +233,7 @@ The jobs:
 
 - **`static-gates`** (ubuntu, every push/PR, < 1 min, **no libtorrent**): runs
   `check-livecodescript.py`, `tests/record_golden_test.py`,
-  `tools/check-record-registry.py` (if present), and builds + runs
+  `tools/check-record-registry.py`, and builds + runs
   `record_handle_test` directly with gcc ASan+UBSan. This is the gate that must
   always stay green.
 - **`sanitize`** (ubuntu): builds the shim + smoke test under gcc ASan+UBSan against
