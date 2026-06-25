@@ -1,16 +1,24 @@
-# .github/workflows/build.yml — TorrentXT CI (plan §7 build/packaging, §8 testing).
+# .github/workflows/build.yml - TorrentXT CI (plan section 7 build/packaging,
+# section 8 testing).
 #
-#   static-gates : every push/PR. NO libtorrent, < 1 min. The always-green gate
-#                  (LCB checker, record golden, registry cross-check, header-only
-#                  record_handle_test under gcc ASan/UBSan).
+#   static-gates    : every push/PR. NO libtorrent, < 1 min. The always-green
+#                     gate (LCB checker, record golden, registry cross-check,
+#                     header-only record_handle_test under gcc ASan/UBSan).
 #
-#   build-matrix : every push/PR. All five targets build the shim against
-#                  libtorrent and run ctest (record_handle_test + the
-#                  libtorrent-linked torrent_smoke_test). libtorrent is acquired
-#                  per-OS by the most reliable route: apt (linux x64), vcpkg
-#                  (Windows), Homebrew (macOS, host arch), and FetchContent at the
-#                  pinned v2.0.11 built -m32 (linux x86). fail-fast is off so one
-#                  platform never masks another.
+#   sanitize        : the shim memory-safety gate - build the shim + smoke test
+#                     under gcc ASan+UBSan against system libtorrent and run them.
+#
+#   build-matrix    : every push/PR. All five targets build the shim (Release)
+#                     against libtorrent and run ctest. libtorrent is acquired
+#                     per-OS by the most reliable route: apt (linux x64), vcpkg
+#                     (Windows), Homebrew (macOS, host arch), and FetchContent at
+#                     the pinned v2.0.11 built -m32 (linux x86). fail-fast off so
+#                     one platform never masks another. Each lane uploads its
+#                     built lib as the artifact native-<platform-id>.
+#
+#   commit-binaries : on push, gather every built lib and commit it into its
+#                     src/code/<arch-platform>/ folder ([skip ci], so no loop) so
+#                     the repo ships ready-to-use native libraries.
 #
 # NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) — proving the
 # binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
@@ -64,6 +72,35 @@ jobs:
             tests/record_handle_test.cpp -o record_handle_test
           ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./record_handle_test
 
+  sanitize:
+    # The shim memory-safety gate: build the shim + smoke test under gcc
+    # ASan+UBSan against system libtorrent and run them. Kept separate from
+    # build-matrix so the committed binaries stay clean Release builds (an
+    # ASan-instrumented .so is not distributable).
+    name: shim ASan+UBSan (linux x86_64)
+    needs: static-gates
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire libtorrent (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtorrent-rasterbar-dev libboost-dev ninja-build
+      - name: Configure + build + test under ASan/UBSan
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTORRENTXT_BUILD_TESTS=ON \
+            -DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON \
+            -DTORRENTXT_SANITIZE=ON
+          cmake --build build --parallel 4
+          # detect_container_overflow off: our ASan code links a non-instrumented
+          # system libtorrent, which would otherwise false-positive on std
+          # containers crossing that boundary.
+          ASAN_OPTIONS=detect_container_overflow=0:halt_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1 \
+          ctest --test-dir build --output-on-failure
+
   build-matrix:
     name: ${{ matrix.name }}
     needs: static-gates
@@ -77,7 +114,9 @@ jobs:
             os: ubuntu-22.04
             platform_id: x86_64-linux
             acquire: apt
-            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -DTORRENTXT_SANITIZE=ON"
+            # Release build (NOT sanitized) so the committed binary is
+            # distributable; the ASan/UBSan shim test runs in the `sanitize` job.
+            cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON"
 
           # ---- Linux x86 (32-bit) — FetchContent libtorrent @ v2.0.11, -m32,
           #      against the i386 system Boost. The hard lane (no 32-bit apt
@@ -206,6 +245,65 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: torrentxt-${{ matrix.name }}
+          # named by platform-id so commit-binaries can place it without a map
+          name: native-${{ matrix.platform_id }}
           path: src/code/${{ matrix.platform_id }}/
           if-no-files-found: ignore
+
+  commit-binaries:
+    # Automatic library placement: gather every freshly built lib and commit it
+    # into its src/code/<arch-platform>/ folder so the repo ships ready-to-use
+    # binaries (resolved by `the revLibraryMapping`). Runs only on push; the
+    # commit carries [skip ci] so it does not trigger another run.
+    #
+    # NOTE: requires the repo's Actions setting "Workflow permissions" =
+    # "Read and write permissions" (Settings > Actions > General) for the
+    # GITHUB_TOKEN push to succeed. To reduce churn you can gate this to one
+    # branch by changing the `if:` below to e.g.
+    #   github.ref == 'refs/heads/main'.
+    # macOS note: the staged universal-mac lib is the CI HOST arch (arm64) only;
+    # the true universal+notarized dylib is a separate release build.
+    name: commit native libs to src/code
+    needs: build-matrix
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Download all built native libs
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+          pattern: native-*
+      - name: Place each lib into its src/code/<arch-platform>/ folder
+        run: |
+          shopt -s nullglob
+          placed=0
+          for dir in _artifacts/native-*/; do
+            id="${dir#_artifacts/native-}"; id="${id%/}"
+            mkdir -p "src/code/$id"
+            for f in "$dir"*; do
+              cp "$f" "src/code/$id/"
+              echo "placed src/code/$id/$(basename "$f")"
+              placed=1
+            done
+          done
+          rm -rf _artifacts
+          if [ "$placed" = 0 ]; then
+            echo "No native-lib artifacts found (all builds may have failed)."
+          fi
+      - name: Commit refreshed binaries (skip CI to avoid a loop)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/code
+          if git diff --cached --quiet; then
+            echo "Native libs unchanged - nothing to commit."
+            exit 0
+          fi
+          git commit -m "CI: place freshly built native libs in src/code/<arch-platform>/ [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}" || \
+            echo "push rejected (branch advanced during the run); the next push refreshes it."
