@@ -117,11 +117,17 @@ command tcBuildUI
    tcMakeButton "tcSeed", "Create + Seed Folder", "568,70,844,94"
    -- table header + selectable list (double-click a row to open its folder)
    tcMakeLabel "tcHeader", \
-      "#" & tab & "Name" & tab & "State" & tab & "%" & tab & "Down" & tab & "Up" & tab & "Peers" & tab & "Size", \
+      "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Down" & tab & "Up" & tab & "Peers" & tab & "Size", \
       "16,102,844,120", 10
    tcMakeList "tcTorrents", "16,122,844,358", false
-   set the tabStops of field "tcHeader" to "26,270,380,440,520,600,670"
-   set the tabStops of field "tcTorrents" to "26,270,380,440,520,600,670"
+   set the tabStops of field "tcHeader" to "26,250,350,510,590,670,720"
+   set the tabStops of field "tcTorrents" to "26,250,350,510,590,670,720"
+   -- a fixed-width font lets the inline progress bars and the right-hand byte
+   -- columns line up cleanly; OXT falls back gracefully if Courier is absent.
+   set the textFont of field "tcHeader" to "Courier"
+   set the textFont of field "tcTorrents" to "Courier"
+   set the textSize of field "tcHeader" to 11
+   set the textSize of field "tcTorrents" to 11
    -- per-torrent controls (row 1)
    tcMakeButton "tcPause", "Pause", "16,364,104,390"
    tcMakeButton "tcResume", "Resume", "108,364,196,390"
@@ -411,12 +417,13 @@ end tcReportAdd
 
 -- ---- per-torrent control (on the selected table row) -------------------------
 command tcControlSelected pAction
-   local tH
+   local tH, tLine, tLeft
    put tcSelectedHandle() into tH
    if tH is 0 then
       tcLogMsg "Select a torrent in the table first."
       exit tcControlSelected
    end if
+   put item 1 of (the hilitedLines of field "tcTorrents") into tLine
    switch pAction
       case "pause"
          btPause tH
@@ -448,6 +455,25 @@ command tcControlSelected pAction
          break
    end switch
    tcRefreshOnce
+   -- after a removal the row indices shift; keep a neighbouring row selected so
+   -- the per-torrent buttons stay live and the user keeps their place.
+   if pAction is "remove" or pAction is "removeData" then
+      put the number of lines of field "tcTorrents" into tLeft
+      if tLeft > 0 then
+         if tLine is not a number then
+            put 1 into tLine
+         end if
+         if tLine > tLeft then
+            put tLeft into tLine
+         end if
+         if tLine < 1 then
+            put 1 into tLine
+         end if
+         set the hilitedLines of field "tcTorrents" to tLine
+         tcEnableControls true
+         tcUpdateDetail tcSelectedHandle()
+      end if
+   end if
 end tcControlSelected
 
 -- Pause or resume every torrent in the session.
@@ -630,6 +656,7 @@ end tcRefreshLoop
 
 command tcRefreshOnce
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tSelH, tSelLine, tNewMap, tLineNum, tNodes, tDht
+   local tColors, tErr
    if sSession is 0 or sSession is empty then
       exit tcRefreshOnce
    end if
@@ -650,8 +677,10 @@ command tcRefreshOnce
       add 1 to tLineNum
       put tH into tNewMap[tLineNum]
       put (the round of (tS["progress"] * 1000) / 10) into tPct
-      put tLineNum & tab & tcTrunc(tS["name"], 40) & tab & tcStateName(tS["state"]) & tab & \
-          tPct & "%" & tab & tcFmtBytes(tS["downloadRate"]) & tab & tcFmtBytes(tS["uploadRate"]) & tab & \
+      put tcStateColor(tS["state"], tS["error"]) into tColors[tLineNum]
+      put tLineNum & tab & tcTrunc(tS["name"], 28) & tab & tcStateName(tS["state"]) & tab & \
+          tcProgressBar(tPct) & tab & (tcFmtBytes(tS["downloadRate"]) & "/s") & tab & \
+          (tcFmtBytes(tS["uploadRate"]) & "/s") & tab & \
           tS["numPeers"] & tab & tcFmtBytes(tS["totalSize"]) & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
@@ -667,6 +696,15 @@ command tcRefreshOnce
    if tSelLine is not empty then
       set the hilitedLines of field "tcTorrents" to tSelLine
    end if
+   -- color each row by state (green=seeding/done, blue=downloading,
+   -- amber=checking, gray=paused/queued, red=error). Wrapped so a platform that
+   -- dislikes per-line coloring still shows the table, just monochrome.
+   try
+      repeat with tI = 1 to tLineNum
+         set the foregroundColor of line tI of field "tcTorrents" to tColors[tI]
+      end repeat
+   catch tErr
+   end try
    -- per-torrent buttons are usable only when a row is selected
    tcEnableControls (tSelLine is not empty)
    -- DHT status: show the real node count if the shim reports one, else on/off.
@@ -746,6 +784,43 @@ function tcStateName pState
    end switch
 end tcStateName
 
+-- A compact 10-segment ASCII progress bar, e.g. [#######---] 72.5%. Fixed width
+-- so it lines up in the monospaced table; trunc (not round) of the tenths keeps
+-- the bar from reading "full" until a torrent is genuinely at 100%.
+function tcProgressBar pPct
+   local tFilled
+   put trunc(pPct / 10) into tFilled
+   if tFilled < 0 then
+      put 0 into tFilled
+   end if
+   if tFilled > 10 then
+      put 10 into tFilled
+   end if
+   return "[" & (char 1 to tFilled of "##########") & \
+      (char 1 to (10 - tFilled) of "----------") & "]" && pPct & "%"
+end tcProgressBar
+
+-- Row text color by torrent state (the numeric state from the status record),
+-- with any error overriding everything to red. Mirrors tcStateName's numbering.
+function tcStateColor pState, pError
+   if pError is not empty then
+      return "200,40,40"
+   end if
+   switch pState
+      case 4
+      case 5
+         return "0,140,70"
+      case 3
+         return "30,90,200"
+      case 1
+      case 2
+      case 7
+         return "190,130,0"
+      default
+         return "110,110,110"
+   end switch
+end tcStateColor
+
 function tcFmtBytes pBytes
    local tUnits, tVal, tI
    if pBytes is empty or pBytes is not a number then
@@ -823,5 +898,11 @@ command tcLogMsg pMsg
       exit tcLogMsg
    end if
    put the time & "  " & pMsg & return after field "tcLog"
+   -- keep the log bounded so a long-running session never bloats the field;
+   -- rebuilding a huge field on every append is the kind of O(N) interpreter
+   -- cost the performance playbook warns about.
+   if the number of lines of field "tcLog" > 250 then
+      delete line 1 to (the number of lines of field "tcLog" - 250) of field "tcLog"
+   end if
    set the vScroll of field "tcLog" to the formattedHeight of field "tcLog"
 end tcLogMsg
