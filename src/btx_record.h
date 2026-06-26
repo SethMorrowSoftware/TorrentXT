@@ -113,7 +113,19 @@ enum FieldId : uint8_t {
     F_DHT_NODES         = 100, /* int */
     F_DHT_NODE_CACHE    = 101, /* int */
     F_DHT_GLOBAL_NODES  = 102, /* int (64-bit estimate) */
-    F_DHT_TORRENTS      = 103  /* int */
+    F_DHT_TORRENTS      = 103, /* int */
+
+    /* ---- DHT BEP44 items (104..119) ---- */
+    F_DHT_TARGET        = 104, /* hex: immutable target / mutable lookup target */
+    F_DHT_VALUE         = 105, /* raw: stored item value bytes (BEP44 <= 1000 B) */
+    F_DHT_PUBLIC_KEY    = 106, /* hex: 32-byte ed25519 public key */
+    F_DHT_SIGNATURE     = 107, /* hex: 64-byte ed25519 signature */
+    F_DHT_SEQ           = 108, /* int: mutable item sequence number */
+    F_DHT_SALT          = 109, /* utf8: mutable item salt ("" if none) */
+    F_DHT_AUTHORITATIVE = 110, /* int 0/1: mutable get response is authoritative */
+    F_DHT_NUM_SUCCESS   = 111, /* int: nodes that accepted a put */
+    F_DHT_SECRET_KEY    = 112, /* hex: 64-byte ed25519 secret key */
+    F_DHT_SEED          = 113  /* hex: 32-byte ed25519 seed (persist to keep identity) */
 };
 
 /* ------------------------------------------------------------- alert codes */
@@ -142,7 +154,10 @@ enum AlertType : uint16_t {
     A_FILE_ERROR          = 18,
     A_STORAGE_MOVED       = 19,
     A_FASTRESUME_REJECTED = 20,
-    A_SCRAPE_REPLY        = 21
+    A_SCRAPE_REPLY        = 21,
+    A_DHT_IMMUTABLE_ITEM  = 22,  /* dht_get_item (immutable) result */
+    A_DHT_MUTABLE_ITEM    = 23,  /* dht_get_item (mutable) result */
+    A_DHT_PUT             = 24   /* dht_put_item completed (immutable or mutable) */
 };
 
 /* ====================================================================== *

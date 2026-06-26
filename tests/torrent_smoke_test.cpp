@@ -143,6 +143,11 @@ static void test_bogus_handles_are_noops() {
         char buf[256];
         CHECK(btx_dht_state(h, buf, sizeof buf) == 0);
         CHECK(btx_dht_save_state(h, buf, sizeof buf) == 0);
+        CHECK(btx_dht_put_immutable(h, "x", 1, buf, sizeof buf) == 0);
+        CHECK(btx_dht_get_immutable(h,
+              "0123456789012345678901234567890123456789") < 0);
+        CHECK(btx_dht_put_mutable(h, "p", "s", "", "x", 1) < 0);
+        CHECK(btx_dht_get_mutable(h, "p", "") < 0);
         CHECK(btx_get_setting(h, "user_agent", buf, sizeof buf) == 0);
 
         /* the alert drain on a bogus session -> 0 alerts, no crash. */
@@ -451,6 +456,65 @@ static void test_drain_oversized_makes_progress() {
     fs::remove_all(dir, ec);
 }
 
+/* BEP44: keypair generation/determinism, the immutable target contract, and
+ * that every put/get wires up and validates input cleanly. The actual DHT
+ * round-trip needs a live swarm (confirmed in an OXT pass), but the deterministic
+ * pieces and the input-validation are checked here under the sanitizers. */
+static std::string field_text(const unsigned char *rec, int n, uint8_t id) {
+    btx::RecordReader rr(rec, static_cast<size_t>(n < 0 ? 0 : n));
+    std::vector<btx::Field> fs;
+    if (!rr.read_record(fs)) return std::string();
+    for (const btx::Field &f : fs) if (f.id == id) return f.text();
+    return std::string();
+}
+
+static void test_dht_bep44() {
+    /* keypair generation is session-less; hex widths are exact. */
+    unsigned char kp[512];
+    int n = btx_dht_keypair("", kp, sizeof kp);
+    CHECK(n > 0);
+    std::string pubHex  = field_text(kp, n, btx::F_DHT_PUBLIC_KEY);
+    std::string secHex  = field_text(kp, n, btx::F_DHT_SECRET_KEY);
+    std::string seedHex = field_text(kp, n, btx::F_DHT_SEED);
+    CHECK(pubHex.size() == 64);    /* 32-byte ed25519 public key  */
+    CHECK(secHex.size() == 128);   /* 64-byte secret key          */
+    CHECK(seedHex.size() == 64);   /* 32-byte seed                */
+
+    /* re-deriving from the same seed is deterministic. */
+    unsigned char kp2[512];
+    int n2 = btx_dht_keypair(seedHex.c_str(), kp2, sizeof kp2);
+    CHECK(n2 > 0);
+    CHECK(field_text(kp2, n2, btx::F_DHT_PUBLIC_KEY) == pubHex);
+
+    int s = btx_session_new();
+    CHECK(s > 0);
+
+    /* immutable put returns a 40-hex target, identical for identical data. */
+    char tgt[64], tgt2[64];
+    const char *val = "hello world";
+    const int vlen = static_cast<int>(std::strlen(val));
+    CHECK(btx_dht_put_immutable(s, val, vlen, tgt, sizeof tgt) == 40);
+    CHECK(btx_dht_put_immutable(s, val, vlen, tgt2, sizeof tgt2) == 40);
+    CHECK(std::string(tgt, 40) == std::string(tgt2, 40));
+
+    /* the gets and the mutable put wire up and return cleanly. */
+    CHECK(btx_dht_get_immutable(s, std::string(tgt, 40).c_str()) == BTX_OK);
+    CHECK(btx_dht_put_mutable(s, pubHex.c_str(), secHex.c_str(), "myapp", val, vlen) == BTX_OK);
+    CHECK(btx_dht_get_mutable(s, pubHex.c_str(), "myapp") == BTX_OK);
+    CHECK(btx_dht_get_mutable(s, pubHex.c_str(), "") == BTX_OK);  /* empty salt */
+
+    /* bad hex / wrong key length / oversize value -> clean BTX_ERR_INVALID_ARG. */
+    CHECK(btx_dht_get_immutable(s, "not-hex") == BTX_ERR_INVALID_ARG);
+    CHECK(btx_dht_get_mutable(s, "short", "") == BTX_ERR_INVALID_ARG);
+    CHECK(btx_dht_put_mutable(s, "short", "short", "", val, vlen) == BTX_ERR_INVALID_ARG);
+    std::vector<char> big(1001, 'x');
+    CHECK(btx_dht_put_mutable(s, pubHex.c_str(), secHex.c_str(), "",
+          big.data(), static_cast<int>(big.size())) == BTX_ERR_INVALID_ARG);
+
+    btx_session_free(s);
+    CHECK(btx::test::live_session_count() == 0);
+}
+
 int main() {
     test_session_lifecycle();
     test_bogus_handles_are_noops();
@@ -460,6 +524,7 @@ int main() {
     test_buffer_needed_contract();
     test_alert_drain_roundtrip();
     test_drain_oversized_makes_progress();
+    test_dht_bep44();
 
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

@@ -74,6 +74,10 @@
 #include <libtorrent/session_handle.hpp>      /* save_state_flags_t, session_state() */
 #include <libtorrent/session_params.hpp>      /* read/write_session_params_buf (public, exported) */
 #include <libtorrent/kademlia/dht_state.hpp>  /* dht::dht_state type for set_dht_state() */
+#include <libtorrent/kademlia/ed25519.hpp>    /* ed25519 keypair + signing (BEP44 mutable) */
+#include <libtorrent/kademlia/item.hpp>       /* sign_mutable_item (BEP44 mutable) */
+#include <libtorrent/kademlia/types.hpp>      /* public_key / secret_key / signature */
+#include <libtorrent/entry.hpp>               /* lt::entry for DHT item values */
 
 /* ---- standard library ------------------------------------------------------ */
 #include <cstring>
@@ -126,6 +130,15 @@ struct PendingAlert {
     bool hasName = false;           std::string name;
     bool hasEndpoint = false;       std::string endpoint;
     bool hasResumeData = false;     std::vector<char> resumeData;
+    /* ---- DHT BEP44 item fields (A_DHT_IMMUTABLE_ITEM / MUTABLE_ITEM / PUT) ---- */
+    bool hasDhtTarget = false;        std::string dhtTarget;       /* hex */
+    bool hasDhtValue = false;         std::vector<char> dhtValue;
+    bool hasDhtPublicKey = false;     std::string dhtPublicKey;    /* hex */
+    bool hasDhtSignature = false;     std::string dhtSignature;    /* hex */
+    bool hasDhtSeq = false;           long long dhtSeq = 0;
+    bool hasDhtSalt = false;          std::string dhtSalt;
+    bool hasDhtAuthoritative = false; long long dhtAuthoritative = 0;
+    bool hasDhtNumSuccess = false;    long long dhtNumSuccess = 0;
 };
 
 /* The whole world a session owns. Boxed in a unique_ptr inside the session
@@ -228,6 +241,45 @@ template <typename Hash>
 std::string hash_hex(const Hash &h) {
     return btx::to_hex(reinterpret_cast<const uint8_t *>(h.data()),
                        static_cast<size_t>(h.size()));
+}
+
+/* An ed25519 seed is 32 bytes; aliased so the bare `std::array<char, 32>` comma
+ * never sits at the top level of a BTX_GUARD_* macro body (the preprocessor only
+ * protects commas inside parentheses, not angle brackets). */
+using ed_seed = std::array<char, 32>;
+
+/* Parse exactly `n` bytes of hex (either case) from `hex` into `out`. Returns
+ * false on NULL, wrong length, or a non-hex digit — so a bad key/target/seed
+ * from script becomes a clean BTX_ERR_INVALID_ARG, never a crash. */
+bool hex_to_buf(const char *hex, char *out, size_t n) {
+    if (!hex) return false;
+    if (std::strlen(hex) != n * 2) return false;
+    auto nyb = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        int hi = nyb(hex[2 * i]), lo = nyb(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<char>((hi << 4) | lo);
+    }
+    return true;
+}
+
+/* The raw bytes of a DHT item value. Our put side always stores a bencoded
+ * STRING, so a get of our own item is a string entry we hand back verbatim; a
+ * value some other client stored that is NOT a string is bencoded so nothing is
+ * silently lost. */
+std::vector<char> entry_to_bytes(const lt::entry &e) {
+    if (e.type() == lt::entry::string_t) {
+        const std::string &s = e.string();
+        return std::vector<char>(s.begin(), s.end());
+    }
+    std::vector<char> buf;
+    lt::bencode(std::back_inserter(buf), e);
+    return buf;
 }
 
 /* ---- settings key type validation ----------------------------------------- */
@@ -1232,6 +1284,36 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
         out.hasMessage = true; out.message = p->message();
         return true;
     }
+    if (auto *p = lt::alert_cast<lt::dht_immutable_item_alert>(a)) {
+        out.type = btx::A_DHT_IMMUTABLE_ITEM;
+        out.hasDhtTarget = true; out.dhtTarget = hash_hex(p->target);
+        out.hasDhtValue = true;  out.dhtValue = entry_to_bytes(p->item);
+        return true;
+    }
+    if (auto *p = lt::alert_cast<lt::dht_mutable_item_alert>(a)) {
+        out.type = btx::A_DHT_MUTABLE_ITEM;
+        out.hasDhtPublicKey = true;    out.dhtPublicKey = hash_hex(p->key);
+        out.hasDhtSignature = true;    out.dhtSignature = hash_hex(p->signature);
+        out.hasDhtSeq = true;          out.dhtSeq = static_cast<long long>(p->seq);
+        out.hasDhtSalt = true;         out.dhtSalt = p->salt;
+        out.hasDhtValue = true;        out.dhtValue = entry_to_bytes(p->item);
+        out.hasDhtAuthoritative = true; out.dhtAuthoritative = p->authoritative ? 1 : 0;
+        return true;
+    }
+    if (auto *p = lt::alert_cast<lt::dht_put_alert>(a)) {
+        out.type = btx::A_DHT_PUT;
+        out.hasDhtNumSuccess = true; out.dhtNumSuccess = p->num_success;
+        /* immutable put -> target is set, public_key zeroed; mutable -> reverse */
+        if (!p->target.is_all_zeros()) {
+            out.hasDhtTarget = true; out.dhtTarget = hash_hex(p->target);
+        } else {
+            out.hasDhtPublicKey = true; out.dhtPublicKey = hash_hex(p->public_key);
+            out.hasDhtSignature = true; out.dhtSignature = hash_hex(p->signature);
+            out.hasDhtSeq = true;       out.dhtSeq = static_cast<long long>(p->seq);
+            out.hasDhtSalt = true;      out.dhtSalt = p->salt;
+        }
+        return true;
+    }
 
     /* Unmapped alert: not surfaced. The broad alert_mask still lets a few
      * uninteresting categories through; we drop them HERE (not at the queue) so
@@ -1273,6 +1355,14 @@ void write_alert_entry(btx::RecordWriter &rw, const PendingAlert &pa) {
         if (pa.hasInfoHashV2)   r.put_hex(btx::F_EVT_INFO_HASH_V2, pa.infoHashV2);
         if (pa.hasName)         r.put_str(btx::F_EVT_NAME, pa.name);
         if (pa.hasEndpoint)     r.put_str(btx::F_EVT_ENDPOINT, pa.endpoint);
+        if (pa.hasDhtTarget)        r.put_hex(btx::F_DHT_TARGET, pa.dhtTarget);
+        if (pa.hasDhtValue)         r.put_bytes(btx::F_DHT_VALUE, pa.dhtValue.data(), pa.dhtValue.size());
+        if (pa.hasDhtPublicKey)     r.put_hex(btx::F_DHT_PUBLIC_KEY, pa.dhtPublicKey);
+        if (pa.hasDhtSignature)     r.put_hex(btx::F_DHT_SIGNATURE, pa.dhtSignature);
+        if (pa.hasDhtSeq)           r.put_int(btx::F_DHT_SEQ, pa.dhtSeq);
+        if (pa.hasDhtSalt)          r.put_str(btx::F_DHT_SALT, pa.dhtSalt);
+        if (pa.hasDhtAuthoritative) r.put_int(btx::F_DHT_AUTHORITATIVE, pa.dhtAuthoritative);
+        if (pa.hasDhtNumSuccess)    r.put_int(btx::F_DHT_NUM_SUCCESS, pa.dhtNumSuccess);
         r.finish();
     }
     rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
@@ -1472,6 +1562,116 @@ extern "C" BTX_API int BTX_CALL btx_dht_load_state(int s, const void *data,
             {reinterpret_cast<char const *>(data), len},
             lt::session_handle::save_dht_state);
         st->ses->set_dht_state(std::move(params.dht_state));
+        return BTX_OK;
+    });
+}
+
+/* ====================================================================== *
+ *  BEP44: the DHT as a key-value store
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_dht_keypair(const char *seedHexOrEmpty,
+                                                void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        ed_seed seed;
+        if (seedHexOrEmpty && *seedHexOrEmpty) {
+            if (!hex_to_buf(seedHexOrEmpty, seed.data(), 32)) {
+                set_error("seed must be empty or 64 hex chars");
+                return 0;
+            }
+        } else {
+            seed = lt::dht::ed25519_create_seed();
+        }
+        lt::dht::public_key pk;
+        lt::dht::secret_key sk;
+        std::tie(pk, sk) = lt::dht::ed25519_create_keypair(seed);
+
+        btx::RecordWriter w(out, cap);
+        btx::KVRecord r(w);
+        r.put_hex(btx::F_DHT_PUBLIC_KEY, hash_hex(pk.bytes));
+        r.put_hex(btx::F_DHT_SECRET_KEY, hash_hex(sk.bytes));
+        r.put_hex(btx::F_DHT_SEED, hash_hex(seed));
+        r.finish();
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_put_immutable(int s, const void *data,
+                                                      int len, char *outTargetHex,
+                                                      int cap) {
+    BTX_GUARD_BUFFER({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;  /* no session -> 0 (no target) */
+        if (!data || len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return 0; }
+        lt::entry e(std::string(static_cast<const char *>(data),
+                                static_cast<size_t>(len)));
+        /* dht_put_item returns the target (SHA-1 of the bencoded value) NOW; the
+         * store itself confirms later as an A_DHT_PUT alert. */
+        lt::sha1_hash target = st->ses->dht_put_item(e);
+        std::string hex = hash_hex(target);
+        const size_t need = hex.size();
+        if (outTargetHex && cap > 0 && need <= static_cast<size_t>(cap))
+            std::memcpy(outTargetHex, hex.data(), need);
+        if (need > static_cast<size_t>(cap < 0 ? 0 : cap))
+            return -static_cast<int>(need);
+        return static_cast<int>(need);
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_get_immutable(int s, const char *targetHex) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        char buf[20];
+        if (!hex_to_buf(targetHex, buf, 20)) {
+            set_error("target must be 40 hex chars"); return BTX_ERR_INVALID_ARG;
+        }
+        st->ses->dht_get_item(lt::sha1_hash(buf));  /* result -> A_DHT_IMMUTABLE_ITEM */
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKeyHex,
+                                                    const char *secretKeyHex,
+                                                    const char *salt,
+                                                    const void *data, int len) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (!data || len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return BTX_ERR_INVALID_ARG; }
+        lt::dht::public_key pk;
+        lt::dht::secret_key sk;
+        if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) { set_error("public key must be 64 hex chars"); return BTX_ERR_INVALID_ARG; }
+        if (!hex_to_buf(secretKeyHex, sk.bytes.data(), 64)) { set_error("secret key must be 128 hex chars"); return BTX_ERR_INVALID_ARG; }
+        std::string salt_s = salt ? salt : "";
+        std::vector<char> val(static_cast<const char *>(data),
+                              static_cast<const char *>(data) + len);
+        /* The signing callback runs on libtorrent's network thread once it has
+         * found where to store the blob. It captures owning COPIES of everything
+         * (value, salt, keypair) — no script, no shared state, no locks — and
+         * signs with sign_mutable_item, honouring rule 1. */
+        st->ses->dht_put_item(pk.bytes,
+            [val, salt_s, pk, sk](lt::entry &e, std::array<char, 64> &sig,
+                                  std::int64_t &seq, std::string const &) {
+                e = lt::entry(std::string(val.begin(), val.end()));
+                seq = seq + 1;  /* monotonic: bump past the current value */
+                lt::dht::signature sg = lt::dht::sign_mutable_item(
+                    val, salt_s, lt::dht::sequence_number(seq), pk, sk);
+                sig = sg.bytes;
+            }, salt_s);
+        return BTX_OK;  /* confirmation -> A_DHT_PUT alert */
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_get_mutable(int s, const char *publicKeyHex,
+                                                    const char *salt) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        lt::dht::public_key pk;
+        if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) { set_error("public key must be 64 hex chars"); return BTX_ERR_INVALID_ARG; }
+        st->ses->dht_get_item(pk.bytes, salt ? salt : "");  /* -> A_DHT_MUTABLE_ITEM */
         return BTX_OK;
     });
 }

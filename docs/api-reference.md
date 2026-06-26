@@ -293,6 +293,47 @@ Restore DHT routing-table state from bytes previously produced by
 `btDhtSaveState`. Returns `0` / negative.
 - **Usage:** command - `btDhtLoadState sSession, tDhtBlob`.
 
+**BEP44 - the DHT as a key-value store.** The DHT can store small (<= 1000-byte)
+values, not just peer lists. **Immutable** items are addressed by the SHA-1 of
+their value (content-addressed, unchangeable); **mutable** items live under an
+ed25519 public key (+ optional salt) and are signed, so the keyholder can publish
+updated, sequence-numbered values. Reads are asynchronous - the value returns as
+a drained `dhtImmutableItem` / `dhtMutableItem` event; puts confirm via a `dhtPut`
+event. Signing happens entirely in the native layer (the secret key never reaches
+a libtorrent thread through script).
+
+### `btDhtKeypair(in pSeed as String) returns Array`
+Generate (pass `""`) or deterministically re-derive (pass a 64-hex `seed`) an
+ed25519 keypair for mutable items. Returns an Array keyed `publicKey` (64 hex),
+`secretKey` (128 hex), `seed` (64 hex). **Persist the seed (or secret key)** to
+keep a stable identity across runs.
+- **Usage:** function - `put btDhtKeypair("") into tKey`, then save `tKey["seed"]`.
+
+### `btDhtPutImmutable(in pSession as Integer, in pData as Data) returns String`
+Store `pData` (1..1000 bytes) as an immutable item. Returns its **target hash**
+(the lookup key) as hex, or `""` on failure; the store confirms later as a
+`dhtPut` event. Anyone with the target can fetch the value.
+- **Usage:** function - `put btDhtPutImmutable(sSession, tBytes) into tTarget`.
+
+### `btDhtGetImmutable(in pSession as Integer, in pTarget as String) returns Integer`
+Look up an immutable item by its 40-hex `pTarget`. Returns `0` / negative; the
+value arrives as a `dhtImmutableItem` event.
+- **Usage:** command - `btDhtGetImmutable sSession, tTarget`.
+
+### `btDhtPutMutable(in pSession as Integer, in pPublicKey as String, in pSecretKey as String, in pSalt as String, in pData as Data) returns Integer`
+Store `pData` (1..1000 bytes) as a mutable item under the ed25519 key (64-hex
+public, 128-hex secret from `btDhtKeypair`), with an optional `pSalt` (`""` for
+none). The native layer signs it and bumps the sequence number. Returns `0` /
+negative; confirms via a `dhtPut` event. Re-putting under the same key+salt
+publishes a new version.
+- **Usage:** command - `btDhtPutMutable sSession, tKey["publicKey"], tKey["secretKey"], "myapp", tBytes`.
+
+### `btDhtGetMutable(in pSession as Integer, in pPublicKey as String, in pSalt as String) returns Integer`
+Look up a mutable item by its 64-hex `pPublicKey` (+ optional `pSalt`). Returns
+`0` / negative; the value arrives as a `dhtMutableItem` event (carrying `value`,
+`seq`, `signature`, `authoritative`).
+- **Usage:** command - `btDhtGetMutable sSession, tPubKey, "myapp"`.
+
 ---
 
 ## Create (seeding side)
@@ -444,14 +485,19 @@ From `_alertName` in `src/torrent.lcb` and the alert registry in
 | `storageMoved` | 19 | `message` | the torrent's storage was moved |
 | `fastresumeRejected` | 20 | `errorCode`, `errorMessage`, `message` | saved resume data was rejected; a recheck follows |
 | `scrapeReply` | 21 | `numPeers`, plus swarm counts in status | a scrape (swarm seeder/leecher counts) returned |
+| `dhtImmutableItem` | 22 | `target`, `value` | a `btDhtGetImmutable` lookup returned a value |
+| `dhtMutableItem` | 23 | `publicKey`, `value`, `seq`, `signature`, `salt`, `authoritative` | a `btDhtGetMutable` lookup returned a value |
+| `dhtPut` | 24 | `numSuccess`, plus `target` (immutable) or `publicKey`/`signature`/`seq`/`salt` (mutable) | a DHT put completed |
 
 The full set of event-array key names available across all alerts (from
-`_fieldKey`, ids `60..73`): `torrent`, `message`, `errorCode`, `errorMessage`,
-`piece`, `state`, `prevState`, `tracker`, `numPeers`, `resumeData`, `infoHashV1`,
-`infoHashV2`, `torrentName`, `endpoint`. Which subset a given alert populates is
-the shim's choice per alert; the column above reflects the intended mapping and
-is implemented in `torrent_shim.cpp`, the source of truth for which subset each
-alert populates.
+`_fieldKey`, ids `60..73` plus the BEP44 item ids `104..113`): `torrent`,
+`message`, `errorCode`, `errorMessage`, `piece`, `state`, `prevState`, `tracker`,
+`numPeers`, `resumeData`, `infoHashV1`, `infoHashV2`, `torrentName`, `endpoint`,
+and for DHT items `target`, `value`, `publicKey`, `secretKey`, `seed`,
+`signature`, `seq`, `salt`, `authoritative`, `numSuccess`. Which subset a given
+alert populates is the shim's choice per alert; the column above reflects the
+intended mapping and is implemented in `torrent_shim.cpp`, the source of truth for
+which subset each alert populates.
 
 ---
 

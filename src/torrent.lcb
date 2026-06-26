@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 2
+constant kABIVersion is 3
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -115,6 +115,16 @@ constant kFieldDhtNodes is 100
 constant kFieldDhtNodeCache is 101
 constant kFieldDhtGlobalNodes is 102
 constant kFieldDhtTorrents is 103
+constant kFieldDhtTarget is 104
+constant kFieldDhtValue is 105
+constant kFieldDhtPublicKey is 106
+constant kFieldDhtSignature is 107
+constant kFieldDhtSeq is 108
+constant kFieldDhtSalt is 109
+constant kFieldDhtAuthoritative is 110
+constant kFieldDhtNumSuccess is 111
+constant kFieldDhtSecretKey is 112
+constant kFieldDhtSeed is 113
 
 -- Stable alert type codes (mirror btx_record.h AlertType -> kAlert*).
 constant kAlertTorrentAdded is 1
@@ -138,6 +148,9 @@ constant kAlertFileError is 18
 constant kAlertStorageMoved is 19
 constant kAlertFastresumeRejected is 20
 constant kAlertScrapeReply is 21
+constant kAlertDhtImmutableItem is 22
+constant kAlertDhtMutableItem is 23
+constant kAlertDhtPut is 24
 
 -- ===================================================================== --
 --  Module state: the reusable poll/status buffers
@@ -201,6 +214,11 @@ private foreign handler _btx_dht_add_bootstrap(in pS as CInt, in pHost as ZStrin
 private foreign handler _btx_dht_state(in pS as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_state!cdecl"
 private foreign handler _btx_dht_save_state(in pS as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_save_state!cdecl"
 private foreign handler _btx_dht_load_state(in pS as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_dht_load_state!cdecl"
+private foreign handler _btx_dht_keypair(in pSeed as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_keypair!cdecl"
+private foreign handler _btx_dht_put_immutable(in pS as CInt, in pData as Pointer, in pLen as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_put_immutable!cdecl"
+private foreign handler _btx_dht_get_immutable(in pS as CInt, in pTarget as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_immutable!cdecl"
+private foreign handler _btx_dht_put_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSec as ZStringUTF8, in pSalt as ZStringUTF8, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_dht_put_mutable!cdecl"
+private foreign handler _btx_dht_get_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_mutable!cdecl"
 
 private foreign handler _btx_save_resume(in pT as CInt) returns CInt binds to "c:torrentxt>btx_save_resume!cdecl"
 private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pTrackers as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
@@ -465,6 +483,26 @@ private handler _fieldKey(in pId as Integer) returns String
       return "globalNodes"
    else if pId is kFieldDhtTorrents then
       return "torrents"
+   else if pId is kFieldDhtTarget then
+      return "target"
+   else if pId is kFieldDhtValue then
+      return "value"
+   else if pId is kFieldDhtPublicKey then
+      return "publicKey"
+   else if pId is kFieldDhtSignature then
+      return "signature"
+   else if pId is kFieldDhtSeq then
+      return "seq"
+   else if pId is kFieldDhtSalt then
+      return "salt"
+   else if pId is kFieldDhtAuthoritative then
+      return "authoritative"
+   else if pId is kFieldDhtNumSuccess then
+      return "numSuccess"
+   else if pId is kFieldDhtSecretKey then
+      return "secretKey"
+   else if pId is kFieldDhtSeed then
+      return "seed"
    else
       return ""
    end if
@@ -515,6 +553,12 @@ private handler _alertName(in pCode as Integer) returns String
       return "fastresumeRejected"
    else if pCode is kAlertScrapeReply then
       return "scrapeReply"
+   else if pCode is kAlertDhtImmutableItem then
+      return "dhtImmutableItem"
+   else if pCode is kAlertDhtMutableItem then
+      return "dhtMutableItem"
+   else if pCode is kAlertDhtPut then
+      return "dhtPut"
    else
       return "torrentEvent"
    end if
@@ -1039,6 +1083,91 @@ public handler btDhtLoadState(in pSession as Integer, in pData as Data) returns 
          put _btx_dht_load_state(pSession, tPtr, the number of bytes in pData) into tR
       end unsafe
    end if
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: BEP44 DHT key-value store
+-- ===================================================================== --
+
+-- Generate (pSeed empty) or deterministically re-derive (pSeed = 64-hex seed)
+-- an ed25519 keypair for mutable items. Returns an Array {publicKey, secretKey,
+-- seed} (all hex); persist the seed (or secretKey) to keep a stable identity.
+public handler btDhtKeypair(in pSeed as String) returns Array
+   variable tCount as Integer
+   _ensureStatus(kStatusCap)
+   unsafe
+      put _btx_dht_keypair(pSeed, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put _btx_dht_keypair(pSeed, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return {}
+   end if
+   return _parseRecord(_bufToData(sStatusPtr, tCount), 1)
+end handler
+
+-- Store pData (1..1000 bytes) as an immutable item. Returns its target hash
+-- (the lookup key) as hex, or "" on failure. The store confirms later as a
+-- dhtPut event.
+public handler btDhtPutImmutable(in pSession as Integer, in pData as Data) returns String
+   variable tCount as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen <= 0 then
+      return ""
+   end if
+   _ensureScratch(kScratchCap)
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+      put _btx_dht_put_immutable(pSession, tPtr, tLen, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- Look up an immutable item by its 40-hex target. The value arrives as a
+-- dhtImmutableItem event (carrying target + value).
+public handler btDhtGetImmutable(in pSession as Integer, in pTarget as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_dht_get_immutable(pSession, pTarget) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Store pData (1..1000 bytes) as a mutable item under an ed25519 key; the
+-- native layer signs it with pSecretKey (no script on the network thread).
+-- pSalt may be empty. Confirms as a dhtPut event.
+public handler btDhtPutMutable(in pSession as Integer, in pPublicKey as String, in pSecretKey as String, in pSalt as String, in pData as Data) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen <= 0 then
+      return -3
+   end if
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+      put _btx_dht_put_mutable(pSession, pPublicKey, pSecretKey, pSalt, tPtr, tLen) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Look up a mutable item by its 64-hex public key (+ optional salt). The value
+-- arrives as a dhtMutableItem event (value, seq, signature, authoritative).
+public handler btDhtGetMutable(in pSession as Integer, in pPublicKey as String, in pSalt as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_dht_get_mutable(pSession, pPublicKey, pSalt) into tR
+   end unsafe
    return tR
 end handler
 
