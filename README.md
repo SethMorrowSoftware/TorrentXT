@@ -177,6 +177,13 @@ These are load-bearing and enforced in the code:
   walks through.
 - **[`examples/torrent-helpers.livecodescript`](examples/torrent-helpers.livecodescript)**
   — the poll dispatcher (`btStartPolling` / `btStopPolling`) and formatting sugar.
+- **[`examples/torrent-dht-note.livecodescript`](examples/torrent-dht-note.livecodescript)**
+  — the BEP44 key-value store, *immutable* side: pin a short note to the DHT, get a
+  content-address share code, and fetch it back by code (content-addressed, no server).
+- **[`examples/torrent-dht-channel.livecodescript`](examples/torrent-dht-channel.livecodescript)**
+  — the BEP44 store, *mutable* side: a persistent ed25519 identity, publish signed,
+  updatable values under your public key, and look up anyone's latest by their key
+  (the "publish a magnet pointer" / rendezvous primitive).
 
 ## Documentation
 
