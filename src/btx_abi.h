@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 2
+#define BTX_ABI_VERSION 3
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -214,6 +214,42 @@ BTX_API int BTX_CALL btx_dht_state(int s, void *out, int cap);
 /* Opaque DHT routing-table state for persistence across runs. */
 BTX_API int BTX_CALL btx_dht_save_state(int s, void *out, int cap);
 BTX_API int BTX_CALL btx_dht_load_state(int s, const void *data, int len);
+
+/* ---- BEP44: the DHT as a key-value store ----------------------------------
+ * Two item kinds. IMMUTABLE: the key IS the SHA-1 of the bencoded value, so
+ * the value cannot change (content-addressed). MUTABLE: the value lives under
+ * an ed25519 public key (+ optional salt) and is signed, so the owner can
+ * publish updated, sequence-numbered values. Values are capped at 1000 bytes
+ * (BEP44). Results arrive as drained alerts (A_DHT_IMMUTABLE_ITEM /
+ * A_DHT_MUTABLE_ITEM for gets, A_DHT_PUT for put confirmations). */
+
+/* Generate (or, with a 64-hex seed, deterministically re-derive) an ed25519
+ * keypair for mutable items. Fills `out` with a record {publicKey, secretKey,
+ * seed} as hex. Persist the seed (or secret key) to keep a stable identity. */
+BTX_API int BTX_CALL btx_dht_keypair(const char *seedHexOrEmpty, void *out, int cap);
+
+/* Store `data` (len bytes, <= 1000) as an immutable item. Fills `outTargetHex`
+ * with the item's target hash (its lookup key) and returns bytes-written /
+ * -needed for that hex; the store itself confirms later via an A_DHT_PUT alert. */
+BTX_API int BTX_CALL btx_dht_put_immutable(int s, const void *data, int len,
+                                           char *outTargetHex, int cap);
+
+/* Look up an immutable item by its 40-hex target. Result: A_DHT_IMMUTABLE_ITEM. */
+BTX_API int BTX_CALL btx_dht_get_immutable(int s, const char *targetHex);
+
+/* Store `data` (<= 1000 bytes) as a mutable item under the given ed25519 key
+ * (64-hex public, 128-hex secret) and optional salt. The shim signs it on
+ * libtorrent's thread using the secret key (no script callback) and bumps the
+ * sequence number. Confirms via an A_DHT_PUT alert. */
+BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKeyHex,
+                                         const char *secretKeyHex,
+                                         const char *salt,
+                                         const void *data, int len);
+
+/* Look up a mutable item by its 64-hex public key (+ optional salt). Result:
+ * A_DHT_MUTABLE_ITEM (carrying value, seq, signature, authoritative). */
+BTX_API int BTX_CALL btx_dht_get_mutable(int s, const char *publicKeyHex,
+                                         const char *salt);
 
 /* ====================================================================== *
  *  Persistence (resume data) — async, libtorrent's model (plan §4.3)

@@ -35,6 +35,8 @@ runtime.
   limits, and the full libtorrent `settings_pack` surface.
 - **Networking** — DHT (BEP 5) with bootstrap and saved state, Local Service
   Discovery, PEX, uTP, UPnP/NAT-PMP, and MSE/PE connection encryption.
+- **DHT key-value store (BEP44)** — put/get small signed (mutable) or
+  content-addressed (immutable) values: a server-less rendezvous / identity layer.
 - **Inspection** — live status snapshots (state, progress, rates, peers, ETA), the
   peer list, and the piece-completion bitfield.
 - **Persistence** — save and reload fast-resume data so a partial download survives
@@ -148,7 +150,7 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-34 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+39 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
@@ -160,6 +162,7 @@ These are load-bearing and enforced in the code:
 | Inspect | `btTorrentStatus` · `btTorrentCount` · `btTorrentHandleAt` · `btInfoHash` · `btPieceBitfield` · `btPeerList` |
 | Events | `btPoll` |
 | DHT | `btDhtAddBootstrap` · `btDhtState` · `btDhtSaveState` · `btDhtLoadState` |
+| DHT key-value (BEP44) | `btDhtKeypair` · `btDhtPutImmutable` · `btDhtGetImmutable` · `btDhtPutMutable` · `btDhtGetMutable` |
 | Create / seed | `btCreateTorrent` |
 | Resume | `btSaveResumeData` |
 
