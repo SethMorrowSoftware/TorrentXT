@@ -15,11 +15,13 @@ script "dhtChannelsApp"
 --   2. Click "Publish a File to My Channel" - it creates a torrent, seeds it, and
 --      publishes the magnet in your channel FEED, signed under your ed25519 key on
 --      the DHT. Publish more files - your channel keeps a feed of recent releases.
---   3. Copy your channel address (its public key) to another machine.
---   4. There, paste the key and click Follow - it fetches that channel's signed
---      feed and lists its releases.
+--   3. Click "Copy" to put your channel CARD ("Name | public key") on the
+--      clipboard, and send it to another machine.
+--   4. There, paste the card (or a bare key) and click Follow - it fetches that
+--      channel's signed feed and lists its releases.
 --   5. Select a release and click Download - the file transfers peer-to-peer while
---      the publisher seeds. Watch the Transfers table fill in on both machines.
+--      the publisher seeds. Watch the color-coded Transfers table (green=seeding,
+--      blue=downloading) fill in on both machines.
 -- Followers see a UNIFIED feed of releases across every channel they follow, and
 -- every entry is cryptographically signed by its channel (tamper-proof: only the
 -- channel's secret key could have published it).
@@ -347,6 +349,7 @@ command chSetName
    end if
    replace return with space in tName
    replace tab with space in tName
+   replace "|" with "/" in tName   -- "|" is the channel-card delimiter
    put tName into sMyName
    set the uChannelName of this stack to sMyName
    if sMyReleases is not empty and sSession is not 0 then
@@ -439,11 +442,20 @@ command chUpdateNowPub
 end chUpdateNowPub
 
 command chCopyKey
+   local tName, tCard
    if sPub is empty then
       exit chCopyKey
    end if
-   set the clipboardData["text"] to sPub
-   chLog "Copied your channel address to the clipboard - share it so people can follow you."
+   -- copy a "Name | key" channel card; the Follow box accepts either that or a
+   -- bare key, so the recipient sees who they are following, not just a hex blob
+   put sMyName into tName
+   if tName is empty then
+      put sPub into tCard
+   else
+      put tName & " | " & sPub into tCard
+   end if
+   set the clipboardData["text"] to tCard
+   chLog "Copied your channel card (name + address) - paste it into someone's Follow box."
 end chCopyKey
 
 command chNewIdentity
@@ -465,14 +477,20 @@ end chNewIdentity
 
 -- ---- subscriptions / unified feed --------------------------------------------
 command chFollow
-   local tKey
+   local tKey, tRaw
    if sSession is 0 then
       chLog "No session."
       exit chFollow
    end if
-   put toLower(chTrim(field "chFollowKey")) into tKey
+   -- accept a bare 64-hex key OR a shared "Name | key" channel card
+   put chTrim(field "chFollowKey") into tRaw
+   if tRaw contains "|" then
+      set the itemDelimiter to "|"
+      put chTrim(the last item of tRaw) into tRaw
+   end if
+   put toLower(tRaw) into tKey
    if the number of chars of tKey is not 64 then
-      chLog "Paste a 64-character channel address (public key) to follow."
+      chLog "Paste a 64-character channel address (public key), or a 'Name | key' card, to follow."
       exit chFollow
    end if
    if tKey is sPub then
@@ -642,6 +660,7 @@ end chRefreshSubs
 -- ---- transfers dashboard -----------------------------------------------------
 command chRefreshTransfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht
+   local tColors, tErr
    if sSession is 0 or sSession is empty then
       exit chRefreshTransfers
    end if
@@ -658,6 +677,7 @@ command chRefreshTransfers
       put btTorrentStatus(tH) into tS
       add 1 to tLineNum
       put (the round of (tS["progress"] * 1000) / 10) into tPct
+      put chStateColor(tS["state"], tS["error"]) into tColors[tLineNum]
       put tLineNum & tab & chTrunc(tS["name"], 44) & tab & chStateName(tS["state"]) & tab & \
           tPct & "%" & tab & tS["numPeers"] & return after tRows
       add tS["downloadRate"] to tDown
@@ -675,6 +695,15 @@ command chRefreshTransfers
    end if
    lock screen
    set the text of field "chXfers" to tRows
+   -- color each row by state (green=seeding/done, blue=downloading, amber=checking,
+   -- grey=queued, red=error). Wrapped so a platform that dislikes per-line coloring
+   -- still shows the table, just monochrome.
+   try
+      repeat with tI = 1 to tLineNum
+         set the foregroundColor of line tI of field "chXfers" to tColors[tI]
+      end repeat
+   catch tErr
+   end try
    put tLineNum && "transfers     down" && (chFmtBytes(tDown) & "/s") && "    up" \
       && (chFmtBytes(tUp) & "/s") && "     " & tDht into field "chTotals"
    unlock screen
@@ -732,14 +761,17 @@ end chFetchCode
 
 -- ---- events (drained by the poll loop) ---------------------------------------
 command chHandleEvent pEvent
-   local tKey, tVal
+   local tKey, tVal, tN
    switch pEvent["name"]
       case "dhtMutableItem"
          put pEvent["publicKey"] into tKey
          put textDecode(pEvent["value"], "UTF-8") into tVal
          put tVal into sFollowFeeds[tKey]
          chRefreshSubs
-         chLog "Channel" && chShortKey(tKey) && "feed updated (signed, v" & pEvent["seq"] & ")."
+         -- libtorrent only surfaces a mutable item after verifying its ed25519
+         -- signature against the public key, so arrival == cryptographically verified
+         put chCountReleases(tVal) into tN
+         chLog "Channel" && chShortKey(tKey) && "feed: signature verified, v" & pEvent["seq"] & "," && tN && "release(s)."
          break
       case "dhtImmutableItem"
          set the text of field "chDropResult" to textDecode(pEvent["value"], "UTF-8")
@@ -832,6 +864,38 @@ function chStateName pState
          return "queued"
    end switch
 end chStateName
+
+-- row color by state, mirroring the main client's palette
+function chStateColor pState, pError
+   if pError is not empty then
+      return "200,40,40"
+   end if
+   switch pState
+      case 4
+      case 5
+         return "0,140,70"
+      case 3
+         return "30,90,200"
+      case 1
+      case 2
+      case 7
+         return "190,130,0"
+      default
+         return "110,110,110"
+   end switch
+end chStateColor
+
+-- count the "r=" release lines in a channel feed value
+function chCountReleases pFeed
+   local tLine, tN
+   put 0 into tN
+   repeat for each line tLine in pFeed
+      if tLine begins with "r=" then
+         add 1 to tN
+      end if
+   end repeat
+   return tN
+end chCountReleases
 
 function chFmtBytes pBytes
    local tUnits, tVal, tI
