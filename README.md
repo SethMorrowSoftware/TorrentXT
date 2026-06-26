@@ -177,13 +177,20 @@ These are load-bearing and enforced in the code:
   walks through.
 - **[`examples/torrent-helpers.livecodescript`](examples/torrent-helpers.livecodescript)**
   — the poll dispatcher (`btStartPolling` / `btStopPolling`) and formatting sugar.
+- **[`examples/torrent-dht-channels.livecodescript`](examples/torrent-dht-channels.livecodescript)**
+  — the flagship **multi-machine demo**: a fully decentralized "channel" app that
+  marries the DHT and BitTorrent. Publish a file to *your* channel (it creates,
+  seeds, and announces the magnet under your ed25519 key on the DHT); follow other
+  people's channel addresses and one-click **download** their latest release while
+  they seed — no server anywhere. Includes a live transfers table and an immutable
+  "quick drop" (pin text, share a 40-char code). The DHT says *where*, BitTorrent
+  moves *what*.
 - **[`examples/torrent-dht-note.livecodescript`](examples/torrent-dht-note.livecodescript)**
-  — the BEP44 key-value store, *immutable* side: pin a short note to the DHT, get a
-  content-address share code, and fetch it back by code (content-addressed, no server).
+  — a minimal single-concept reference for the BEP44 *immutable* side: pin a short
+  note, get a content-address share code, fetch it back by code.
 - **[`examples/torrent-dht-channel.livecodescript`](examples/torrent-dht-channel.livecodescript)**
-  — the BEP44 store, *mutable* side: a persistent ed25519 identity, publish signed,
-  updatable values under your public key, and look up anyone's latest by their key
-  (the "publish a magnet pointer" / rendezvous primitive).
+  — a minimal single-concept reference for the *mutable* side: a persistent ed25519
+  identity, publish signed/updatable values, look up anyone's latest by their key.
 
 ## Documentation
 
