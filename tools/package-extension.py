@@ -187,12 +187,12 @@ def assemble_staging(dry_run):
         dst = os.path.join(staging, rel_dst)
         actions.append((src, dst))
 
-    # The LCB binding and the script sugar (present from Phase 1 on).
+    # The LCB binding, the poll-dispatcher sugar, and the two flagship demos.
     stage(os.path.join("src", "torrent.lcb"), "torrent.lcb")
-    stage(os.path.join("examples", "torrent-helpers.livecodescript"),
-          os.path.join("examples", "torrent-helpers.livecodescript"))
-    stage(os.path.join("examples", "torrent-demo.livecodescript"),
-          os.path.join("examples", "torrent-demo.livecodescript"))
+    for ex in ("torrent-helpers.livecodescript",
+               "torrent-client.livecodescript",
+               "torrent-dht-channels.livecodescript"):
+        stage(os.path.join("examples", ex), os.path.join("examples", ex))
 
     # Every committed per-platform library currently in the tree.
     if os.path.isdir(CODE_ROOT):

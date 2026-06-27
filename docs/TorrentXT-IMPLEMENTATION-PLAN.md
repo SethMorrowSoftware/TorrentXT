@@ -524,9 +524,9 @@ TorrentXT/
 │   ├── check-livecodescript.py     static gate for .lcb + .livecodescript
 │   └── package-extension.py        refresh the committed code/<platform>/ trees
 ├── examples/
-│   ├── torrent-helpers.livecodescript   the poll dispatcher + sugar
-│   ├── torrent-client.livecodescript    the flagship multi-torrent client
-│   └── torrent-demo.livecodescript      minimal add-a-magnet walkthrough
+│   ├── torrent-helpers.livecodescript     the poll dispatcher + sugar
+│   ├── torrent-client.livecodescript      the flagship multi-torrent client
+│   └── torrent-dht-channels.livecodescript  the decentralized DHT channel demo
 ├── docs/
 │   └── architecture.md  building.md  getting-started.md  api-reference.md
 ├── CMakeLists.txt

@@ -10,10 +10,10 @@ contract see `docs/api-reference.md`; for the *why* of the design see
 > **Honesty note.** OXT cannot compile or run `.lcb`/`.livecodescript` headlessly,
 > so the snippets here are "verified statically; needs an OXT pass." They mirror
 > the runnable examples — `examples/torrent-client.livecodescript` (the full
-> self-building client) plus the smaller `examples/torrent-demo.livecodescript`
-> and `examples/torrent-helpers.livecodescript` this guide walks through; when
-> something does not behave, trust the running engine and `btLastError()` over
-> this page.
+> self-building client), `examples/torrent-dht-channels.livecodescript` (the
+> decentralized DHT demo), and `examples/torrent-helpers.livecodescript` (the
+> poll dispatcher this guide builds on); when something does not behave, trust the
+> running engine and `btLastError()` over this page.
 
 ---
 
@@ -66,7 +66,8 @@ threads at quit - the documented failure mode (plan section 4.2). `btStopSession
 **idempotent** and a stale handle is a no-op, so calling it defensively is always
 safe. Only one session may be live at a time; `btStartSession` refuses a second.
 
-Here is that skeleton, lifted from `examples/torrent-demo.livecodescript`:
+Here is that skeleton — the minimal shape every TorrentXT app shares (the
+flagship examples wrap the same lifecycle around a richer UI):
 
 ```
 local sSession

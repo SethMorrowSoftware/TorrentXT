@@ -24,8 +24,9 @@ can find their footing.
         |     - public bt* handlers: hide every handle, pre-size buffers,
         |       walk records, set the module last-error, never throw to script
         |
-  examples/torrent-helpers.livecodescript   the poll dispatcher (timer -> btPoll -> messages)
-  examples/torrent-client.livecodescript    the flagship multi-torrent client (self-building UI)
+  examples/torrent-helpers.livecodescript      the poll dispatcher (timer -> btPoll -> messages)
+  examples/torrent-client.livecodescript       the flagship multi-torrent client (self-building UI)
+  examples/torrent-dht-channels.livecodescript  the decentralized DHT + BitTorrent channel demo
         |
   your xTalk app              writes event handlers (metadataReceived, pieceFinished, ...)
 ```
@@ -103,8 +104,9 @@ runtime. So the binding uses the proven htmltidy/HIDAPI shape built on the
 engine `<builtin>` allocators (foreign handlers that bind by their exact engine
 name, so they carry no leading underscore):
 
-- **out** (the shim fills it — alert drain, status / peer / DHT / bitfield
-  snapshots, resume bytes, a created `.torrent`): the binding hands the shim a
+- **out** (the shim fills it — alert drain, status / peer / file / tracker / DHT
+  snapshots, the piece bitfield and per-piece availability, resume bytes, a
+  created `.torrent`): the binding hands the shim a
   raw block from `MCMemoryAllocate` as a real `Pointer` plus its capacity; the
   shim writes into it and returns **bytes-written**, or **`-needed`** when the
   block was too small. The binding then copies exactly the written bytes back
