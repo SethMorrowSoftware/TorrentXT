@@ -27,23 +27,34 @@ runtime.
 ## Features
 
 - **Add anything** — magnet links, `.torrent` files, and resume data; metadata is
-  fetched over the swarm for magnets.
-- **Full control** — pause, resume, force-recheck, force-reannounce, remove (with or
-  without deleting data).
+  fetched over the swarm for magnets. Optional **add-time flags** (e.g. add
+  *paused* to set priorities before it starts, or *sequential* for streaming).
+- **Full control** — pause, resume, force-recheck, force-reannounce, scrape,
+  move-storage, clear-error, remove (with or without data), and **download-queue**
+  positioning (up / down / top / bottom).
+- **Modes** — per-torrent `torrent_flags`: sequential download (streaming),
+  auto-managed, super-seeding, share-mode, upload-only.
 - **Seeding & creation** — build a `.torrent` from a file or folder and seed it.
-- **Tuning** — per-file and per-piece priorities, per-torrent and session-wide rate
-  limits, and the full libtorrent `settings_pack` surface.
-- **Networking** — DHT (BEP 5) with bootstrap and saved state, Local Service
-  Discovery, PEX, uTP, UPnP/NAT-PMP, and MSE/PE connection encryption.
+- **Tuning** — per-file and per-piece priorities, per-torrent rate caps and
+  connection / upload-slot caps, the full libtorrent `settings_pack` surface, an
+  **IP filter** (block ranges / blocklists), and **streaming piece-deadlines**.
+- **Networking** — DHT (BEP 5) with bootstrap, saved state and peer announce,
+  Local Service Discovery, PEX, uTP, UPnP/NAT-PMP, MSE/PE encryption; plus
+  whole-session pause/resume, the bound listen port, and find-by-info-hash.
 - **DHT key-value store (BEP44)** — put/get small signed (mutable) or
   content-addressed (immutable) values: a server-less rendezvous / identity layer.
 - **Inspection** — live status snapshots (state, progress, rates, peers, ETA), the
-  peer list, and the piece-completion bitfield.
+  peer list, the piece-completion bitfield and per-piece availability, the **file
+  table** (names, sizes, per-file progress and priority), the **tracker list**,
+  and **web seeds**.
+- **Trackers & web seeds** — list and edit a torrent's announce list and its
+  HTTP/URL seeds (BEP 19) at runtime.
 - **Persistence** — save and reload fast-resume data so a partial download survives
   a restart.
 - **Events, not callbacks** — inbound activity (metadata received, piece finished,
-  torrent finished, tracker replies, errors) arrives as ordinary message-path
-  handlers via a poll-drained queue, never from a foreign thread.
+  torrent finished, tracker replies, scrape/storage results, errors) arrives as
+  ordinary message-path handlers via a poll-drained queue, never from a foreign
+  thread.
 
 ## Platform support
 
@@ -172,29 +183,26 @@ These are load-bearing and enforced in the code:
 
 ## Examples
 
+Two runnable flagship demos plus the shared poll-dispatcher utility:
+
 - **[`examples/torrent-client.livecodescript`](examples/torrent-client.livecodescript)**
-  — the flagship: a self-building, multi-torrent client with a smart Add box
+  — the flagship client: a self-building, multi-torrent app with a smart Add box
   (magnet / `.torrent` / HTTP / info-hash), per-torrent controls, create-and-seed, a
   live color-coded table with inline progress bars, DHT bootstrap, and an event log.
-- **[`examples/torrent-demo.livecodescript`](examples/torrent-demo.livecodescript)**
-  — the minimal add-a-magnet-and-watch-it-finish skeleton the getting-started guide
-  walks through.
-- **[`examples/torrent-helpers.livecodescript`](examples/torrent-helpers.livecodescript)**
-  — the poll dispatcher (`btStartPolling` / `btStopPolling`) and formatting sugar.
 - **[`examples/torrent-dht-channels.livecodescript`](examples/torrent-dht-channels.livecodescript)**
-  — the flagship **multi-machine demo**: a fully decentralized "channel" app that
+  — the flagship **multi-machine DHT demo**: a fully decentralized "channel" app that
   marries the DHT and BitTorrent. Publish a file to *your* channel (it creates,
   seeds, and announces the magnet under your ed25519 key on the DHT); follow other
   people's channel addresses and one-click **download** their latest release while
-  they seed — no server anywhere. Includes a live transfers table and an immutable
-  "quick drop" (pin text, share a 40-char code). The DHT says *where*, BitTorrent
-  moves *what*.
-- **[`examples/torrent-dht-note.livecodescript`](examples/torrent-dht-note.livecodescript)**
-  — a minimal single-concept reference for the BEP44 *immutable* side: pin a short
-  note, get a content-address share code, fetch it back by code.
-- **[`examples/torrent-dht-channel.livecodescript`](examples/torrent-dht-channel.livecodescript)**
-  — a minimal single-concept reference for the *mutable* side: a persistent ed25519
-  identity, publish signed/updatable values, look up anyone's latest by their key.
+  they seed — no server anywhere. Includes a signed multi-release feed, a live
+  color-coded transfers table, shareable channel cards, and an immutable "quick
+  drop" (pin text, share a 40-char code). The DHT says *where*, BitTorrent moves
+  *what*. A built-in **"What is this?"** button explains it in plain language.
+- **[`examples/torrent-helpers.livecodescript`](examples/torrent-helpers.livecodescript)**
+  — the reusable **poll dispatcher** (`btStartPolling` / `btStopPolling`) and
+  formatting sugar (`btFormatBytes`, `btStateName`). `start using` it to drive
+  engine events as ordinary message-path handlers; the getting-started guide builds
+  on it. (Both flagship demos are self-contained and run without it.)
 
 ## Documentation
 
@@ -227,12 +235,14 @@ sanitizer builds, and the per-platform notes.
 
 ## Status
 
-The shim, the LCB binding, the test suite, and four of five platform binaries are
-built and gated by CI. Because OpenXTalk has no headless way to compile or run
-`.lcb`, runtime behaviour is marked "verified statically; needs an OXT pass" and
-confirmed by a human in the IDE — the project does not claim runtime behaviour it
-cannot observe. Remaining: the signed macOS universal dylib, and the optional visual
-dashboard widget.
+The public API spans **75 `bt*` handlers** (ABI v8) — essentially the full
+practical libtorrent surface. The shim, the LCB binding, the test suite, and four
+of five platform binaries are built and gated by CI; the shim is exercised under
+ASan/UBSan against real libtorrent on every change. Because OpenXTalk has no
+headless way to compile or run `.lcb`, runtime behaviour is marked "verified
+statically; needs an OXT pass" and confirmed by a human in the IDE — the project
+does not claim runtime behaviour it cannot observe. Remaining: the signed macOS
+universal dylib, and the optional visual dashboard widget.
 
 ## License
 
