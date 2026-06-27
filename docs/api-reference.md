@@ -193,6 +193,84 @@ unlimited). Distinct from the session-wide `download_rate_limit` /
 `upload_rate_limit` settings.
 - **Usage:** command - `btSetTorrentLimits tH, "1000000", "0"`.
 
+### `btSetMaxConnections(in pTorrent as Integer, in pMax as Integer) returns Integer`
+Cap the number of peer connections for this torrent (libtorrent wants `>= 2`, or
+`-1` for unlimited).
+- **Usage:** command - `btSetMaxConnections tH, 80`.
+
+### `btSetMaxUploads(in pTorrent as Integer, in pMax as Integer) returns Integer`
+Cap the number of simultaneously **unchoked** upload slots for this torrent.
+- **Usage:** command - `btSetMaxUploads tH, 6`.
+
+### `btClearTorrentError(in pTorrent as Integer) returns Integer`
+Clear a torrent's error state (e.g. after fixing a disk-full or permission problem
+that paused it) so it can resume. Distinct from `btClearError`, which clears the
+library's last-error string.
+- **Usage:** command - `btClearTorrentError tH`.
+
+### `btScrapeTracker(in pTorrent as Integer) returns Integer`
+Ask the tracker(s) for current seed / leecher counts. **Asynchronous**: the
+numbers arrive later as a `scrapeReply` event.
+- **Usage:** command - `btScrapeTracker tH`, then handle `scrapeReply`.
+
+### `btMoveStorage(in pTorrent as Integer, in pSavePath as String) returns Integer`
+Move the torrent's downloaded files to a new directory. **Asynchronous**: success
+arrives as a `storageMoved` event (or `fileError` on failure). The bytes move
+engine-side; nothing crosses into script.
+- **Usage:** command - `btMoveStorage tH, "/mnt/big/downloads"`.
+
+#### Torrent flags
+
+The full `torrent_flags_t` set is exposed as two primitives plus named
+conveniences. Flag **values** are the `kFlag*` constants (decimal strings you add
+together): `kFlagSeedMode` (1), `kFlagUploadMode` (2), `kFlagShareMode` (4),
+`kFlagApplyIpFilter` (8), `kFlagPaused` (16), `kFlagAutoManaged` (32),
+`kFlagSuperSeeding` (256), `kFlagSequentialDownload` (512), `kFlagStopWhenReady`
+(1024).
+
+### `btSetTorrentFlags(in pTorrent as Integer, in pFlags as String, in pMask as String) returns Integer`
+Set the bits named in `pFlags`, touching only the bits named in `pMask` (a
+read-modify-write: `set(flags, mask)`). Both are decimal strings - add `kFlag*`
+constants to combine them.
+- **Usage:** command - `btSetTorrentFlags tH, kFlagSequentialDownload, kFlagSequentialDownload`.
+
+### `btUnsetTorrentFlags(in pTorrent as Integer, in pFlags as String) returns Integer`
+Clear the bits named in `pFlags`.
+- **Usage:** command - `btUnsetTorrentFlags tH, kFlagSequentialDownload`.
+
+### `btSetSequentialDownload(in pTorrent as Integer, in pOn as Boolean) returns Integer`
+Convenience: turn in-order (streaming) download on or off.
+- **Usage:** command - `btSetSequentialDownload tH, true`.
+
+### `btSetAutoManaged(in pTorrent as Integer, in pOn as Boolean) returns Integer`
+Convenience: let libtorrent automatically queue / start / stop this torrent.
+- **Usage:** command - `btSetAutoManaged tH, true`.
+
+### `btSetSuperSeeding(in pTorrent as Integer, in pOn as Boolean) returns Integer`
+Convenience: super-seed (initial-seeding) mode - only meaningful on a complete seed.
+- **Usage:** command - `btSetSuperSeeding tH, true`.
+
+### `btSetShareMode(in pTorrent as Integer, in pOn as Boolean) returns Integer`
+Convenience: optimise this torrent for share-ratio rather than for completion.
+- **Usage:** command - `btSetShareMode tH, true`.
+
+### `btSetUploadMode(in pTorrent as Integer, in pOn as Boolean) returns Integer`
+Convenience: upload-only - serve pieces but never request any.
+- **Usage:** command - `btSetUploadMode tH, true`.
+
+#### Download queue
+
+### `btQueuePosition(in pTorrent as Integer) returns Integer`
+The torrent's 0-based position in the download queue, or `-1` if it is not queued
+(or the handle is invalid). This getter returns `-1`, not `0`, for "no value",
+because `0` is itself a real position - the one getter in the API that does so.
+- **Usage:** function - `put btQueuePosition(tH) into tPos`.
+
+### `btQueueUp(in pTorrent as Integer) returns Integer` · `btQueueDown(...)` · `btQueueTop(...)` · `btQueueBottom(...)`
+Move the torrent one step up / down, or all the way to the top / bottom of the
+download queue. (Only meaningful for auto-managed torrents.)
+- **Usage:** command - `btQueueTop tH`.
+
 ### `btSaveResumeData(in pTorrent as Integer) returns Integer`
 **Request** resume data for the torrent. This is **asynchronous** (libtorrent's
 model): the bytes do not return here - they arrive later as a `resumeDataReady`
