@@ -337,6 +337,28 @@ have) for a full piece map. Empty `Data` until the torrent has metadata and
 peers, or on a bad handle.
 - **Usage:** function - `put btPieceAvailability(tH) into tAvail`, then `byte i of tAvail`.
 
+### `btTrackers(in pTorrent as Integer) returns List`
+The torrent's trackers as a `List` of `Array`s, each with keys `url`, `tier`
+(0 == first tier tried), `verified` (`1` once the tracker has answered this
+session), and `source` (the `announce_entry` source bitmask). Empty `List` on a
+bad handle.
+- **Usage:** function - `repeat for each element tTr in btTrackers(tH)` then read `tTr["url"]`.
+
+### `btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier as Integer) returns Integer`
+Add an announce URL at `pTier` (0 == first tier). A URL already in the list is
+ignored by libtorrent.
+- **Usage:** command - `btAddTracker tH, "udp://tracker.example:6969/announce", 0`.
+
+### `btWebSeeds(in pTorrent as Integer) returns List`
+The torrent's HTTP (URL / web) seeds as a `List` of URL `String`s. Empty `List`
+on a bad handle.
+- **Usage:** function - `put btWebSeeds(tH) into tSeeds`.
+
+### `btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer` · `btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer`
+Add or remove an HTTP (URL / web) seed (BEP 19) — a plain web server that can
+serve the torrent's data alongside peers.
+- **Usage:** command - `btAddWebSeed tH, "https://mirror.example/path/"`.
+
 ---
 
 ## Events / poll
@@ -526,6 +548,17 @@ arithmetic.
 | `size` | 121 | int | file size, bytes |
 | `progress` | 122 | int | bytes of this file downloaded |
 | `priority` | 123 | int | this file's download priority, `0..7` |
+
+### Tracker entry (`btTrackers`, one array per tracker)
+
+| key | field id | type | meaning |
+|---|---|---|---|
+| `url` | 130 | utf8 | announce URL |
+| `tier` | 131 | int | tracker tier (`0` == first) |
+| `verified` | 132 | int | `1` once it has answered this session |
+| `source` | 133 | int | `announce_entry` source bitmask |
+
+(`btWebSeeds` returns a plain list of URL strings, not records.)
 
 ### DHT state (`btDhtState`)
 

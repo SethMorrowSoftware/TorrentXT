@@ -187,6 +187,11 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_peer_list(h, buf, sizeof buf) == 0);
         CHECK(btx_file_list(h, buf, sizeof buf) == 0);          /* ABI v5 */
         CHECK(btx_piece_availability(h, buf, sizeof buf) == 0); /* ABI v5 */
+        CHECK(btx_trackers(h, buf, sizeof buf) == 0);           /* ABI v6 */
+        CHECK(btx_url_seeds(h, buf, sizeof buf) == 0);          /* ABI v6 */
+        CHECK(btx_add_tracker(h, "udp://x.example:6969", 0) < 0);
+        CHECK(btx_add_url_seed(h, "http://x.example/seed") < 0);
+        CHECK(btx_remove_url_seed(h, "http://x.example/seed") < 0);
     }
 
     /* remove() needs a live session to even reach the torrent check; with one

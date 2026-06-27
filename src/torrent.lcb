@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 5
+constant kABIVersion is 6
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -145,6 +145,13 @@ constant kFieldFileSize is 121
 constant kFieldFileProgress is 122
 constant kFieldFilePriority is 123
 
+-- tracker + web-seed entry fields (btTrackers / btWebSeeds)
+constant kFieldTrackerUrl is 130
+constant kFieldTrackerTier is 131
+constant kFieldTrackerVerified is 132
+constant kFieldTrackerSource is 133
+constant kFieldUrlSeed is 134
+
 -- Stable alert type codes (mirror btx_record.h AlertType -> kAlert*).
 constant kAlertTorrentAdded is 1
 constant kAlertMetadataReceived is 2
@@ -239,6 +246,11 @@ private foreign handler _btx_piece_bitfield(in pT as CInt, in pOut as Pointer, i
 private foreign handler _btx_peer_list(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_peer_list!cdecl"
 private foreign handler _btx_file_list(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_file_list!cdecl"
 private foreign handler _btx_piece_availability(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_piece_availability!cdecl"
+private foreign handler _btx_trackers(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_trackers!cdecl"
+private foreign handler _btx_add_tracker(in pT as CInt, in pUrl as ZStringUTF8, in pTier as CInt) returns CInt binds to "c:torrentxt>btx_add_tracker!cdecl"
+private foreign handler _btx_add_url_seed(in pT as CInt, in pUrl as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_url_seed!cdecl"
+private foreign handler _btx_remove_url_seed(in pT as CInt, in pUrl as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_remove_url_seed!cdecl"
+private foreign handler _btx_url_seeds(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_url_seeds!cdecl"
 
 private foreign handler _btx_pop_alerts(in pS as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_pop_alerts!cdecl"
 
@@ -543,6 +555,16 @@ private handler _fieldKey(in pId as Integer) returns String
       return "progress"
    else if pId is kFieldFilePriority then
       return "priority"
+   else if pId is kFieldTrackerUrl then
+      return "url"
+   else if pId is kFieldTrackerTier then
+      return "tier"
+   else if pId is kFieldTrackerVerified then
+      return "verified"
+   else if pId is kFieldTrackerSource then
+      return "source"
+   else if pId is kFieldUrlSeed then
+      return "urlSeed"
    else
       return ""
    end if
@@ -1214,6 +1236,107 @@ public handler btPieceAvailability(in pTorrent as Integer) returns Data
       return the empty data
    end if
    return _bufToData(sStatusPtr, tCount)
+end handler
+
+-- The torrent's trackers as a List of Arrays, each with keys "url", "tier",
+-- "verified" (0/1), "source". One FFI round-trip for the whole announce list.
+public handler btTrackers(in pTorrent as Integer) returns List
+   variable tTrackers as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tTrackerCount as Integer
+   variable tBodyLen as Integer
+   variable tTracker as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tTrackers
+   _ensureStatus(kStatusCap)
+   unsafe
+      put _btx_trackers(pTorrent, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put _btx_trackers(pTorrent, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tTrackers
+   end if
+   put _bufToData(sStatusPtr, tCount) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tTrackerCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tTrackerCount
+      put _readU16(tBuf, tOffset) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 2) into tTracker
+      push tTracker onto tTrackers
+      add (2 + tBodyLen) to tOffset
+   end repeat
+   return tTrackers
+end handler
+
+-- Add an announce URL at the given tier (0 == first tier). Duplicates ignored.
+public handler btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_add_tracker(pTorrent, pUrl, pTier) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Add / remove an HTTP (URL / web) seed (BEP 19).
+public handler btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_add_url_seed(pTorrent, pUrl) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_remove_url_seed(pTorrent, pUrl) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The torrent's web seeds as a List of URL Strings.
+public handler btWebSeeds(in pTorrent as Integer) returns List
+   variable tSeeds as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tSeedCount as Integer
+   variable tBodyLen as Integer
+   variable tRec as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tSeeds
+   _ensureStatus(kStatusCap)
+   unsafe
+      put _btx_url_seeds(pTorrent, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put _btx_url_seeds(pTorrent, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tSeeds
+   end if
+   put _bufToData(sStatusPtr, tCount) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tSeedCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tSeedCount
+      put _readU16(tBuf, tOffset) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 2) into tRec
+      push tRec["urlSeed"] onto tSeeds
+      add (2 + tBodyLen) to tOffset
+   end repeat
+   return tSeeds
 end handler
 
 -- ===================================================================== --

@@ -82,6 +82,7 @@
 /* ---- standard library ------------------------------------------------------ */
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1254,6 +1255,109 @@ extern "C" BTX_API int BTX_CALL btx_piece_availability(int t, void *out, int cap
         if (nbytes > static_cast<size_t>(cap < 0 ? 0 : cap))
             return -static_cast<int>(nbytes);
         return static_cast<int>(nbytes);
+    });
+}
+
+/* ====================================================================== *
+ *  Trackers & web seeds (ABI v6) — inspect and edit the announce list and
+ *  the HTTP/URL seed list. Listers mirror the peer-list framing; editors are
+ *  fire-and-forget. (The downloaded data still rides engine ⇄ disk.)
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_trackers(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        std::vector<lt::announce_entry> trs = h.trackers();
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);  /* trackerCount placeholder */
+        uint16_t emitted = 0;
+        for (const lt::announce_entry &ae : trs) {
+            const size_t bodyAt = w.pos();
+            w.put_u16(0);  /* bodyLen placeholder */
+            const size_t bodyStart = w.pos();
+            {
+                btx::KVRecord r(w);
+                r.put_str(btx::F_TRACKER_URL, ae.url);
+                r.put_int(btx::F_TRACKER_TIER, static_cast<long long>(ae.tier));
+                r.put_bool(btx::F_TRACKER_VERIFIED, ae.verified);
+                r.put_int(btx::F_TRACKER_SOURCE, static_cast<long long>(ae.source));
+                r.finish();
+            }
+            w.patch_u16(bodyAt, static_cast<uint16_t>(w.pos() - bodyStart));
+            ++emitted;
+        }
+        w.patch_u16(countAt, emitted);
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_tracker(int t, const char *url, int tier) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty tracker url"); return BTX_ERR_INVALID_ARG; }
+        lt::announce_entry ae;
+        ae.url = url;
+        if (tier < 0) tier = 0;
+        if (tier > 255) tier = 255;
+        ae.tier = static_cast<std::uint8_t>(tier);
+        /* libtorrent ignores a duplicate URL already in the list. */
+        h.add_tracker(ae);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_url_seed(int t, const char *url) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty url seed"); return BTX_ERR_INVALID_ARG; }
+        h.add_url_seed(std::string(url));
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_remove_url_seed(int t, const char *url) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty url seed"); return BTX_ERR_INVALID_ARG; }
+        h.remove_url_seed(std::string(url));
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_url_seeds(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        std::set<std::string> seeds = h.url_seeds();
+        /* one single-field KV record per seed, in the peer-list framing so the
+         * LCB walker reuses the same counted-loop parse. */
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);  /* seedCount placeholder */
+        uint16_t emitted = 0;
+        for (const std::string &u : seeds) {
+            const size_t bodyAt = w.pos();
+            w.put_u16(0);  /* bodyLen placeholder */
+            const size_t bodyStart = w.pos();
+            {
+                btx::KVRecord r(w);
+                r.put_str(btx::F_URL_SEED, u);
+                r.finish();
+            }
+            w.patch_u16(bodyAt, static_cast<uint16_t>(w.pos() - bodyStart));
+            ++emitted;
+        }
+        w.patch_u16(countAt, emitted);
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
     });
 }
 

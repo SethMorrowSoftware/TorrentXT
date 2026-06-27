@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 5
+#define BTX_ABI_VERSION 6
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -235,6 +235,24 @@ BTX_API int BTX_CALL btx_file_list(int t, void *out, int cap);
  * bytes — one byte per piece, clamped to 255 — a read-only view for an
  * availability grid. bytes-written / -needed / 0, like btx_piece_bitfield. */
 BTX_API int BTX_CALL btx_piece_availability(int t, void *out, int cap);
+
+/* ---- trackers & web seeds (ABI v6) ----------------------------------------
+ * Inspect and edit a torrent's tracker list and HTTP/URL (web) seeds. The two
+ * listers return count-prefixed KV-record lists (the peer-list framing); the
+ * editors are fire-and-forget actions. */
+
+/* The torrent's trackers as a list of KV records: url, tier, verified, source. */
+BTX_API int BTX_CALL btx_trackers(int t, void *out, int cap);
+
+/* Add an announce URL at the given tier (0 == first tier; libtorrent dedups). */
+BTX_API int BTX_CALL btx_add_tracker(int t, const char *url, int tier);
+
+/* Add / remove an HTTP (URL / web) seed (BEP 19). */
+BTX_API int BTX_CALL btx_add_url_seed(int t, const char *url);
+BTX_API int BTX_CALL btx_remove_url_seed(int t, const char *url);
+
+/* The torrent's web seeds as a list of KV records (one F_URL_SEED field each). */
+BTX_API int BTX_CALL btx_url_seeds(int t, void *out, int cap);
 
 /* ====================================================================== *
  *  The alert drain (the event firehose) — one FFI round-trip per poll (§3)
