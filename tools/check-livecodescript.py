@@ -414,7 +414,7 @@ def gather(paths):
 
 
 def main(argv):
-    paths = argv[1:] or ["src", "examples"]
+    paths = argv[1:] or ["src", "examples", "tests"]
     files = gather(paths)
     all_problems = []
     for f in files:

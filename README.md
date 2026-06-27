@@ -217,6 +217,10 @@ Two runnable flagship demos plus the shared poll-dispatcher utility:
 - **[TorrentXT-IMPLEMENTATION-PLAN.md](docs/TorrentXT-IMPLEMENTATION-PLAN.md)** — the
   original design brief, kept for the *why* (engine choice, ABI design, risk
   register).
+- **[NEXT-EXTENSIONS-PLAN.md](docs/NEXT-EXTENSIONS-PLAN.md)** — the forward plan
+  for the next native wraps (libsodium, ENet, libdatachannel) **and** the
+  consolidated OXT/LiveCode engine playbook: every FFI / LCB / runtime gotcha
+  we have uncovered, so the next wraps avoid the same mistakes.
 
 ## Building from source
 
