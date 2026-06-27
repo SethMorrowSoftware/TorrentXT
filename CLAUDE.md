@@ -151,7 +151,12 @@ pass" and let the user confirm.
    string — they fail OXT compilation. ASCII `"` and `'` only. The static checker
    enforces zero.
 2. **Avoid names whose stem shadows an engine token** even when prefixed; prefer
-   distinctive, multi-word stems.
+   distinctive, multi-word stems. The nastiest case is a prefixed name whose
+   *full spelling* IS a reserved token: `tExt` (t + "Ext" for extension) is
+   literally `t-e-x-t` = `text`, so xTalk evaluates it as the `text` keyword, not
+   a variable — it compiles and silently misbehaves. `tools/check-livecodescript.py`
+   now flags this class (any `t/p/s/k`-prefixed name that lowercases to a reserved
+   word); use a different stem (e.g. `tSuffix`).
 3. **Prefix conventions:** `t` handler-local, `p` parameter, `s` script/module-local,
    `k` constant. Public API `btPascalCase`; C ABI `btx_snake_case`.
 4. **Constants must be literal** and declared **before first use** (OXT resolves them by

@@ -994,19 +994,19 @@ end chCloseStream
 -- Classify a path as "video", "audio", or "" by its file extension. Video and
 -- audio are the only kinds the player streams.
 function chMediaKind pPath
-   local tExt, tVideo, tAudio
+   local tSuffix, tVideo, tAudio
    set the itemDelimiter to "."
    if the number of items of pPath < 2 then
       return ""
    end if
-   put toLower(the last item of pPath) into tExt
+   put toLower(the last item of pPath) into tSuffix
    put "mp4,m4v,mov,mkv,avi,webm,mpg,mpeg,wmv,flv,3gp,ogv" into tVideo
    put "mp3,m4a,aac,flac,wav,ogg,oga,opus,wma,aiff,aif" into tAudio
    set the itemDelimiter to comma
-   if tExt is among the items of tVideo then
+   if tSuffix is among the items of tVideo then
       return "video"
    end if
-   if tExt is among the items of tAudio then
+   if tSuffix is among the items of tAudio then
       return "audio"
    end if
    return ""
