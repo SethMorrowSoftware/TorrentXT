@@ -174,7 +174,11 @@ command stRun
       exit stRun
    end if
    stAssert "btStartSession returns a positive handle", (sSession > 0)
-   stAssert "btLastError is a string", (btLastError() is a string)
+   -- NB: LiveCode's `is a <type>` only knows number/integer/boolean/point/rect/
+   -- date/color - there is NO `is a string`. Test btLastError by clearing it and
+   -- confirming it reads back empty (exercises btClearError + btLastError).
+   btClearError
+   stAssert "btLastError is empty after btClearError", (btLastError() is empty)
 
    -- Wrap the rest: a mis-declared foreign handler (wrong signature) raises a
    -- runtime error on its first call. Catch it so the harness REPORTS which call
