@@ -26,6 +26,10 @@ script "dhtChannelsApp"
 -- every entry is cryptographically signed by its channel (tamper-proof: only the
 -- channel's secret key could have published it).
 --
+-- Click any transfer to see the files inside it with a live per-file progress
+-- bar (btFileList), or hit "Stream" to download it in order (btSetSequentialDownload)
+-- so a media release plays as it arrives. The transfers table shows inline bars.
+--
 -- It also includes a "Quick drop" panel using IMMUTABLE items: pin a short text,
 -- get a 40-character content-address code, and fetch any code back.
 --
@@ -47,6 +51,7 @@ local sFollowFeeds      -- array: pubkey -> their raw feed value
 local sFeedKey          -- array: feed-list line -> channel pubkey
 local sFeedMag          -- array: feed-list line -> magnet
 local sFeedTitle        -- array: feed-list line -> release title
+local sXferHandle       -- array: transfers-list line -> torrent handle
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -87,6 +92,12 @@ on mouseUp
       case "chCopyMag"
          chCopySelectedMagnet
          break
+      case "chStream"
+         chStreamSelected
+         break
+      case "chXfers"
+         chShowFilesForSelection
+         break
       case "chUnfollow"
          chUnfollow
          break
@@ -119,7 +130,7 @@ command chBuild
    end if
    lock screen
    set the width of this stack to 880
-   set the height of this stack to 748
+   set the height of this stack to 900
    set the backgroundColor of this card to "237,239,243"
    set the title of this stack to "TorrentXT - Decentralized Channels"
    chMakeLabel "chTitle", "  Decentralized Channels - share files with no server", "0,0,880,30", 14
@@ -155,23 +166,35 @@ command chBuild
    chMakeLabel "chXferHeader", "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "16,384,864,402", 10
    chMakeList "chXfers", "16,404,864,490", false
    chMakeLabel "chTotals", "", "16,494,864,514", 10
-   set the tabStops of field "chXferHeader" to "26,430,540,650"
-   set the tabStops of field "chXfers" to "26,430,540,650"
+   set the tabStops of field "chXferHeader" to "26,400,500,640"
+   set the tabStops of field "chXfers" to "26,400,500,640"
    set the textFont of field "chXferHeader" to "Courier"
    set the textFont of field "chXfers" to "Courier"
    set the textSize of field "chXferHeader" to 10
    set the textSize of field "chXfers" to 10
+   -- 3b. Contents of the selected transfer (live per-file progress) + streaming
+   chMakeButton "chStream", "Stream Selected (in order)", "16,520,300,544"
+   chMakeLabel "chFilesCaption", "Click a transfer above to see its files. Stream downloads in order so media can play as it arrives.", "308,524,864,542", 9
+   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "16,548,864,566", 10
+   chMakeList "chFiles", "16,568,864,662", true
+   set the tabStops of field "chFilesHeader" to "440,540"
+   set the tabStops of field "chFiles" to "440,540"
+   set the textFont of field "chFilesHeader" to "Courier"
+   set the textFont of field "chFiles" to "Courier"
+   set the textSize of field "chFilesHeader" to 10
+   set the textSize of field "chFiles" to 10
+   set the text of field "chFiles" to "   Click a transfer above to see its files and per-file progress."
    -- 4. Quick drop (immutable)
-   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,522,864,542"
-   chMakeField "chPinText", "16,548,430,572", false
-   chMakeButton "chPin", "Pin", "438,548,510,572"
-   chMakeField "chPinCode", "518,548,790,572", true
-   chMakeButton "chPinCopy", "Copy", "794,548,864,572"
-   chMakeField "chFetchCode", "16,576,430,600", false
-   chMakeButton "chFetchBtn", "Fetch", "438,576,510,600"
-   chMakeField "chDropResult", "518,576,864,600", true
+   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,672,864,692"
+   chMakeField "chPinText", "16,698,430,722", false
+   chMakeButton "chPin", "Pin", "438,698,510,722"
+   chMakeField "chPinCode", "518,698,790,722", true
+   chMakeButton "chPinCopy", "Copy", "794,698,864,722"
+   chMakeField "chFetchCode", "16,726,430,750", false
+   chMakeButton "chFetchBtn", "Fetch", "438,726,510,750"
+   chMakeField "chDropResult", "518,726,864,750", true
    -- Log
-   chMakeList "chLog", "16,608,864,738", true
+   chMakeList "chLog", "16,758,864,888", true
    set the textFont of field "chMyKey" to "Courier"
    set the textFont of field "chFollowKey" to "Courier"
    set the textFont of field "chPinCode" to "Courier"
@@ -251,6 +274,9 @@ command chAddTips
    set the tooltip of button "chDownload" to "Download the selected file - it transfers peer-to-peer from the publisher."
    set the tooltip of button "chCopyMag" to "Copy the selected file's magnet link to the clipboard."
    set the tooltip of button "chUnfollow" to "Stop following the selected file's channel."
+   set the tooltip of field "chXfers" to "Click a transfer to see its files and per-file progress below."
+   set the tooltip of button "chStream" to "Download the selected transfer in order, so media plays as it arrives."
+   set the tooltip of field "chFiles" to "Files inside the selected transfer, with live per-file progress."
    set the tooltip of field "chPinText" to "Type any short text (up to 1000 bytes) to pin to the network."
    set the tooltip of button "chPin" to "Store the text on the DHT and get back a short share code."
    set the tooltip of button "chPinCopy" to "Copy the share code to the clipboard."
@@ -270,7 +296,8 @@ command chHelp
    put tMsg & "2) CHANNELS YOU FOLLOW - paste someone's channel card to see their latest files. Pick" & return into tMsg
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
    put tMsg & "   so it is tamper-proof." & return & return into tMsg
-   put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving." & return & return into tMsg
+   put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving. Click one to see" & return into tMsg
+   put tMsg & "   the files inside it with per-file progress, or Stream it to download in order." & return & return into tMsg
    put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return & return into tMsg
    put tMsg & "TRY IT on two machines: Copy your card on one, Follow it on the other, then share a file." into tMsg
    answer tMsg with "Got it"
@@ -716,15 +743,19 @@ end chRefreshSubs
 -- ---- transfers dashboard -----------------------------------------------------
 command chRefreshTransfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht
-   local tColors, tErr
+   local tColors, tErr, tSelH, tSelLine
    if sSession is 0 or sSession is empty then
       exit chRefreshTransfers
    end if
+   -- remember which transfer is selected (by handle) so the 1 s repaint keeps it
+   put chSelectedXferHandle() into tSelH
    put btTorrentCount(sSession) into tCount
    put "" into tRows
    put 0 into tDown
    put 0 into tUp
    put 0 into tLineNum
+   put 0 into tSelLine
+   put empty into sXferHandle
    repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is 0 then
@@ -732,10 +763,15 @@ command chRefreshTransfers
       end if
       put btTorrentStatus(tH) into tS
       add 1 to tLineNum
+      put tH into sXferHandle[tLineNum]
+      if tH is tSelH then
+         put tLineNum into tSelLine
+      end if
       put (the round of (tS["progress"] * 1000) / 10) into tPct
       put chStateColor(tS["state"], tS["error"]) into tColors[tLineNum]
-      put tLineNum & tab & chTrunc(tS["name"], 44) & tab & chStateName(tS["state"]) & tab & \
-          tPct & "%" & tab & tS["numPeers"] & return after tRows
+      -- Progress column is now an inline ASCII bar (the field is monospaced)
+      put tLineNum & tab & chTrunc(tS["name"], 40) & tab & chStateName(tS["state"]) & tab & \
+          chProgressBar(tPct) & tab & tS["numPeers"] & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
    end repeat
@@ -769,10 +805,109 @@ command chRefreshTransfers
       end repeat
    catch tErr
    end try
+   -- keep the selected transfer highlighted across the repaint
+   if tSelLine > 0 then
+      set the hilitedLines of field "chXfers" to tSelLine
+   end if
    put tLineNum && "transfers     down" && (chFmtBytes(tDown) & "/s") && "    up" \
       && (chFmtBytes(tUp) & "/s") && "     " & tDht into field "chTotals"
    unlock screen
+   -- refresh the file detail for whatever transfer is selected (live per-file %)
+   chShowFiles tSelH
 end chRefreshTransfers
+
+-- ---- selected-transfer detail: the file table + streaming --------------------
+
+-- The 0-based line of the selected transfer, or 0 if none.
+function chSelectedXferLine
+   local tNum
+   set the itemDelimiter to comma   -- the hilitedLines is comma-delimited
+   put item 1 of (the hilitedLines of field "chXfers") into tNum
+   if tNum is empty or tNum is not a number then
+      return 0
+   end if
+   return tNum
+end chSelectedXferLine
+
+-- The torrent handle of the selected transfer, or 0 if none / stale.
+function chSelectedXferHandle
+   local tL
+   put chSelectedXferLine() into tL
+   if tL is 0 or sXferHandle[tL] is empty then
+      return 0
+   end if
+   return sXferHandle[tL]
+end chSelectedXferHandle
+
+-- Show the file table of a torrent: name, size, and a live per-file progress
+-- bar (btFileList - the marquee v5 inspection call). Empty until metadata
+-- arrives (a magnet fetches its file list over the swarm).
+command chShowFiles pHandle
+   local tFiles, tFile, tRows, tPct
+   if there is no field "chFiles" then
+      exit chShowFiles
+   end if
+   if pHandle is 0 or pHandle is empty then
+      put "   Click a transfer above to see its files and per-file progress." into tRows
+   else
+      put btFileList(pHandle) into tFiles
+      put "" into tRows
+      repeat for each element tFile in tFiles
+         if tFile["size"] > 0 then
+            put (the round of (tFile["progress"] * 1000 / tFile["size"]) / 10) into tPct
+         else
+            put 0 into tPct
+         end if
+         put chTrunc(tFile["path"], 60) & tab & chFmtBytes(tFile["size"]) & tab \
+             & chProgressBar(tPct) & return after tRows
+      end repeat
+      if the last char of tRows is return then
+         delete the last char of tRows
+      end if
+      if tRows is empty then
+         put "   No file list yet - metadata still arriving (a magnet fetches it over the swarm)." into tRows
+      end if
+   end if
+   -- repaint only when the contents actually changed (single-thread playbook)
+   if the text of field "chFiles" is not tRows then
+      set the text of field "chFiles" to tRows
+   end if
+end chShowFiles
+
+command chShowFilesForSelection
+   chShowFiles chSelectedXferHandle()
+end chShowFilesForSelection
+
+-- Turn on sequential (in-order) download for the selected transfer, so a media
+-- release can play as it arrives instead of downloading pieces at random.
+command chStreamSelected
+   local tH, tR
+   put chSelectedXferHandle() into tH
+   if tH is 0 then
+      chLog "Select a transfer first, then click Stream."
+      exit chStreamSelected
+   end if
+   put btSetSequentialDownload(tH, true) into tR
+   if tR is 0 then
+      chLog "Streaming on: transfer" && tH && "now downloads in order (play-as-it-arrives)."
+   else
+      chLog "Could not enable streaming:" && btLastError()
+   end if
+end chStreamSelected
+
+-- a 10-segment ASCII progress bar, e.g. [####------] 42%  (monospaced fields)
+function chProgressBar pPct
+   local tFilled
+   put trunc(pPct / 10) into tFilled
+   if tFilled < 0 then
+      put 0 into tFilled
+   end if
+   if tFilled > 10 then
+      put 10 into tFilled
+   end if
+   return "[" & (char 1 to tFilled of "##########") & \
+      (char 1 to (10 - tFilled) of "----------") & "]" && pPct & "%"
+end chProgressBar
 
 -- ---- quick drop (immutable) --------------------------------------------------
 command chPin
