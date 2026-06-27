@@ -843,6 +843,114 @@ extern "C" BTX_API int BTX_CALL btx_set_torrent_limits(int t, const char *downDe
 }
 
 /* ====================================================================== *
+ *  Control — extended (ABI v4): flags, connection/upload caps, error clear,
+ *  scrape, storage move, download-queue positioning. More of libtorrent's
+ *  torrent_handle surface, all fire-and-forget; scrape/move results ride the
+ *  already-wired A_SCRAPE_REPLY / A_STORAGE_MOVED alerts.
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_set_torrent_flags(int t, const char *flagsDec,
+                                                      const char *maskDec) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!flagsDec || !maskDec) { set_error("null flags"); return BTX_ERR_INVALID_ARG; }
+        /* torrent_flags_t is a 64-bit bitfield; it crosses as a decimal string.
+         * set_flags(flags, mask) writes only the masked bits. */
+        std::uint64_t flags = std::strtoull(flagsDec, nullptr, 10);
+        std::uint64_t mask  = std::strtoull(maskDec, nullptr, 10);
+        h.set_flags(lt::torrent_flags_t{flags}, lt::torrent_flags_t{mask});
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_unset_torrent_flags(int t, const char *flagsDec) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!flagsDec) { set_error("null flags"); return BTX_ERR_INVALID_ARG; }
+        std::uint64_t flags = std::strtoull(flagsDec, nullptr, 10);
+        h.unset_flags(lt::torrent_flags_t{flags});
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_set_max_connections(int t, int maxConns) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        /* libtorrent wants >= 2 (or -1 == unlimited); forward as-is, it clamps. */
+        h.set_max_connections(maxConns);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_set_max_uploads(int t, int maxUploads) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        h.set_max_uploads(maxUploads);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_torrent_clear_error(int t) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        h.clear_error();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_scrape_tracker(int t) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        /* default idx -1 == scrape every tracker in the list; -> A_SCRAPE_REPLY. */
+        h.scrape_tracker();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_move_storage(int t, const char *savePath) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!savePath || !*savePath) { set_error("empty save path"); return BTX_ERR_INVALID_ARG; }
+        /* Async; result -> A_STORAGE_MOVED (or A_FILE_ERROR). Bytes move
+         * engine-side between the old and new directory, never through script. */
+        h.move_storage(std::string(savePath));
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_queue_position(int t) {
+    BTX_GUARD_INT({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        /* Not a buffer getter: -1 (libtorrent's own "not queued" sentinel) also
+         * stands in for an invalid handle, since 0 is a real queue position. */
+        if (!ok) return -1;
+        return static_cast<int>(h.queue_position());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_queue_move(int t, int op) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        switch (op) {
+            case 0: h.queue_position_up();     break;
+            case 1: h.queue_position_down();   break;
+            case 2: h.queue_position_top();    break;
+            case 3: h.queue_position_bottom(); break;
+            default: set_error("queue op must be 0..3"); return BTX_ERR_INVALID_ARG;
+        }
+        return BTX_OK;
+    });
+}
+
+/* ====================================================================== *
  *  Status — one KV-record snapshot per call (perf §8: never one call per field)
  * ====================================================================== */
 

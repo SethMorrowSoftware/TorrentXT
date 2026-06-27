@@ -42,11 +42,24 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 3
+constant kABIVersion is 4
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
 constant kEncodingUtf8 is 4
+
+-- torrent_flags_t bit VALUES (stable libtorrent constants; mirror of
+-- libtorrent/torrent_flags.hpp). Passed to btSetTorrentFlags / btUnsetTorrentFlags
+-- as decimal strings. Combine by adding the values (the bits are disjoint).
+constant kFlagSeedMode is "1"             -- bit 0:  assume we already have all data
+constant kFlagUploadMode is "2"           -- bit 1:  upload only, never request
+constant kFlagShareMode is "4"            -- bit 2:  optimise for share-ratio
+constant kFlagApplyIpFilter is "8"        -- bit 3:  subject this torrent to the IP filter
+constant kFlagPaused is "16"              -- bit 4:  start paused
+constant kFlagAutoManaged is "32"         -- bit 5:  let libtorrent queue/start/stop it
+constant kFlagSuperSeeding is "256"       -- bit 8:  super-seed (initial-seed) mode
+constant kFlagSequentialDownload is "512" -- bit 9:  download pieces in order (streaming)
+constant kFlagStopWhenReady is "1024"     -- bit 10: pause as soon as checking finishes
 
 -- Reusable buffer capacities (the single-thread performance playbook: allocate
 -- once, reuse every poll, never rebuild). Grown on demand if the shim reports a
@@ -200,6 +213,17 @@ private foreign handler _btx_set_file_priority(in pT as CInt, in pFile as CInt, 
 private foreign handler _btx_set_file_priorities(in pT as CInt, in pPrios as Pointer, in pCount as CInt) returns CInt binds to "c:torrentxt>btx_set_file_priorities!cdecl"
 private foreign handler _btx_set_piece_priority(in pT as CInt, in pPiece as CInt, in pPrio as CInt) returns CInt binds to "c:torrentxt>btx_set_piece_priority!cdecl"
 private foreign handler _btx_set_torrent_limits(in pT as CInt, in pDown as ZStringUTF8, in pUp as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_set_torrent_limits!cdecl"
+
+-- extended control (ABI v4): flags, connection/upload caps, queue, storage
+private foreign handler _btx_set_torrent_flags(in pT as CInt, in pFlags as ZStringUTF8, in pMask as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_set_torrent_flags!cdecl"
+private foreign handler _btx_unset_torrent_flags(in pT as CInt, in pFlags as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_unset_torrent_flags!cdecl"
+private foreign handler _btx_set_max_connections(in pT as CInt, in pMax as CInt) returns CInt binds to "c:torrentxt>btx_set_max_connections!cdecl"
+private foreign handler _btx_set_max_uploads(in pT as CInt, in pMax as CInt) returns CInt binds to "c:torrentxt>btx_set_max_uploads!cdecl"
+private foreign handler _btx_torrent_clear_error(in pT as CInt) returns CInt binds to "c:torrentxt>btx_torrent_clear_error!cdecl"
+private foreign handler _btx_scrape_tracker(in pT as CInt) returns CInt binds to "c:torrentxt>btx_scrape_tracker!cdecl"
+private foreign handler _btx_move_storage(in pT as CInt, in pPath as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_move_storage!cdecl"
+private foreign handler _btx_queue_position(in pT as CInt) returns CInt binds to "c:torrentxt>btx_queue_position!cdecl"
+private foreign handler _btx_queue_move(in pT as CInt, in pOp as CInt) returns CInt binds to "c:torrentxt>btx_queue_move!cdecl"
 
 private foreign handler _btx_torrent_status(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_torrent_status!cdecl"
 private foreign handler _btx_torrent_count(in pS as CInt) returns CInt binds to "c:torrentxt>btx_torrent_count!cdecl"
@@ -844,6 +868,148 @@ public handler btSetTorrentLimits(in pTorrent as Integer, in pDownBytesPerSec as
    variable tR as Integer
    unsafe
       put _btx_set_torrent_limits(pTorrent, pDownBytesPerSec, pUpBytesPerSec) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ---- extended control (ABI v4): flags, caps, queue, storage --------------
+
+-- Set/clear raw torrent_flags_t bits. pFlags and pMask are decimal strings;
+-- combine the kFlag* constants by adding their values. set writes ONLY the
+-- masked bits, so set(flags, mask) is the read-modify-write primitive.
+public handler btSetTorrentFlags(in pTorrent as Integer, in pFlags as String, in pMask as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_set_torrent_flags(pTorrent, pFlags, pMask) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btUnsetTorrentFlags(in pTorrent as Integer, in pFlags as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_unset_torrent_flags(pTorrent, pFlags) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Convenience: toggle one common flag by name (built on the generic pair).
+public handler btSetSequentialDownload(in pTorrent as Integer, in pOn as Boolean) returns Integer
+   if pOn then
+      return btSetTorrentFlags(pTorrent, kFlagSequentialDownload, kFlagSequentialDownload)
+   end if
+   return btUnsetTorrentFlags(pTorrent, kFlagSequentialDownload)
+end handler
+
+public handler btSetAutoManaged(in pTorrent as Integer, in pOn as Boolean) returns Integer
+   if pOn then
+      return btSetTorrentFlags(pTorrent, kFlagAutoManaged, kFlagAutoManaged)
+   end if
+   return btUnsetTorrentFlags(pTorrent, kFlagAutoManaged)
+end handler
+
+public handler btSetSuperSeeding(in pTorrent as Integer, in pOn as Boolean) returns Integer
+   if pOn then
+      return btSetTorrentFlags(pTorrent, kFlagSuperSeeding, kFlagSuperSeeding)
+   end if
+   return btUnsetTorrentFlags(pTorrent, kFlagSuperSeeding)
+end handler
+
+public handler btSetShareMode(in pTorrent as Integer, in pOn as Boolean) returns Integer
+   if pOn then
+      return btSetTorrentFlags(pTorrent, kFlagShareMode, kFlagShareMode)
+   end if
+   return btUnsetTorrentFlags(pTorrent, kFlagShareMode)
+end handler
+
+public handler btSetUploadMode(in pTorrent as Integer, in pOn as Boolean) returns Integer
+   if pOn then
+      return btSetTorrentFlags(pTorrent, kFlagUploadMode, kFlagUploadMode)
+   end if
+   return btUnsetTorrentFlags(pTorrent, kFlagUploadMode)
+end handler
+
+-- Per-torrent caps: max peer connections, and max unchoked upload slots.
+public handler btSetMaxConnections(in pTorrent as Integer, in pMax as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_set_max_connections(pTorrent, pMax) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btSetMaxUploads(in pTorrent as Integer, in pMax as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_set_max_uploads(pTorrent, pMax) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Clear a torrent's error state so it can resume (after fixing disk/permission).
+public handler btClearTorrentError(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_torrent_clear_error(pTorrent) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Ask the tracker(s) for current seed/leecher counts (-> scrapeReply event).
+public handler btScrapeTracker(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_scrape_tracker(pTorrent) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Move the downloaded files to a new folder (-> storageMoved / fileError event).
+public handler btMoveStorage(in pTorrent as Integer, in pSavePath as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_move_storage(pTorrent, pSavePath) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Download-queue position: 0-based, or -1 if not queued (or invalid handle).
+public handler btQueuePosition(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_queue_position(pTorrent) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btQueueUp(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_queue_move(pTorrent, 0) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btQueueDown(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_queue_move(pTorrent, 1) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btQueueTop(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_queue_move(pTorrent, 2) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btQueueBottom(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_queue_move(pTorrent, 3) into tR
    end unsafe
    return tR
 end handler

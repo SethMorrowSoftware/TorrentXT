@@ -165,6 +165,21 @@ static void test_bogus_handles_are_noops() {
         const unsigned char prios[2] = {4, 4};
         CHECK(btx_set_file_priorities(h, prios, 2) < 0);
 
+        /* --- ABI v4 extended control on a bogus torrent handle -> error --- */
+        CHECK(btx_set_torrent_flags(h, "512", "512") < 0);
+        CHECK(btx_unset_torrent_flags(h, "512") < 0);
+        CHECK(btx_set_max_connections(h, 50) < 0);
+        CHECK(btx_set_max_uploads(h, 4) < 0);
+        CHECK(btx_torrent_clear_error(h) < 0);
+        CHECK(btx_scrape_tracker(h) < 0);
+        CHECK(btx_move_storage(h, "/tmp") < 0);
+        CHECK(btx_queue_move(h, 2) < 0);
+        /* btx_queue_position is the lone int-getter that returns -1 (not 0) for a
+         * bad handle, because 0 is a valid position. */
+        CHECK(btx_queue_position(h) == -1);
+        /* argument validation independent of the (bogus) handle path. */
+        CHECK(btx_queue_move(h, 99) < 0);              /* out-of-range op       */
+
         /* torrent getters on a bogus torrent -> 0/empty. */
         CHECK(btx_torrent_status(h, buf, sizeof buf) == 0);
         CHECK(btx_info_hash_hex(h, buf, sizeof buf) == 0);

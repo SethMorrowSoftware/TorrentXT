@@ -150,15 +150,17 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-39 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+56 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
 | Session | `btStartSession` · `btStopSession` · `btLastError` · `btClearError` |
 | Settings | `btSetInt` · `btSetBool` · `btSetString` · `btGetSetting` · `btSetEncryption` |
 | Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` |
-| Control | `btPause` · `btResume` · `btForceRecheck` · `btForceReannounce` |
-| Priorities / limits | `btSetFilePriority` · `btSetFilePriorities` · `btSetPiecePriority` · `btSetTorrentLimits` |
+| Control | `btPause` · `btResume` · `btForceRecheck` · `btForceReannounce` · `btScrapeTracker` · `btClearTorrentError` |
+| Priorities / limits | `btSetFilePriority` · `btSetFilePriorities` · `btSetPiecePriority` · `btSetTorrentLimits` · `btSetMaxConnections` · `btSetMaxUploads` |
+| Flags / modes | `btSetTorrentFlags` · `btUnsetTorrentFlags` · `btSetSequentialDownload` · `btSetAutoManaged` · `btSetSuperSeeding` · `btSetShareMode` · `btSetUploadMode` |
+| Queue / storage | `btQueuePosition` · `btQueueUp` · `btQueueDown` · `btQueueTop` · `btQueueBottom` · `btMoveStorage` |
 | Inspect | `btTorrentStatus` · `btTorrentCount` · `btTorrentHandleAt` · `btInfoHash` · `btPieceBitfield` · `btPeerList` |
 | Events | `btPoll` |
 | DHT | `btDhtAddBootstrap` · `btDhtState` · `btDhtSaveState` · `btDhtLoadState` |

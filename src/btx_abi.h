@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 3
+#define BTX_ABI_VERSION 4
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -169,6 +169,39 @@ BTX_API int BTX_CALL btx_set_piece_priority(int t, int pieceIndex, int priority)
 /* Per-torrent rate caps in bytes/sec, as decimal strings ("0" == unlimited). */
 BTX_API int BTX_CALL btx_set_torrent_limits(int t, const char *downDec,
                                             const char *upDec);
+
+/* ---- extended control (ABI v4): flags, slots, queue, storage ---------------
+ * More of libtorrent's torrent_handle surface. torrent_flags_t rides as a
+ * 64-bit decimal string (there is no 64-bit foreign int): set_flags writes only
+ * the bits named in `mask`, unset_flags clears the bits named in `flags`. The
+ * named bit values (sequential_download, auto_managed, share_mode, upload_mode,
+ * super_seeding, apply_ip_filter, stop_when_ready, ...) are stable libtorrent
+ * constants the LCB layer mirrors as kFlag*. */
+BTX_API int BTX_CALL btx_set_torrent_flags(int t, const char *flagsDec,
+                                           const char *maskDec);
+BTX_API int BTX_CALL btx_unset_torrent_flags(int t, const char *flagsDec);
+
+/* Per-torrent caps: max peer connections, and max unchoked upload slots. */
+BTX_API int BTX_CALL btx_set_max_connections(int t, int maxConns);
+BTX_API int BTX_CALL btx_set_max_uploads(int t, int maxUploads);
+
+/* Clear a torrent's error state so it can resume (e.g. after fixing a disk or
+ * permission problem that paused it). */
+BTX_API int BTX_CALL btx_torrent_clear_error(int t);
+
+/* Ask the tracker(s) for current seed/leecher counts; result -> A_SCRAPE_REPLY. */
+BTX_API int BTX_CALL btx_scrape_tracker(int t);
+
+/* Move the downloaded files to a new directory; result -> A_STORAGE_MOVED (or
+ * A_FILE_ERROR on failure). The bytes move engine-side, never through script. */
+BTX_API int BTX_CALL btx_move_storage(int t, const char *savePath);
+
+/* Download-queue positioning. btx_queue_position returns the 0-based position,
+ * or -1 when the torrent is not queued (or the handle is invalid). This is the
+ * ONE int-getter that uses -1 (not 0) for "no value", because 0 is itself a
+ * valid queue position. btx_queue_move op: 0=up 1=down 2=top 3=bottom. */
+BTX_API int BTX_CALL btx_queue_position(int t);
+BTX_API int BTX_CALL btx_queue_move(int t, int op);
 
 /* ====================================================================== *
  *  Status — ONE snapshot per call (perf: never one FFI call per field, §8)
