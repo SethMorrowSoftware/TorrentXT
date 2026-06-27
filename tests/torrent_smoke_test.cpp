@@ -128,6 +128,16 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_set_encryption_policy(h, 1, 1, 3) < 0);
         CHECK(btx_dht_add_bootstrap(h, "router.bittorrent.com", 6881) < 0);
 
+        /* --- ABI v7 session ops on a bogus SESSION handle --- */
+        CHECK(btx_session_pause(h) < 0);
+        CHECK(btx_session_resume(h) < 0);
+        CHECK(btx_session_is_paused(h) == 0);   /* int-getter: 0 on no session */
+        CHECK(btx_listen_port(h) == 0);
+        CHECK(btx_find_torrent(h,
+              "0123456789abcdef0123456789abcdef01234567") == 0);
+        CHECK(btx_dht_announce(h,
+              "0123456789abcdef0123456789abcdef01234567", 6881) < 0);
+
         /* add-* on a bogus session return 0 (no handle made), not a crash. */
         CHECK(btx_add_magnet(h, "magnet:?xt=urn:btih:"
               "0123456789abcdef0123456789abcdef01234567", "/tmp") == 0);

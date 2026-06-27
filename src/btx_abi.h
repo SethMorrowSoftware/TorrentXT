@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 6
+#define BTX_ABI_VERSION 7
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -128,6 +128,28 @@ BTX_API int BTX_CALL btx_get_setting(int s, const char *key, char *out, int cap)
  * out_enc_policy / allowed_enc_level. */
 BTX_API int BTX_CALL btx_set_encryption_policy(int s, int inPolicy,
                                                int outPolicy, int level);
+
+/* ====================================================================== *
+ *  Session operations (ABI v7) — whole-session pause, listen port, look up a
+ *  torrent by info-hash, classic (BEP5) DHT peer announce.
+ * ====================================================================== */
+
+/* Pause / resume the WHOLE session (all torrents); is_paused returns 1/0 (0 on
+ * no session). Distinct from per-torrent btx_pause/btx_resume. */
+BTX_API int BTX_CALL btx_session_pause(int s);
+BTX_API int BTX_CALL btx_session_resume(int s);
+BTX_API int BTX_CALL btx_session_is_paused(int s);
+
+/* The TCP port we actually ended up listening on (0 == not listening yet). */
+BTX_API int BTX_CALL btx_listen_port(int s);
+
+/* Look up an already-added torrent by its 40-hex (v1) info-hash; returns OUR
+ * torrent handle id, or 0 if not found / bad args. */
+BTX_API int BTX_CALL btx_find_torrent(int s, const char *infoHashHex);
+
+/* Classic BEP5 DHT peer announce (NOT BEP44): tell the DHT we have peers for
+ * this 40-hex info-hash on `port` (0 == our listen port). Fire-and-forget. */
+BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex, int port);
 
 /* ====================================================================== *
  *  Add / remove torrents

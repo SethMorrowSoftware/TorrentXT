@@ -150,11 +150,11 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-63 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+69 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
-| Session | `btStartSession` · `btStopSession` · `btLastError` · `btClearError` |
+| Session | `btStartSession` · `btStopSession` · `btLastError` · `btClearError` · `btSessionPause` · `btSessionResume` · `btSessionIsPaused` · `btListenPort` · `btFindTorrent` · `btDhtAnnounce` |
 | Settings | `btSetInt` · `btSetBool` · `btSetString` · `btGetSetting` · `btSetEncryption` |
 | Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` |
 | Control | `btPause` · `btResume` · `btForceRecheck` · `btForceReannounce` · `btScrapeTracker` · `btClearTorrentError` |

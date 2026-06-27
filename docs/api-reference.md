@@ -119,6 +119,36 @@ MSE / protocol-encryption (PE) policy, mapped straight to libtorrent's
 
 ---
 
+## Session operations
+
+### `btSessionPause(in pSession as Integer) returns Integer` · `btSessionResume(in pSession as Integer) returns Integer`
+Pause / resume the **whole session** - every torrent at once. Distinct from the
+per-torrent `btPause` / `btResume`.
+- **Usage:** command - `btSessionPause sSession`.
+
+### `btSessionIsPaused(in pSession as Integer) returns Boolean`
+`true` if the session is paused. `false` on no session.
+- **Usage:** function - `if btSessionIsPaused(sSession) then ...`.
+
+### `btListenPort(in pSession as Integer) returns Integer`
+The TCP port the session actually ended up listening on, or `0` if it is not
+listening yet (or on a bad handle).
+- **Usage:** function - `put btListenPort(sSession) into tPort`.
+
+### `btFindTorrent(in pSession as Integer, in pInfoHash as String) returns Integer`
+Look up an already-added torrent by its **40-hex (v1) info-hash**; returns the
+torrent handle, or `0` if it is not in this session. Lets you recover a handle
+from a hash you stored earlier instead of keeping the integer around.
+- **Usage:** function - `put btFindTorrent(sSession, tHashHex) into tH`.
+
+### `btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in pPort as Integer) returns Integer`
+Classic **BEP 5** DHT peer announce (not BEP 44): advertise to the DHT that we
+serve peers for `pInfoHash` (40-hex) on `pPort` (`0` == our listen port). Useful
+for announcing your own content's info-hash so others can find you swarm-side.
+- **Usage:** command - `btDhtAnnounce sSession, tHashHex, 0`.
+
+---
+
 ## Add / remove torrents
 
 ### `btAddMagnet(in pSession as Integer, in pURI as String, in pSavePath as String) returns Integer`

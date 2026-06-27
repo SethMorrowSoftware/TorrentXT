@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 6
+constant kABIVersion is 7
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -212,6 +212,14 @@ private foreign handler _btx_set_bool(in pS as CInt, in pKey as ZStringUTF8, in 
 private foreign handler _btx_set_str(in pS as CInt, in pKey as ZStringUTF8, in pVal as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_set_str!cdecl"
 private foreign handler _btx_get_setting(in pS as CInt, in pKey as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_get_setting!cdecl"
 private foreign handler _btx_set_encryption_policy(in pS as CInt, in pIn as CInt, in pOut as CInt, in pLevel as CInt) returns CInt binds to "c:torrentxt>btx_set_encryption_policy!cdecl"
+
+-- session operations (ABI v7)
+private foreign handler _btx_session_pause(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_pause!cdecl"
+private foreign handler _btx_session_resume(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_resume!cdecl"
+private foreign handler _btx_session_is_paused(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_is_paused!cdecl"
+private foreign handler _btx_listen_port(in pS as CInt) returns CInt binds to "c:torrentxt>btx_listen_port!cdecl"
+private foreign handler _btx_find_torrent(in pS as CInt, in pHash as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_find_torrent!cdecl"
+private foreign handler _btx_dht_announce(in pS as CInt, in pHash as ZStringUTF8, in pPort as CInt) returns CInt binds to "c:torrentxt>btx_dht_announce!cdecl"
 
 private foreign handler _btx_add_magnet(in pS as CInt, in pURI as ZStringUTF8, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_magnet!cdecl"
 private foreign handler _btx_add_torrent_file(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_torrent_file!cdecl"
@@ -775,6 +783,63 @@ public handler btSetEncryption(in pSession as Integer, in pIn as Integer, in pOu
    variable tR as Integer
    unsafe
       put _btx_set_encryption_policy(pSession, pIn, pOut, pLevel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ---- session operations (ABI v7) ----------------------------------------
+
+-- Pause / resume the WHOLE session (every torrent). Distinct from the
+-- per-torrent btPause / btResume.
+public handler btSessionPause(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_session_pause(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btSessionResume(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_session_resume(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btSessionIsPaused(in pSession as Integer) returns Boolean
+   variable tR as Integer
+   unsafe
+      put _btx_session_is_paused(pSession) into tR
+   end unsafe
+   return tR is not 0
+end handler
+
+-- The TCP port we actually ended up listening on (0 == not listening yet).
+public handler btListenPort(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_listen_port(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Look up an already-added torrent by its 40-hex (v1) info-hash; returns the
+-- torrent handle, or 0 if not found.
+public handler btFindTorrent(in pSession as Integer, in pInfoHash as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_find_torrent(pSession, pInfoHash) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Classic BEP5 DHT peer announce (NOT BEP44): tell the DHT we have peers for
+-- this 40-hex info-hash on pPort (0 == our listen port).
+public handler btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in pPort as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_dht_announce(pSession, pInfoHash, pPort) into tR
    end unsafe
    return tR
 end handler

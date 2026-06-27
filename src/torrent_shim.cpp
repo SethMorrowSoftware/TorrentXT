@@ -626,6 +626,76 @@ extern "C" BTX_API int BTX_CALL btx_set_encryption_policy(int s, int inPolicy,
 }
 
 /* ====================================================================== *
+ *  Session operations (ABI v7) — whole-session pause, listen port, look up a
+ *  torrent by info-hash, classic (BEP5) DHT peer announce.
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_session_pause(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        st->ses->pause();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_session_resume(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        st->ses->resume();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_session_is_paused(int s) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;  /* no session -> "not paused" default */
+        return st->ses->is_paused() ? 1 : 0;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_listen_port(int s) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;  /* 0 == not listening / no session */
+        return static_cast<int>(st->ses->listen_port());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_find_torrent(int s, const char *infoHashHex) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;
+        char buf[20];
+        if (!hex_to_buf(infoHashHex, buf, 20)) return 0;  /* not 40 hex -> not found */
+        lt::torrent_handle h = st->ses->find_torrent(lt::sha1_hash(buf));
+        if (!h.is_valid()) return 0;
+        /* map libtorrent's handle back to OUR int id via the reverse map. */
+        auto it = st->idOf.find(h);
+        return it == st->idOf.end() ? 0 : it->second;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex,
+                                                 int port) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        char buf[20];
+        if (!hex_to_buf(infoHashHex, buf, 20)) {
+            set_error("info-hash must be 40 hex chars"); return BTX_ERR_INVALID_ARG;
+        }
+        if (port < 0 || port > 65535) { set_error("bad port"); return BTX_ERR_INVALID_ARG; }
+        /* classic BEP5 peer announce (distinct from the BEP44 KV calls): tell the
+         * DHT we serve peers for this info-hash on `port` (0 == our listen port). */
+        st->ses->dht_announce(lt::sha1_hash(buf), port);
+        return BTX_OK;
+    });
+}
+
+/* ====================================================================== *
  *  Add / remove torrents
  * ====================================================================== */
 
