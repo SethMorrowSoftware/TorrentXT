@@ -65,6 +65,19 @@ BTX_API int force_throw(void);
  * visibility reason as force_throw above. */
 BTX_API int live_session_count(void);
 
+/* Sign a mutable DHT value through the production signing helper and verify it
+ * with libtorrent's verify_mutable_item; returns 1 if the signature verifies, 0
+ * if not (negative on an internal throw). Guards the BEP44 signing contract -
+ * the value must be signed in its BENCODED form - which is otherwise unreachable
+ * through the public ABI because real signing only runs in a network-thread
+ * callback once a live DHT finds a home for the blob. A regression here is the
+ * silent "channel feeds never arrive" failure. Exported (BTX_API) for the same
+ * visibility reason as the hooks above. */
+BTX_API int dht_mutable_sign_verifies(const char *publicKeyHex,
+                                      const char *secretKeyHex,
+                                      const char *salt,
+                                      const void *data, int len);
+
 }  // namespace test
 }  // namespace btx
 
