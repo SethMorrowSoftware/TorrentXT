@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 7
+constant kABIVersion is 8
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -223,6 +223,14 @@ private foreign handler _btx_dht_announce(in pS as CInt, in pHash as ZStringUTF8
 
 private foreign handler _btx_add_magnet(in pS as CInt, in pURI as ZStringUTF8, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_magnet!cdecl"
 private foreign handler _btx_add_torrent_file(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_torrent_file!cdecl"
+
+-- extended add + filtering/streaming (ABI v8)
+private foreign handler _btx_add_magnet_ex(in pS as CInt, in pURI as ZStringUTF8, in pSave as ZStringUTF8, in pFlags as ZStringUTF8, in pMask as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_magnet_ex!cdecl"
+private foreign handler _btx_add_torrent_file_ex(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8, in pFlags as ZStringUTF8, in pMask as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_torrent_file_ex!cdecl"
+private foreign handler _btx_ip_filter_add(in pS as CInt, in pStart as ZStringUTF8, in pEnd as ZStringUTF8, in pBlock as CInt) returns CInt binds to "c:torrentxt>btx_ip_filter_add!cdecl"
+private foreign handler _btx_ip_filter_clear(in pS as CInt) returns CInt binds to "c:torrentxt>btx_ip_filter_clear!cdecl"
+private foreign handler _btx_set_piece_deadline(in pT as CInt, in pPiece as CInt, in pDeadline as CInt) returns CInt binds to "c:torrentxt>btx_set_piece_deadline!cdecl"
+private foreign handler _btx_clear_piece_deadlines(in pT as CInt) returns CInt binds to "c:torrentxt>btx_clear_piece_deadlines!cdecl"
 private foreign handler _btx_add_with_resume(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_with_resume!cdecl"
 private foreign handler _btx_remove(in pS as CInt, in pT as CInt, in pDel as CInt) returns CInt binds to "c:torrentxt>btx_remove!cdecl"
 
@@ -870,6 +878,74 @@ public handler btAddTorrentFile(in pSession as Integer, in pData as Data, in pSa
       end unsafe
    end if
    return tHandle
+end handler
+
+-- ---- extended add: add with add-time torrent_flags (ABI v8) --------------
+-- pFlags / pMask are decimal strings (combine kFlag* constants). The common
+-- use is adding PAUSED (kFlagPaused) to set file priorities before it starts.
+
+public handler btAddMagnetEx(in pSession as Integer, in pURI as String, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer
+   variable tHandle as Integer
+   unsafe
+      put _btx_add_magnet_ex(pSession, pURI, pSavePath, pFlags, pMask) into tHandle
+   end unsafe
+   return tHandle
+end handler
+
+public handler btAddTorrentFileEx(in pSession as Integer, in pData as Data, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer
+   variable tHandle as Integer
+   variable tPtr as Pointer
+   put 0 into tHandle
+   if the number of bytes in pData > 0 then
+      unsafe
+         put MCDataGetBytePtr(pData) into tPtr
+         put _btx_add_torrent_file_ex(pSession, tPtr, the number of bytes in pData, pSavePath, pFlags, pMask) into tHandle
+      end unsafe
+   end if
+   return tHandle
+end handler
+
+-- ---- IP filter + streaming (ABI v8) --------------------------------------
+
+-- Add an inclusive IP range to the session filter; pBlock true blocks it.
+-- Rules accumulate. Start/end must be the same family (both v4 or both v6).
+public handler btIpFilterAdd(in pSession as Integer, in pStartIp as String, in pEndIp as String, in pBlock as Boolean) returns Integer
+   variable tR as Integer
+   variable tB as Integer
+   if pBlock then
+      put 1 into tB
+   else
+      put 0 into tB
+   end if
+   unsafe
+      put _btx_ip_filter_add(pSession, pStartIp, pEndIp, tB) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btIpFilterClear(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_ip_filter_clear(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Streaming: fetch a piece by a deadline (ms from now); soonest deadlines win.
+public handler btSetPieceDeadline(in pTorrent as Integer, in pPieceIndex as Integer, in pDeadlineMs as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_set_piece_deadline(pTorrent, pPieceIndex, pDeadlineMs) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btClearPieceDeadlines(in pTorrent as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_clear_piece_deadlines(pTorrent) into tR
+   end unsafe
+   return tR
 end handler
 
 public handler btAddTorrentWithResume(in pSession as Integer, in pResume as Data, in pSavePath as String) returns Integer

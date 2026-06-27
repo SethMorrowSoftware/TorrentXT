@@ -149,6 +149,31 @@ for announcing your own content's info-hash so others can find you swarm-side.
 
 ---
 
+## Filtering & streaming
+
+### `btIpFilterAdd(in pSession as Integer, in pStartIp as String, in pEndIp as String, in pBlock as Boolean) returns Integer`
+Add an **inclusive IP range** to the session's IP filter; `pBlock = true` blocks
+it (the default-empty filter allows everything). Rules accumulate. `pStartIp` and
+`pEndIp` are textual addresses of the **same family** (both IPv4 or both IPv6),
+e.g. `"1.2.3.0"` .. `"1.2.3.255"`. A blocked peer is dropped before connecting.
+- **Usage:** command - `btIpFilterAdd sSession, "1.2.3.0", "1.2.3.255", true`.
+
+### `btIpFilterClear(in pSession as Integer) returns Integer`
+Remove all IP-filter rules (back to "allow everything").
+- **Usage:** command - `btIpFilterClear sSession`.
+
+### `btSetPieceDeadline(in pTorrent as Integer, in pPieceIndex as Integer, in pDeadlineMs as Integer) returns Integer`
+**Streaming**: ask libtorrent to fetch a piece within `pDeadlineMs` milliseconds
+from now, reordering requests so the soonest deadlines come first. Set deadlines
+across the pieces you are about to play to stream in order / seek smoothly.
+- **Usage:** command - `btSetPieceDeadline tH, 0, 5000`.
+
+### `btClearPieceDeadlines(in pTorrent as Integer) returns Integer`
+Remove all piece deadlines on the torrent.
+- **Usage:** command - `btClearPieceDeadlines tH`.
+
+---
+
 ## Add / remove torrents
 
 ### `btAddMagnet(in pSession as Integer, in pURI as String, in pSavePath as String) returns Integer`
@@ -176,6 +201,14 @@ Returns a torrent handle, or `0` on failure.
 Remove a torrent from the session. If `pDeleteFiles` is `true`, the downloaded
 files are deleted too. Returns `0` / negative.
 - **Usage:** command - `btRemoveTorrent sSession, tH, false`.
+
+### `btAddMagnetEx(in pSession as Integer, in pURI as String, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer` · `btAddTorrentFileEx(in pSession as Integer, in pData as Data, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer`
+Like `btAddMagnet` / `btAddTorrentFile`, but apply **add-time `torrent_flags`** —
+set the bits named in `pFlags`, touching only the bits named in `pMask` (decimal
+strings; combine the `kFlag*` constants). The classic use is **adding paused**
+(`kFlagPaused`) so you can set file priorities *before* it starts downloading, or
+`kFlagSequentialDownload` for immediate streaming. Returns the torrent handle.
+- **Usage:** function - `put btAddMagnetEx(sSession, tURI, tPath, kFlagPaused, kFlagPaused) into tH` (added paused), then set priorities, then `btResume tH`.
 
 ---
 

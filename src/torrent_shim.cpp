@@ -64,6 +64,8 @@
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/info_hash.hpp>
 #include <libtorrent/sha1_hash.hpp>
+#include <libtorrent/ip_filter.hpp>           /* set_ip_filter (ABI v8)          */
+#include <libtorrent/address.hpp>             /* make_address for IP-filter rules */
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/units.hpp>
 #include <libtorrent/create_torrent.hpp>
@@ -696,10 +698,83 @@ extern "C" BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex,
 }
 
 /* ====================================================================== *
+ *  Filtering & streaming (ABI v8) — IP filter rules and piece deadlines.
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_ip_filter_add(int s, const char *startIp,
+                                                  const char *endIp, int block) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (!startIp || !endIp) { set_error("null ip range"); return BTX_ERR_INVALID_ARG; }
+        lt::error_code ec;
+        lt::address first = lt::make_address(startIp, ec);
+        if (ec) { set_error("bad start address"); return BTX_ERR_INVALID_ARG; }
+        lt::address last = lt::make_address(endIp, ec);
+        if (ec) { set_error("bad end address"); return BTX_ERR_INVALID_ARG; }
+        if (first.is_v4() != last.is_v4()) {
+            set_error("ip range start/end must be the same family");
+            return BTX_ERR_INVALID_ARG;
+        }
+        /* read-modify-write the session filter so rules accumulate. */
+        lt::ip_filter f = st->ses->get_ip_filter();
+        std::uint32_t flags = block
+            ? static_cast<std::uint32_t>(lt::ip_filter::blocked) : 0u;
+        f.add_rule(first, last, flags);
+        st->ses->set_ip_filter(f);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_ip_filter_clear(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        /* an empty filter allows everything. */
+        st->ses->set_ip_filter(lt::ip_filter());
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_set_piece_deadline(int t, int pieceIndex,
+                                                       int deadlineMs) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (pieceIndex < 0) { set_error("negative piece index"); return BTX_ERR_INVALID_ARG; }
+        /* deadline is milliseconds from now; libtorrent reorders requests to hit
+         * the soonest deadlines first (streaming / seeking). */
+        h.set_piece_deadline(lt::piece_index_t{pieceIndex}, deadlineMs);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_clear_piece_deadlines(int t) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        h.clear_piece_deadlines();
+        return BTX_OK;
+    });
+}
+
+/* ====================================================================== *
  *  Add / remove torrents
  * ====================================================================== */
 
 namespace {
+
+/* Apply add-time torrent_flags from two decimal strings: set the bits named in
+ * `maskDec` to the values in `flagsDec`, leaving everything else at libtorrent's
+ * default. Used by the _ex add variants (e.g. add PAUSED, or sequential). A null
+ * pair is a no-op (the plain add path). */
+void apply_add_flags(lt::add_torrent_params &atp, const char *flagsDec,
+                     const char *maskDec) {
+    if (!flagsDec || !maskDec) return;
+    lt::torrent_flags_t fl{std::strtoull(flagsDec, nullptr, 10)};
+    lt::torrent_flags_t mk{std::strtoull(maskDec, nullptr, 10)};
+    atp.flags = (atp.flags & ~mk) | (fl & mk);
+}
 
 /* Register a freshly-added handle in the torrent table + reverse map and return
  * our int id (0 if the table is full). Centralised so add_magnet / add_file /
@@ -785,6 +860,49 @@ extern "C" BTX_API int BTX_CALL btx_add_with_resume(int s, const void *resume,
          * the app relocate content between runs). */
         if (savePath && *savePath) atp.save_path = savePath;
 
+        lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
+        if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
+        return register_torrent(st, h);
+    });
+}
+
+/* Extended add (ABI v8): the plain add path + add-time torrent_flags. */
+extern "C" BTX_API int BTX_CALL btx_add_magnet_ex(int s, const char *uri,
+                                                  const char *savePath,
+                                                  const char *flagsDec,
+                                                  const char *maskDec) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return 0; }
+        if (!uri || !*uri) { set_error("empty magnet URI"); return 0; }
+        lt::error_code ec;
+        lt::add_torrent_params atp = lt::parse_magnet_uri(uri, ec);
+        if (ec) { set_error("bad magnet URI: " + ec.message()); return 0; }
+        if (savePath && *savePath) atp.save_path = savePath;
+        apply_add_flags(atp, flagsDec, maskDec);
+        lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
+        if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
+        return register_torrent(st, h);
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_torrent_file_ex(int s, const void *data,
+                                                        int len,
+                                                        const char *savePath,
+                                                        const char *flagsDec,
+                                                        const char *maskDec) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return 0; }
+        if (!data || len <= 0) { set_error("empty .torrent buffer"); return 0; }
+        lt::error_code ec;
+        auto ti = std::make_shared<lt::torrent_info>(
+            reinterpret_cast<char const *>(data), len, ec);
+        if (ec) { set_error("invalid .torrent: " + ec.message()); return 0; }
+        lt::add_torrent_params atp;
+        atp.ti = ti;
+        if (savePath && *savePath) atp.save_path = savePath;
+        apply_add_flags(atp, flagsDec, maskDec);
         lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
         if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
         return register_torrent(st, h);

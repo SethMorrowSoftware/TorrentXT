@@ -138,6 +138,16 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_dht_announce(h,
               "0123456789abcdef0123456789abcdef01234567", 6881) < 0);
 
+        /* --- ABI v8 filtering / streaming / extended add on a bogus handle --- */
+        CHECK(btx_ip_filter_add(h, "1.2.3.0", "1.2.3.255", 1) < 0);
+        CHECK(btx_ip_filter_clear(h) < 0);
+        CHECK(btx_set_piece_deadline(h, 0, 5000) < 0);
+        CHECK(btx_clear_piece_deadlines(h) < 0);
+        CHECK(btx_add_magnet_ex(h, "magnet:?xt=urn:btih:"
+              "0123456789abcdef0123456789abcdef01234567", "/tmp", "16", "16") == 0);
+        const unsigned char d8[4] = {'d', '3', ':', 'e'};
+        CHECK(btx_add_torrent_file_ex(h, d8, sizeof d8, "/tmp", "16", "16") == 0);
+
         /* add-* on a bogus session return 0 (no handle made), not a crash. */
         CHECK(btx_add_magnet(h, "magnet:?xt=urn:btih:"
               "0123456789abcdef0123456789abcdef01234567", "/tmp") == 0);
