@@ -321,6 +321,22 @@ The connected peers as a `List` of `Array`s, each keyed by the **peer keys**
 Empty `List` on a bad handle.
 - **Usage:** function - `repeat for each element tPeer in btPeerList(tH)`.
 
+### `btFileList(in pTorrent as Integer) returns List`
+The torrent's files as a `List` of `Array`s, one per file, each with keys `path`
+(relative path within the torrent), `size` (bytes), `progress` (bytes of that
+file downloaded), and `priority` (`0..7`). The whole file table in **one FFI
+round-trip**. Empty `List` until metadata arrives (a magnet has no file table
+yet) or on a bad handle - so it doubles as a "do we have metadata" probe.
+- **Usage:** function - `repeat for each element tFile in btFileList(tH)` then read `tFile["path"]`, `tFile["size"]`, `tFile["progress"]`, `tFile["priority"]`.
+
+### `btPieceAvailability(in pTorrent as Integer) returns Data`
+Per-piece availability as raw `Data`: **one byte per piece**, the number of
+connected peers advertising that piece (clamped to `255`). A read-only view for
+an availability/rarity grid - pair it with `btPieceBitfield` (which pieces you
+have) for a full piece map. Empty `Data` until the torrent has metadata and
+peers, or on a bad handle.
+- **Usage:** function - `put btPieceAvailability(tH) into tAvail`, then `byte i of tAvail`.
+
 ---
 
 ## Events / poll
@@ -501,6 +517,15 @@ arithmetic.
 | `upRate` | 43 | int | upload rate to this peer, bytes/sec |
 | `progress` | 44 | real | peer's completion fraction, `0..1` |
 | `flags` | 45 | int | peer flag bits |
+
+### File entry (`btFileList`, one array per file)
+
+| key | field id | type | meaning |
+|---|---|---|---|
+| `path` | 120 | utf8 | file path within the torrent (relative) |
+| `size` | 121 | int | file size, bytes |
+| `progress` | 122 | int | bytes of this file downloaded |
+| `priority` | 123 | int | this file's download priority, `0..7` |
 
 ### DHT state (`btDhtState`)
 

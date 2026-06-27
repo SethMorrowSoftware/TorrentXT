@@ -185,6 +185,8 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_info_hash_hex(h, buf, sizeof buf) == 0);
         CHECK(btx_piece_bitfield(h, buf, sizeof buf) == 0);
         CHECK(btx_peer_list(h, buf, sizeof buf) == 0);
+        CHECK(btx_file_list(h, buf, sizeof buf) == 0);          /* ABI v5 */
+        CHECK(btx_piece_availability(h, buf, sizeof buf) == 0); /* ABI v5 */
     }
 
     /* remove() needs a live session to even reach the torrent check; with one

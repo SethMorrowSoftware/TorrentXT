@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 4
+#define BTX_ABI_VERSION 5
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -225,6 +225,16 @@ BTX_API int BTX_CALL btx_piece_bitfield(int t, void *out, int cap);
 
 /* Connected peers as a count-prefixed list of KV records (schema §). */
 BTX_API int BTX_CALL btx_peer_list(int t, void *out, int cap);
+
+/* The torrent's files as a count-prefixed list of KV records — one per file:
+ * path (relative), size, bytes downloaded, and download priority. Empty (count
+ * 0) until metadata arrives. One round-trip for the whole file table (§8). */
+BTX_API int BTX_CALL btx_file_list(int t, void *out, int cap);
+
+/* Per-piece availability (how many connected peers advertise each piece) as raw
+ * bytes — one byte per piece, clamped to 255 — a read-only view for an
+ * availability grid. bytes-written / -needed / 0, like btx_piece_bitfield. */
+BTX_API int BTX_CALL btx_piece_availability(int t, void *out, int cap);
 
 /* ====================================================================== *
  *  The alert drain (the event firehose) — one FFI round-trip per poll (§3)
