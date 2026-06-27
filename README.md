@@ -150,7 +150,7 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-56 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+58 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
@@ -161,7 +161,7 @@ These are load-bearing and enforced in the code:
 | Priorities / limits | `btSetFilePriority` · `btSetFilePriorities` · `btSetPiecePriority` · `btSetTorrentLimits` · `btSetMaxConnections` · `btSetMaxUploads` |
 | Flags / modes | `btSetTorrentFlags` · `btUnsetTorrentFlags` · `btSetSequentialDownload` · `btSetAutoManaged` · `btSetSuperSeeding` · `btSetShareMode` · `btSetUploadMode` |
 | Queue / storage | `btQueuePosition` · `btQueueUp` · `btQueueDown` · `btQueueTop` · `btQueueBottom` · `btMoveStorage` |
-| Inspect | `btTorrentStatus` · `btTorrentCount` · `btTorrentHandleAt` · `btInfoHash` · `btPieceBitfield` · `btPeerList` |
+| Inspect | `btTorrentStatus` · `btTorrentCount` · `btTorrentHandleAt` · `btInfoHash` · `btPieceBitfield` · `btPeerList` · `btFileList` · `btPieceAvailability` |
 | Events | `btPoll` |
 | DHT | `btDhtAddBootstrap` · `btDhtState` · `btDhtSaveState` · `btDhtLoadState` |
 | DHT key-value (BEP44) | `btDhtKeypair` · `btDhtPutImmutable` · `btDhtGetImmutable` · `btDhtPutMutable` · `btDhtGetMutable` |

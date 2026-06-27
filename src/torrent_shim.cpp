@@ -1169,6 +1169,95 @@ extern "C" BTX_API int BTX_CALL btx_peer_list(int t, void *out, int cap) {
 }
 
 /* ====================================================================== *
+ *  Inspection — file table & piece availability (ABI v5)
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_file_list(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        /* The file table lives in the metainfo, which is null for a magnet until
+         * metadata arrives — that is a legitimately EMPTY list (count 0), not an
+         * error. file list := [fileCount:u16] then fileCount x [bodyLen:u16]
+         * [kvrecord], mirroring the peer-list framing so the LCB walker reuses
+         * the same byte arithmetic. */
+        std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);  /* fileCount placeholder */
+        uint16_t emitted = 0;
+
+        if (ti) {
+            const lt::file_storage &fs = ti->files();
+            const int n = fs.num_files();
+            /* per-file downloaded bytes + priorities in two bulk calls (cheaper
+             * than N round-trips); tiny control data, never payload. */
+            std::vector<std::int64_t> prog;
+            h.file_progress(prog);
+            std::vector<lt::download_priority_t> prio = h.get_file_priorities();
+            for (int i = 0; i < n; ++i) {
+                lt::file_index_t fi{i};
+                const size_t bodyAt = w.pos();
+                w.put_u16(0);  /* bodyLen placeholder */
+                const size_t bodyStart = w.pos();
+                {
+                    btx::KVRecord r(w);
+                    r.put_str(btx::F_FILE_PATH, fs.file_path(fi));
+                    r.put_int(btx::F_FILE_SIZE,
+                              static_cast<long long>(fs.file_size(fi)));
+                    r.put_int(btx::F_FILE_PROGRESS,
+                              static_cast<size_t>(i) < prog.size()
+                                  ? static_cast<long long>(prog[static_cast<size_t>(i)])
+                                  : 0);
+                    r.put_int(btx::F_FILE_PRIORITY,
+                              static_cast<size_t>(i) < prio.size()
+                                  ? static_cast<long long>(static_cast<std::uint8_t>(
+                                        prio[static_cast<size_t>(i)]))
+                                  : 0);
+                    r.finish();
+                }
+                w.patch_u16(bodyAt, static_cast<uint16_t>(w.pos() - bodyStart));
+                ++emitted;
+            }
+        }
+        w.patch_u16(countAt, emitted);
+
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_piece_availability(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        /* One int per piece (peers advertising it); we hand back one byte each,
+         * clamped to 255 — a read-only availability VIEW, not payload. Empty when
+         * the torrent has no metadata / no peers yet (legitimately 0 bytes). */
+        std::vector<int> avail;
+        h.piece_availability(avail);
+        const size_t nbytes = avail.size();
+        if (nbytes == 0) return 0;
+
+        uint8_t *dst = static_cast<uint8_t *>(out);
+        const bool fits = (dst != nullptr) && (cap > 0) &&
+                          (nbytes <= static_cast<size_t>(cap));
+        if (fits) {
+            for (size_t i = 0; i < nbytes; ++i) {
+                int a = avail[i];
+                dst[i] = static_cast<uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
+            }
+        }
+        if (nbytes > static_cast<size_t>(cap < 0 ? 0 : cap))
+            return -static_cast<int>(nbytes);
+        return static_cast<int>(nbytes);
+    });
+}
+
+/* ====================================================================== *
  *  The alert drain (the event firehose) — one FFI round-trip per poll (§3)
  * ====================================================================== */
 

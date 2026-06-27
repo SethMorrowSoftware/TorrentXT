@@ -125,7 +125,13 @@ enum FieldId : uint8_t {
     F_DHT_AUTHORITATIVE = 110, /* int 0/1: mutable get response is authoritative */
     F_DHT_NUM_SUCCESS   = 111, /* int: nodes that accepted a put */
     F_DHT_SECRET_KEY    = 112, /* hex: 64-byte ed25519 secret key */
-    F_DHT_SEED          = 113  /* hex: 32-byte ed25519 seed (persist to keep identity) */
+    F_DHT_SEED          = 113, /* hex: 32-byte ed25519 seed (persist to keep identity) */
+
+    /* ---- file entry (120..139): one record per file in btx_file_list ---- */
+    F_FILE_PATH         = 120, /* utf8: file path within the torrent (relative) */
+    F_FILE_SIZE         = 121, /* int (64-bit): file size in bytes */
+    F_FILE_PROGRESS     = 122, /* int (64-bit): bytes of this file downloaded */
+    F_FILE_PRIORITY     = 123  /* int 0..7: this file's download priority */
 };
 
 /* ------------------------------------------------------------- alert codes */
