@@ -27,8 +27,9 @@ script "dhtChannelsApp"
 -- channel's secret key could have published it).
 --
 -- Click any transfer to see the files inside it with a live per-file progress
--- bar (btFileList), or hit "Stream" to download it in order (btSetSequentialDownload)
--- so a media release plays as it arrives. The transfers table shows inline bars.
+-- bar (btFileList). Hit "Stream" on a video or audio release and it downloads in
+-- order (btSetSequentialDownload) AND plays right here in a built-in player that
+-- appears over the transfer pane. The transfers table shows inline progress bars.
 --
 -- It also includes a "Quick drop" panel using IMMUTABLE items: pin a short text,
 -- get a 40-character content-address code, and fetch any code back.
@@ -52,6 +53,7 @@ local sFeedKey          -- array: feed-list line -> channel pubkey
 local sFeedMag          -- array: feed-list line -> magnet
 local sFeedTitle        -- array: feed-list line -> release title
 local sXferHandle       -- array: transfers-list line -> torrent handle
+local sHasPlayer        -- "true" once the native player object built OK
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -95,6 +97,9 @@ on mouseUp
       case "chStream"
          chStreamSelected
          break
+      case "chCloseStream"
+         chCloseStream
+         break
       case "chXfers"
          chShowFilesForSelection
          break
@@ -125,82 +130,107 @@ end mouseDoubleUp
 
 -- ---- self-building UI (idempotent) -------------------------------------------
 command chBuild
+   local tErr
    if there is a field "chLog" then
       exit chBuild
    end if
    lock screen
-   set the width of this stack to 880
-   set the height of this stack to 900
+   -- two columns so the whole app fits a 720p (1280x720) screen
+   set the width of this stack to 1180
+   set the height of this stack to 648
    set the backgroundColor of this card to "237,239,243"
    set the title of this stack to "TorrentXT - Decentralized Channels"
-   chMakeLabel "chTitle", "  Decentralized Channels - share files with no server", "0,0,880,30", 14
+   chMakeLabel "chTitle", "  Decentralized Channels - share files with no server", "0,0,1180,30", 14
    set the opaque of field "chTitle" to true
    set the backgroundColor of field "chTitle" to "44,90,160"
    set the foregroundColor of field "chTitle" to "255,255,255"
    set the textStyle of field "chTitle" to "bold"
-   chMakeButton "chHelp", "?  What is this?", "700,4,864,26"
-   -- 1. My channel
-   chSection "chSecMine", "1.  Your channel - publish files for people to download", "16,40,864,60"
-   chMakeLabel "chMyKeyLabel", "Your channel address. Click Copy to share it - that is how people follow you and get your files:", "16,64,864,82", 10
-   chMakeField "chMyKey", "16,84,524,108", true
-   chMakeButton "chCopyKey", "Copy", "532,84,620,108"
-   chMakeButton "chNewId", "New ID", "626,84,728,108"
-   chMakeButton "chSetName", "Set Name", "734,84,842,108"
-   chMakeButton "chPublish", "Publish a File to My Channel...", "16,116,300,142"
-   chMakeLabel "chNowPub", "Not publishing yet.", "310,120,864,140", 10
-   -- 2. Subscriptions / unified feed
-   chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,150,864,170"
-   chMakeField "chFollowKey", "16,176,640,200", false
-   chMakeButton "chFollow", "Follow", "648,176,742,200"
-   chMakeButton "chRefresh", "Refresh", "748,176,842,200"
-   chMakeLabel "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,204,864,220", 9
-   chMakeLabel "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by (key)", "16,222,864,240", 10
-   chMakeList "chSubs", "16,242,864,316", false
-   chMakeButton "chDownload", "Download Selected", "16,322,180,348"
-   chMakeButton "chCopyMag", "Copy Magnet", "188,322,300,348"
-   chMakeButton "chUnfollow", "Unfollow Channel", "308,322,448,348"
-   set the tabStops of field "chSubsHeader" to "160,580"
-   set the tabStops of field "chSubs" to "160,580"
-   -- 3. Transfers
-   chSection "chSecXfer", "3.  Transfers - live upload + download activity", "16,358,864,378"
-   chMakeLabel "chXferHeader", "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "16,384,864,402", 10
-   chMakeList "chXfers", "16,404,864,490", false
-   chMakeLabel "chTotals", "", "16,494,864,514", 10
-   set the tabStops of field "chXferHeader" to "26,400,500,640"
-   set the tabStops of field "chXfers" to "26,400,500,640"
+   chMakeButton "chHelp", "?  What is this?", "1000,4,1164,26"
+   -- ===== LEFT COLUMN (x 16..580): your channel + channels you follow =====
+   chSection "chSecMine", "1.  Your channel - publish files for people to download", "16,38,580,58"
+   chMakeLabel "chMyKeyLabel", "Your channel address. Click Copy to share it - that is how people follow you and get your files:", "16,62,580,80", 10
+   chMakeField "chMyKey", "16,82,580,106", true
+   chMakeButton "chCopyKey", "Copy", "16,112,140,136"
+   chMakeButton "chNewId", "New ID", "148,112,272,136"
+   chMakeButton "chSetName", "Set Name", "280,112,404,136"
+   chMakeButton "chPublish", "Publish a File...", "16,142,290,166"
+   chMakeLabel "chNowPub", "Not publishing yet.", "298,146,580,166", 9
+   chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,176,580,196"
+   chMakeField "chFollowKey", "16,200,400,224", false
+   chMakeButton "chFollow", "Follow", "408,200,492,224"
+   chMakeButton "chRefresh", "Refresh", "498,200,580,224"
+   chMakeLabel "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,228,580,252", 9
+   chMakeLabel "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by", "16,256,580,274", 10
+   chMakeList "chSubs", "16,276,580,452", false
+   chMakeButton "chDownload", "Download", "16,458,180,482"
+   chMakeButton "chCopyMag", "Copy Magnet", "188,458,300,482"
+   chMakeButton "chUnfollow", "Unfollow", "308,458,448,482"
+   set the tabStops of field "chSubsHeader" to "150,430"
+   set the tabStops of field "chSubs" to "150,430"
+   -- ===== RIGHT COLUMN (x 596..1164): transfers + selected-transfer detail =====
+   chSection "chSecXfer", "3.  Transfers - live upload + download activity", "596,38,1164,58"
+   chMakeLabel "chXferHeader", "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "596,62,1164,80", 10
+   chMakeList "chXfers", "596,82,1164,264", false
+   chMakeLabel "chTotals", "", "596,268,1164,288", 10
+   set the tabStops of field "chXferHeader" to "26,300,400,540"
+   set the tabStops of field "chXfers" to "26,300,400,540"
    set the textFont of field "chXferHeader" to "Courier"
    set the textFont of field "chXfers" to "Courier"
    set the textSize of field "chXferHeader" to 10
    set the textSize of field "chXfers" to 10
-   -- 3b. Contents of the selected transfer (live per-file progress) + streaming
-   chMakeButton "chStream", "Stream Selected (in order)", "16,520,300,544"
-   chMakeLabel "chFilesCaption", "Click a transfer above to see its files. Stream downloads in order so media can play as it arrives.", "308,524,864,542", 9
-   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "16,548,864,566", 10
-   chMakeList "chFiles", "16,568,864,662", true
-   set the tabStops of field "chFilesHeader" to "440,540"
-   set the tabStops of field "chFiles" to "440,540"
+   chMakeButton "chStream", "Stream Selected (play in order)", "596,294,820,318"
+   chMakeLabel "chFilesCaption", "Click a transfer to see its files. Stream plays a video/audio release here as it arrives.", "828,296,1164,318", 9
+   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,322,1164,340", 10
+   chMakeList "chFiles", "596,342,1164,452", true
+   set the tabStops of field "chFilesHeader" to "340,440"
+   set the tabStops of field "chFiles" to "340,440"
    set the textFont of field "chFilesHeader" to "Courier"
    set the textFont of field "chFiles" to "Courier"
    set the textSize of field "chFilesHeader" to 10
    set the textSize of field "chFiles" to 10
    set the text of field "chFiles" to "   Click a transfer above to see its files and per-file progress."
-   -- 4. Quick drop (immutable)
-   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,672,864,692"
-   chMakeField "chPinText", "16,698,430,722", false
-   chMakeButton "chPin", "Pin", "438,698,510,722"
-   chMakeField "chPinCode", "518,698,790,722", true
-   chMakeButton "chPinCopy", "Copy", "794,698,864,722"
-   chMakeField "chFetchCode", "16,726,430,750", false
-   chMakeButton "chFetchBtn", "Fetch", "438,726,510,750"
-   chMakeField "chDropResult", "518,726,864,750", true
-   -- Log
-   chMakeList "chLog", "16,758,864,888", true
+   -- ===== FULL-WIDTH BOTTOM: quick drop + log =====
+   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,488,1164,508"
+   chMakeField "chPinText", "16,512,440,534", false
+   chMakeButton "chPin", "Pin", "448,512,530,534"
+   chMakeField "chPinCode", "538,512,810,534", true
+   chMakeButton "chPinCopy", "Copy", "818,512,910,534"
+   chMakeField "chFetchCode", "16,538,440,560", false
+   chMakeButton "chFetchBtn", "Fetch", "448,538,530,560"
+   chMakeField "chDropResult", "538,538,910,560", true
+   chMakeList "chLog", "16,564,1164,640", true
    set the textFont of field "chMyKey" to "Courier"
    set the textFont of field "chFollowKey" to "Courier"
    set the textFont of field "chPinCode" to "Courier"
    set the textFont of field "chFetchCode" to "Courier"
    set the textSize of field "chMyKey" to 9
    set the textSize of field "chFollowKey" to 9
+   -- ===== streaming overlay: a native player shown ONLY while streaming =====
+   -- Built last so it sits on TOP of the right column; hidden until Stream is used.
+   -- When shown it covers the transfers/files pane; Close returns to that view.
+   chMakeLabel "chStreamBar", "", "596,62,1080,104", 11
+   set the opaque of field "chStreamBar" to true
+   set the backgroundColor of field "chStreamBar" to "20,24,32"
+   set the foregroundColor of field "chStreamBar" to "255,255,255"
+   set the textStyle of field "chStreamBar" to "bold"
+   set the visible of field "chStreamBar" to false
+   chMakeButton "chCloseStream", "Close", "1086,62,1164,104"
+   set the visible of button "chCloseStream" to false
+   -- the player object is optional: some OXT builds may not ship it, so build it
+   -- defensively and remember whether it worked (sHasPlayer gates every player op)
+   put false into sHasPlayer
+   try
+      if there is no player "chPlayer" then
+         create player
+         set the name of the last player to "chPlayer"
+      end if
+      set the rect of player "chPlayer" to "596,108,1164,452"
+      set the showController of player "chPlayer" to true
+      set the visible of player "chPlayer" to false
+      put true into sHasPlayer
+   catch tErr
+      put false into sHasPlayer
+   end try
    chAddTips
    unlock screen
 end chBuild
@@ -275,7 +305,8 @@ command chAddTips
    set the tooltip of button "chCopyMag" to "Copy the selected file's magnet link to the clipboard."
    set the tooltip of button "chUnfollow" to "Stop following the selected file's channel."
    set the tooltip of field "chXfers" to "Click a transfer to see its files and per-file progress below."
-   set the tooltip of button "chStream" to "Download the selected transfer in order, so media plays as it arrives."
+   set the tooltip of button "chStream" to "Play the selected transfer's video/audio here as it downloads in order."
+   set the tooltip of button "chCloseStream" to "Stop the player and return to the transfer view."
    set the tooltip of field "chFiles" to "Files inside the selected transfer, with live per-file progress."
    set the tooltip of field "chPinText" to "Type any short text (up to 1000 bytes) to pin to the network."
    set the tooltip of button "chPin" to "Store the text on the DHT and get back a short share code."
@@ -297,7 +328,8 @@ command chHelp
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
    put tMsg & "   so it is tamper-proof." & return & return into tMsg
    put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving. Click one to see" & return into tMsg
-   put tMsg & "   the files inside it with per-file progress, or Stream it to download in order." & return & return into tMsg
+   put tMsg & "   the files inside it with per-file progress. Stream a video or audio release and it" & return into tMsg
+   put tMsg & "   plays right here in a built-in player while it downloads in order." & return & return into tMsg
    put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return & return into tMsg
    put tMsg & "TRY IT on two machines: Copy your card on one, Follow it on the other, then share a file." into tMsg
    answer tMsg with "Got it"
@@ -878,22 +910,128 @@ command chShowFilesForSelection
    chShowFiles chSelectedXferHandle()
 end chShowFilesForSelection
 
--- Turn on sequential (in-order) download for the selected transfer, so a media
--- release can play as it arrives instead of downloading pieces at random.
+-- Stream the selected transfer: turn on sequential (in-order) download so the
+-- file fills from the front, then point the built-in player at the largest
+-- video/audio file inside it and play. The player overlays the transfer pane.
 command chStreamSelected
-   local tH, tR
+   local tH, tR, tRel, tKind, tStatus, tSave, tPath, tName
    put chSelectedXferHandle() into tH
    if tH is 0 then
       chLog "Select a transfer first, then click Stream."
       exit chStreamSelected
    end if
+   -- in-order download so a media file is watchable/listenable as it arrives
    put btSetSequentialDownload(tH, true) into tR
-   if tR is 0 then
-      chLog "Streaming on: transfer" && tH && "now downloads in order (play-as-it-arrives)."
-   else
+   if tR is not 0 then
       chLog "Could not enable streaming:" && btLastError()
+      exit chStreamSelected
    end if
+   -- find the main video/audio file (those are the only two we stream)
+   put chMainMediaFile(tH) into tRel
+   if tRel is "" then
+      chLog "Streaming on (in order). No video or audio file in this transfer to play."
+      exit chStreamSelected
+   end if
+   put chMediaKind(tRel) into tKind
+   if not sHasPlayer then
+      chLog "Streaming on (in order):" && tRel & ". (No player in this build - open it in your media app.)"
+      exit chStreamSelected
+   end if
+   -- build the on-disk path: the torrent's save path + the file's relative path
+   put btTorrentStatus(tH) into tStatus
+   put tStatus["savePath"] into tSave
+   if tSave is empty then
+      chLog "Streaming on (in order). Waiting for a download location to appear..."
+      exit chStreamSelected
+   end if
+   put tSave & "/" & tRel into tPath
+   replace "\" with "/" in tPath
+   if there is no file tPath then
+      chLog "Streaming in order - '" & tRel & "' is not on disk yet. Click Stream again in a moment to play."
+      exit chStreamSelected
+   end if
+   put chTrunc(tRel, 56) into tName
+   chOpenPlayer tPath, tName, tKind
 end chStreamSelected
+
+-- Point the player at a file, reveal the overlay, and start playback. Wrapped
+-- defensively because player capabilities vary across OXT builds/platforms.
+command chOpenPlayer pFullPath, pTitle, pKind
+   local tErr
+   if not sHasPlayer then
+      exit chOpenPlayer
+   end if
+   try
+      set the filename of player "chPlayer" to pFullPath
+      put "  Streaming (" & pKind & "):  " & pTitle into field "chStreamBar"
+      set the visible of field "chStreamBar" to true
+      set the visible of button "chCloseStream" to true
+      set the visible of player "chPlayer" to true
+      set the showController of player "chPlayer" to true
+      start player "chPlayer"
+      chLog "Playing '" & pTitle & "' (" & pKind & ") - it streams as the download fills in order."
+   catch tErr
+      chLog "Could not open the player:" && tErr
+   end try
+end chOpenPlayer
+
+-- Stop playback and hide the overlay, returning to the transfer/files view.
+command chCloseStream
+   local tErr
+   if not sHasPlayer then
+      exit chCloseStream
+   end if
+   try
+      stop player "chPlayer"
+      set the filename of player "chPlayer" to empty
+   catch tErr
+   end try
+   set the visible of player "chPlayer" to false
+   set the visible of field "chStreamBar" to false
+   set the visible of button "chCloseStream" to false
+end chCloseStream
+
+-- Classify a path as "video", "audio", or "" by its file extension. Video and
+-- audio are the only kinds the player streams.
+function chMediaKind pPath
+   local tExt, tVideo, tAudio
+   set the itemDelimiter to "."
+   if the number of items of pPath < 2 then
+      return ""
+   end if
+   put toLower(the last item of pPath) into tExt
+   put "mp4,m4v,mov,mkv,avi,webm,mpg,mpeg,wmv,flv,3gp,ogv" into tVideo
+   put "mp3,m4a,aac,flac,wav,ogg,oga,opus,wma,aiff,aif" into tAudio
+   set the itemDelimiter to comma
+   if tExt is among the items of tVideo then
+      return "video"
+   end if
+   if tExt is among the items of tAudio then
+      return "audio"
+   end if
+   return ""
+end chMediaKind
+
+-- The relative path of the LARGEST video/audio file in a torrent (a release is
+-- usually one media file plus small extras), or "" if it holds no media.
+function chMainMediaFile pHandle
+   local tFiles, tFile, tBest, tBestSize
+   if pHandle is 0 or pHandle is empty then
+      return ""
+   end if
+   put btFileList(pHandle) into tFiles
+   put "" into tBest
+   put -1 into tBestSize
+   repeat for each element tFile in tFiles
+      if chMediaKind(tFile["path"]) is not "" then
+         if tFile["size"] > tBestSize then
+            put tFile["size"] into tBestSize
+            put tFile["path"] into tBest
+         end if
+      end if
+   end repeat
+   return tBest
+end chMainMediaFile
 
 -- a 10-segment ASCII progress bar, e.g. [####------] 42%  (monospaced fields)
 function chProgressBar pPct
