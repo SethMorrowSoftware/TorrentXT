@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 7
+#define BTX_ABI_VERSION 8
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -152,6 +152,24 @@ BTX_API int BTX_CALL btx_find_torrent(int s, const char *infoHashHex);
 BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex, int port);
 
 /* ====================================================================== *
+ *  Filtering & streaming (ABI v8)
+ * ====================================================================== */
+
+/* Add an inclusive IP range to the session IP filter; block != 0 blocks it
+ * (the default-empty filter allows everything). Rules accumulate (read-modify-
+ * write). `startIp`/`endIp` are textual addresses of the SAME family (both IPv4
+ * or both IPv6), e.g. "1.2.3.0".."1.2.3.255". btx_ip_filter_clear removes all. */
+BTX_API int BTX_CALL btx_ip_filter_add(int s, const char *startIp,
+                                       const char *endIp, int block);
+BTX_API int BTX_CALL btx_ip_filter_clear(int s);
+
+/* Streaming: ask libtorrent to fetch a piece by a deadline (milliseconds from
+ * now), reordering requests so the soonest deadlines come first. Clear removes
+ * all deadlines. The data still rides engine ⇄ disk; only the hint crosses. */
+BTX_API int BTX_CALL btx_set_piece_deadline(int t, int pieceIndex, int deadlineMs);
+BTX_API int BTX_CALL btx_clear_piece_deadlines(int t);
+
+/* ====================================================================== *
  *  Add / remove torrents
  * ====================================================================== */
 
@@ -169,6 +187,19 @@ BTX_API int BTX_CALL btx_add_torrent_file(int s, const void *data, int len,
  * torrent handle (0 on failure). */
 BTX_API int BTX_CALL btx_add_with_resume(int s, const void *resume, int len,
                                          const char *savePath);
+
+/* Extended add (ABI v8): like btx_add_magnet / btx_add_torrent_file but apply
+ * add-time torrent_flags — set the bits named in `maskDec` to `flagsDec`,
+ * leaving the rest at libtorrent's default. The common use is adding PAUSED
+ * (kFlagPaused) so you can set file priorities before it starts, or
+ * kFlagSequentialDownload for immediate streaming. */
+BTX_API int BTX_CALL btx_add_magnet_ex(int s, const char *uri,
+                                       const char *savePath,
+                                       const char *flagsDec, const char *maskDec);
+BTX_API int BTX_CALL btx_add_torrent_file_ex(int s, const void *data, int len,
+                                             const char *savePath,
+                                             const char *flagsDec,
+                                             const char *maskDec);
 
 /* Remove a torrent; deleteFiles != 0 also deletes downloaded files. */
 BTX_API int BTX_CALL btx_remove(int s, int t, int deleteFiles);

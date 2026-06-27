@@ -150,13 +150,14 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-69 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+75 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
 | Session | `btStartSession` · `btStopSession` · `btLastError` · `btClearError` · `btSessionPause` · `btSessionResume` · `btSessionIsPaused` · `btListenPort` · `btFindTorrent` · `btDhtAnnounce` |
 | Settings | `btSetInt` · `btSetBool` · `btSetString` · `btGetSetting` · `btSetEncryption` |
-| Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` |
+| Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` · `btAddMagnetEx` · `btAddTorrentFileEx` |
+| Filter / streaming | `btIpFilterAdd` · `btIpFilterClear` · `btSetPieceDeadline` · `btClearPieceDeadlines` |
 | Control | `btPause` · `btResume` · `btForceRecheck` · `btForceReannounce` · `btScrapeTracker` · `btClearTorrentError` |
 | Priorities / limits | `btSetFilePriority` · `btSetFilePriorities` · `btSetPiecePriority` · `btSetTorrentLimits` · `btSetMaxConnections` · `btSetMaxUploads` |
 | Flags / modes | `btSetTorrentFlags` · `btUnsetTorrentFlags` · `btSetSequentialDownload` · `btSetAutoManaged` · `btSetSuperSeeding` · `btSetShareMode` · `btSetUploadMode` |
