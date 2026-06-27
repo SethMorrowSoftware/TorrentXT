@@ -60,6 +60,9 @@ end closeStack
 
 on mouseUp
    switch the short name of the target
+      case "chHelp"
+         chHelp
+         break
       case "chCopyKey"
          chCopyKey
          break
@@ -118,15 +121,16 @@ command chBuild
    set the width of this stack to 880
    set the height of this stack to 748
    set the backgroundColor of this card to "237,239,243"
-   set the title of this stack to "TorrentXT - Decentralized Channel"
-   chMakeLabel "chTitle", "  TorrentXT - Decentralized Channel (DHT directory + BitTorrent transfer, no server)", "0,0,880,30", 14
+   set the title of this stack to "TorrentXT - Decentralized Channels"
+   chMakeLabel "chTitle", "  Decentralized Channels - share files with no server", "0,0,880,30", 14
    set the opaque of field "chTitle" to true
    set the backgroundColor of field "chTitle" to "44,90,160"
    set the foregroundColor of field "chTitle" to "255,255,255"
    set the textStyle of field "chTitle" to "bold"
+   chMakeButton "chHelp", "?  What is this?", "700,4,864,26"
    -- 1. My channel
-   chSection "chSecMine", "1.  Your channel", "16,40,864,60"
-   chMakeLabel "chMyKeyLabel", "Your channel address (public key) - share it so people can follow you:", "16,64,864,82", 10
+   chSection "chSecMine", "1.  Your channel - publish files for people to download", "16,40,864,60"
+   chMakeLabel "chMyKeyLabel", "Your channel address. Click Copy to share it - that is how people follow you and get your files:", "16,64,864,82", 10
    chMakeField "chMyKey", "16,84,524,108", true
    chMakeButton "chCopyKey", "Copy", "532,84,620,108"
    chMakeButton "chNewId", "New ID", "626,84,728,108"
@@ -134,11 +138,11 @@ command chBuild
    chMakeButton "chPublish", "Publish a File to My Channel...", "16,116,300,142"
    chMakeLabel "chNowPub", "Not publishing yet.", "310,120,864,140", 10
    -- 2. Subscriptions / unified feed
-   chSection "chSecSubs", "2.  Channels you follow", "16,150,864,170"
+   chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,150,864,170"
    chMakeField "chFollowKey", "16,176,640,200", false
    chMakeButton "chFollow", "Follow", "648,176,742,200"
    chMakeButton "chRefresh", "Refresh", "748,176,842,200"
-   chMakeLabel "chFeedCaption", "Releases from channels you follow - every entry is cryptographically signed by its channel (tamper-proof):", "16,204,864,220", 9
+   chMakeLabel "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,204,864,220", 9
    chMakeLabel "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by (key)", "16,222,864,240", 10
    chMakeList "chSubs", "16,242,864,316", false
    chMakeButton "chDownload", "Download Selected", "16,322,180,348"
@@ -147,7 +151,7 @@ command chBuild
    set the tabStops of field "chSubsHeader" to "160,580"
    set the tabStops of field "chSubs" to "160,580"
    -- 3. Transfers
-   chSection "chSecXfer", "3.  Transfers (your seed + your downloads)", "16,358,864,378"
+   chSection "chSecXfer", "3.  Transfers - live upload + download activity", "16,358,864,378"
    chMakeLabel "chXferHeader", "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "16,384,864,402", 10
    chMakeList "chXfers", "16,404,864,490", false
    chMakeLabel "chTotals", "", "16,494,864,514", 10
@@ -158,7 +162,7 @@ command chBuild
    set the textSize of field "chXferHeader" to 10
    set the textSize of field "chXfers" to 10
    -- 4. Quick drop (immutable)
-   chSection "chSecDrop", "4.  Quick drop (immutable: pin text, share a 40-char code)", "16,522,864,542"
+   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,522,864,542"
    chMakeField "chPinText", "16,548,430,572", false
    chMakeButton "chPin", "Pin", "438,548,510,572"
    chMakeField "chPinCode", "518,548,790,572", true
@@ -174,6 +178,7 @@ command chBuild
    set the textFont of field "chFetchCode" to "Courier"
    set the textSize of field "chMyKey" to 9
    set the textSize of field "chFollowKey" to 9
+   chAddTips
    unlock screen
 end chBuild
 
@@ -231,6 +236,45 @@ command chMakeList pName, pRect, pIsLog
       set the listBehavior of field pName to true
    end if
 end chMakeList
+
+-- a hover hint on every control, so the app explains itself
+command chAddTips
+   set the tooltip of button "chHelp" to "What is this app? A plain-language overview."
+   set the tooltip of field "chMyKey" to "Your channel address. Share it (Copy) so people can follow you."
+   set the tooltip of button "chCopyKey" to "Copy your channel card (your name + address) to the clipboard."
+   set the tooltip of button "chNewId" to "Start over with a brand-new identity. Your current followers will lose you."
+   set the tooltip of button "chSetName" to "Give your channel a friendly display name your followers will see."
+   set the tooltip of button "chPublish" to "Pick a folder. It is packaged, seeded, and added to your channel feed."
+   set the tooltip of field "chFollowKey" to "Paste someone's channel card or 64-character address, then click Follow."
+   set the tooltip of button "chFollow" to "Subscribe to that channel and fetch its signed list of files."
+   set the tooltip of button "chRefresh" to "Re-fetch the latest files from every channel you follow."
+   set the tooltip of button "chDownload" to "Download the selected file - it transfers peer-to-peer from the publisher."
+   set the tooltip of button "chCopyMag" to "Copy the selected file's magnet link to the clipboard."
+   set the tooltip of button "chUnfollow" to "Stop following the selected file's channel."
+   set the tooltip of field "chPinText" to "Type any short text (up to 1000 bytes) to pin to the network."
+   set the tooltip of button "chPin" to "Store the text on the DHT and get back a short share code."
+   set the tooltip of button "chPinCopy" to "Copy the share code to the clipboard."
+   set the tooltip of field "chFetchCode" to "Paste a 40-character drop code to fetch its text back."
+   set the tooltip of button "chFetchBtn" to "Look up the text for that drop code."
+end chAddTips
+
+-- a plain-language overview, shown by the title-bar "What is this?" button
+command chHelp
+   local tMsg
+   put "DECENTRALIZED CHANNELS - what this is" & return & return into tMsg
+   put tMsg & "A tiny file-sharing app with NO central server. Two proven technologies do the work:" & return into tMsg
+   put tMsg & "  - the DHT, a giant shared address book, remembers WHERE things are;" & return into tMsg
+   put tMsg & "  - BitTorrent moves the actual files directly between computers." & return & return into tMsg
+   put tMsg & "1) YOUR CHANNEL - like a personal feed. Publish a file and it is shared under your own" & return into tMsg
+   put tMsg & "   cryptographic key, so nobody else can post to your channel or forge it." & return & return into tMsg
+   put tMsg & "2) CHANNELS YOU FOLLOW - paste someone's channel card to see their latest files. Pick" & return into tMsg
+   put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
+   put tMsg & "   so it is tamper-proof." & return & return into tMsg
+   put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving." & return & return into tMsg
+   put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return & return into tMsg
+   put tMsg & "TRY IT on two machines: Copy your card on one, Follow it on the other, then share a file." into tMsg
+   answer tMsg with "Got it"
+end chHelp
 
 -- ---- session, identity, subscriptions, loops ---------------------------------
 command chStart
@@ -597,7 +641,7 @@ end chCopySelectedMagnet
 
 -- Rebuild the unified, signed release feed across every channel we follow.
 command chRefreshSubs
-   local tKey, tFeed, tL, tName, tRel, tTitle, tMag, tRows, tLineNum, tSelMag
+   local tKey, tFeed, tL, tName, tRel, tTitle, tMag, tRows, tLineNum, tSelMag, tEmpty, tErr
    put chSelectedMagnet() into tSelMag
    put "" into tRows
    put 0 into tLineNum
@@ -643,8 +687,20 @@ command chRefreshSubs
    if the last char of tRows is return then
       delete the last char of tRows
    end if
+   put false into tEmpty
+   if tRows is empty then
+      -- friendly empty state instead of a blank list
+      put true into tEmpty
+      put "   You are not following anyone yet. Paste a channel card or key above and click Follow." into tRows
+   end if
    lock screen
    set the text of field "chSubs" to tRows
+   if tEmpty then
+      try
+         set the foregroundColor of line 1 of field "chSubs" to "130,130,130"
+      catch tErr
+      end try
+   end if
    -- keep the same release selected across the rebuild, by its magnet
    if tSelMag is not empty then
       repeat with tLineNum = 1 to (the number of lines of field "chSubs")
@@ -691,10 +747,19 @@ command chRefreshTransfers
    if tNodes is a number and tNodes > 0 then
       put ("DHT:" && tNodes && "nodes") into tDht
    else
-      put "DHT: on" into tDht
+      put "DHT: connecting..." into tDht
    end if
    lock screen
    set the text of field "chXfers" to tRows
+   if tLineNum is 0 then
+      -- friendly empty state instead of a blank table
+      set the text of field "chXfers" to \
+         "   Nothing transferring yet. Publish a file above, or Download a release from a channel you follow."
+      try
+         set the foregroundColor of line 1 of field "chXfers" to "130,130,130"
+      catch tErr
+      end try
+   end if
    -- color each row by state (green=seeding/done, blue=downloading, amber=checking,
    -- grey=queued, red=error). Wrapped so a platform that dislikes per-line coloring
    -- still shows the table, just monochrome.
