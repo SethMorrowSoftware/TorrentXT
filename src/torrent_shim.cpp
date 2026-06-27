@@ -82,6 +82,7 @@
 /* ---- standard library ------------------------------------------------------ */
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -620,6 +621,76 @@ extern "C" BTX_API int BTX_CALL btx_set_encryption_policy(int s, int inPolicy,
         sp.set_int(lt::settings_pack::out_enc_policy, outPolicy);
         sp.set_int(lt::settings_pack::allowed_enc_level, level);
         st->ses->apply_settings(sp);
+        return BTX_OK;
+    });
+}
+
+/* ====================================================================== *
+ *  Session operations (ABI v7) — whole-session pause, listen port, look up a
+ *  torrent by info-hash, classic (BEP5) DHT peer announce.
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_session_pause(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        st->ses->pause();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_session_resume(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        st->ses->resume();
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_session_is_paused(int s) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;  /* no session -> "not paused" default */
+        return st->ses->is_paused() ? 1 : 0;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_listen_port(int s) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;  /* 0 == not listening / no session */
+        return static_cast<int>(st->ses->listen_port());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_find_torrent(int s, const char *infoHashHex) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;
+        char buf[20];
+        if (!hex_to_buf(infoHashHex, buf, 20)) return 0;  /* not 40 hex -> not found */
+        lt::torrent_handle h = st->ses->find_torrent(lt::sha1_hash(buf));
+        if (!h.is_valid()) return 0;
+        /* map libtorrent's handle back to OUR int id via the reverse map. */
+        auto it = st->idOf.find(h);
+        return it == st->idOf.end() ? 0 : it->second;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex,
+                                                 int port) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        char buf[20];
+        if (!hex_to_buf(infoHashHex, buf, 20)) {
+            set_error("info-hash must be 40 hex chars"); return BTX_ERR_INVALID_ARG;
+        }
+        if (port < 0 || port > 65535) { set_error("bad port"); return BTX_ERR_INVALID_ARG; }
+        /* classic BEP5 peer announce (distinct from the BEP44 KV calls): tell the
+         * DHT we serve peers for this info-hash on `port` (0 == our listen port). */
+        st->ses->dht_announce(lt::sha1_hash(buf), port);
         return BTX_OK;
     });
 }
@@ -1254,6 +1325,109 @@ extern "C" BTX_API int BTX_CALL btx_piece_availability(int t, void *out, int cap
         if (nbytes > static_cast<size_t>(cap < 0 ? 0 : cap))
             return -static_cast<int>(nbytes);
         return static_cast<int>(nbytes);
+    });
+}
+
+/* ====================================================================== *
+ *  Trackers & web seeds (ABI v6) — inspect and edit the announce list and
+ *  the HTTP/URL seed list. Listers mirror the peer-list framing; editors are
+ *  fire-and-forget. (The downloaded data still rides engine ⇄ disk.)
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_trackers(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        std::vector<lt::announce_entry> trs = h.trackers();
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);  /* trackerCount placeholder */
+        uint16_t emitted = 0;
+        for (const lt::announce_entry &ae : trs) {
+            const size_t bodyAt = w.pos();
+            w.put_u16(0);  /* bodyLen placeholder */
+            const size_t bodyStart = w.pos();
+            {
+                btx::KVRecord r(w);
+                r.put_str(btx::F_TRACKER_URL, ae.url);
+                r.put_int(btx::F_TRACKER_TIER, static_cast<long long>(ae.tier));
+                r.put_bool(btx::F_TRACKER_VERIFIED, ae.verified);
+                r.put_int(btx::F_TRACKER_SOURCE, static_cast<long long>(ae.source));
+                r.finish();
+            }
+            w.patch_u16(bodyAt, static_cast<uint16_t>(w.pos() - bodyStart));
+            ++emitted;
+        }
+        w.patch_u16(countAt, emitted);
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_tracker(int t, const char *url, int tier) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty tracker url"); return BTX_ERR_INVALID_ARG; }
+        lt::announce_entry ae;
+        ae.url = url;
+        if (tier < 0) tier = 0;
+        if (tier > 255) tier = 255;
+        ae.tier = static_cast<std::uint8_t>(tier);
+        /* libtorrent ignores a duplicate URL already in the list. */
+        h.add_tracker(ae);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_url_seed(int t, const char *url) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty url seed"); return BTX_ERR_INVALID_ARG; }
+        h.add_url_seed(std::string(url));
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_remove_url_seed(int t, const char *url) {
+    BTX_GUARD_ACTION({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) { set_error("bad torrent handle"); return BTX_ERR_BAD_HANDLE; }
+        if (!url || !*url) { set_error("empty url seed"); return BTX_ERR_INVALID_ARG; }
+        h.remove_url_seed(std::string(url));
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_url_seeds(int t, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
+        if (!ok) return 0;  /* stale -> empty */
+
+        std::set<std::string> seeds = h.url_seeds();
+        /* one single-field KV record per seed, in the peer-list framing so the
+         * LCB walker reuses the same counted-loop parse. */
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);  /* seedCount placeholder */
+        uint16_t emitted = 0;
+        for (const std::string &u : seeds) {
+            const size_t bodyAt = w.pos();
+            w.put_u16(0);  /* bodyLen placeholder */
+            const size_t bodyStart = w.pos();
+            {
+                btx::KVRecord r(w);
+                r.put_str(btx::F_URL_SEED, u);
+                r.finish();
+            }
+            w.patch_u16(bodyAt, static_cast<uint16_t>(w.pos() - bodyStart));
+            ++emitted;
+        }
+        w.patch_u16(countAt, emitted);
+        if (w.overflow()) return -static_cast<int>(w.pos());
+        return static_cast<int>(w.pos());
     });
 }
 

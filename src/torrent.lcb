@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 5
+constant kABIVersion is 7
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -145,6 +145,13 @@ constant kFieldFileSize is 121
 constant kFieldFileProgress is 122
 constant kFieldFilePriority is 123
 
+-- tracker + web-seed entry fields (btTrackers / btWebSeeds)
+constant kFieldTrackerUrl is 130
+constant kFieldTrackerTier is 131
+constant kFieldTrackerVerified is 132
+constant kFieldTrackerSource is 133
+constant kFieldUrlSeed is 134
+
 -- Stable alert type codes (mirror btx_record.h AlertType -> kAlert*).
 constant kAlertTorrentAdded is 1
 constant kAlertMetadataReceived is 2
@@ -206,6 +213,14 @@ private foreign handler _btx_set_str(in pS as CInt, in pKey as ZStringUTF8, in p
 private foreign handler _btx_get_setting(in pS as CInt, in pKey as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_get_setting!cdecl"
 private foreign handler _btx_set_encryption_policy(in pS as CInt, in pIn as CInt, in pOut as CInt, in pLevel as CInt) returns CInt binds to "c:torrentxt>btx_set_encryption_policy!cdecl"
 
+-- session operations (ABI v7)
+private foreign handler _btx_session_pause(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_pause!cdecl"
+private foreign handler _btx_session_resume(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_resume!cdecl"
+private foreign handler _btx_session_is_paused(in pS as CInt) returns CInt binds to "c:torrentxt>btx_session_is_paused!cdecl"
+private foreign handler _btx_listen_port(in pS as CInt) returns CInt binds to "c:torrentxt>btx_listen_port!cdecl"
+private foreign handler _btx_find_torrent(in pS as CInt, in pHash as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_find_torrent!cdecl"
+private foreign handler _btx_dht_announce(in pS as CInt, in pHash as ZStringUTF8, in pPort as CInt) returns CInt binds to "c:torrentxt>btx_dht_announce!cdecl"
+
 private foreign handler _btx_add_magnet(in pS as CInt, in pURI as ZStringUTF8, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_magnet!cdecl"
 private foreign handler _btx_add_torrent_file(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_torrent_file!cdecl"
 private foreign handler _btx_add_with_resume(in pS as CInt, in pData as Pointer, in pLen as CInt, in pSave as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_with_resume!cdecl"
@@ -239,6 +254,11 @@ private foreign handler _btx_piece_bitfield(in pT as CInt, in pOut as Pointer, i
 private foreign handler _btx_peer_list(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_peer_list!cdecl"
 private foreign handler _btx_file_list(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_file_list!cdecl"
 private foreign handler _btx_piece_availability(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_piece_availability!cdecl"
+private foreign handler _btx_trackers(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_trackers!cdecl"
+private foreign handler _btx_add_tracker(in pT as CInt, in pUrl as ZStringUTF8, in pTier as CInt) returns CInt binds to "c:torrentxt>btx_add_tracker!cdecl"
+private foreign handler _btx_add_url_seed(in pT as CInt, in pUrl as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_url_seed!cdecl"
+private foreign handler _btx_remove_url_seed(in pT as CInt, in pUrl as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_remove_url_seed!cdecl"
+private foreign handler _btx_url_seeds(in pT as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_url_seeds!cdecl"
 
 private foreign handler _btx_pop_alerts(in pS as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_pop_alerts!cdecl"
 
@@ -543,6 +563,16 @@ private handler _fieldKey(in pId as Integer) returns String
       return "progress"
    else if pId is kFieldFilePriority then
       return "priority"
+   else if pId is kFieldTrackerUrl then
+      return "url"
+   else if pId is kFieldTrackerTier then
+      return "tier"
+   else if pId is kFieldTrackerVerified then
+      return "verified"
+   else if pId is kFieldTrackerSource then
+      return "source"
+   else if pId is kFieldUrlSeed then
+      return "urlSeed"
    else
       return ""
    end if
@@ -753,6 +783,63 @@ public handler btSetEncryption(in pSession as Integer, in pIn as Integer, in pOu
    variable tR as Integer
    unsafe
       put _btx_set_encryption_policy(pSession, pIn, pOut, pLevel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ---- session operations (ABI v7) ----------------------------------------
+
+-- Pause / resume the WHOLE session (every torrent). Distinct from the
+-- per-torrent btPause / btResume.
+public handler btSessionPause(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_session_pause(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btSessionResume(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_session_resume(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btSessionIsPaused(in pSession as Integer) returns Boolean
+   variable tR as Integer
+   unsafe
+      put _btx_session_is_paused(pSession) into tR
+   end unsafe
+   return tR is not 0
+end handler
+
+-- The TCP port we actually ended up listening on (0 == not listening yet).
+public handler btListenPort(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_listen_port(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Look up an already-added torrent by its 40-hex (v1) info-hash; returns the
+-- torrent handle, or 0 if not found.
+public handler btFindTorrent(in pSession as Integer, in pInfoHash as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_find_torrent(pSession, pInfoHash) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Classic BEP5 DHT peer announce (NOT BEP44): tell the DHT we have peers for
+-- this 40-hex info-hash on pPort (0 == our listen port).
+public handler btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in pPort as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_dht_announce(pSession, pInfoHash, pPort) into tR
    end unsafe
    return tR
 end handler
@@ -1214,6 +1301,107 @@ public handler btPieceAvailability(in pTorrent as Integer) returns Data
       return the empty data
    end if
    return _bufToData(sStatusPtr, tCount)
+end handler
+
+-- The torrent's trackers as a List of Arrays, each with keys "url", "tier",
+-- "verified" (0/1), "source". One FFI round-trip for the whole announce list.
+public handler btTrackers(in pTorrent as Integer) returns List
+   variable tTrackers as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tTrackerCount as Integer
+   variable tBodyLen as Integer
+   variable tTracker as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tTrackers
+   _ensureStatus(kStatusCap)
+   unsafe
+      put _btx_trackers(pTorrent, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put _btx_trackers(pTorrent, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tTrackers
+   end if
+   put _bufToData(sStatusPtr, tCount) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tTrackerCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tTrackerCount
+      put _readU16(tBuf, tOffset) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 2) into tTracker
+      push tTracker onto tTrackers
+      add (2 + tBodyLen) to tOffset
+   end repeat
+   return tTrackers
+end handler
+
+-- Add an announce URL at the given tier (0 == first tier). Duplicates ignored.
+public handler btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_add_tracker(pTorrent, pUrl, pTier) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Add / remove an HTTP (URL / web) seed (BEP 19).
+public handler btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_add_url_seed(pTorrent, pUrl) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_remove_url_seed(pTorrent, pUrl) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The torrent's web seeds as a List of URL Strings.
+public handler btWebSeeds(in pTorrent as Integer) returns List
+   variable tSeeds as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tSeedCount as Integer
+   variable tBodyLen as Integer
+   variable tRec as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tSeeds
+   _ensureStatus(kStatusCap)
+   unsafe
+      put _btx_url_seeds(pTorrent, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put _btx_url_seeds(pTorrent, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tSeeds
+   end if
+   put _bufToData(sStatusPtr, tCount) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tSeedCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tSeedCount
+      put _readU16(tBuf, tOffset) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 2) into tRec
+      push tRec["urlSeed"] onto tSeeds
+      add (2 + tBodyLen) to tOffset
+   end repeat
+   return tSeeds
 end handler
 
 -- ===================================================================== --

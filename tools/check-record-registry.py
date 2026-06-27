@@ -55,6 +55,17 @@ def parse_lcb_constants(text):
     return out
 
 
+def parse_abi_version(path):
+    """Return the int N from `#define BTX_ABI_VERSION N`, or None if unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r"#define\s+BTX_ABI_VERSION\s+(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
 def main(argv):
     header = argv[1] if len(argv) > 1 else os.path.join(HERE, "src", "btx_record.h")
     lcb = argv[2] if len(argv) > 2 else os.path.join(HERE, "src", "torrent.lcb")
@@ -73,6 +84,21 @@ def main(argv):
 
     problems = []
     checked = 0
+
+    # The ABI version must match between btx_abi.h (#define BTX_ABI_VERSION) and
+    # torrent.lcb (constant kABIVersion) - a skew makes _checkABI() throw at
+    # runtime, and a forgotten bump is an easy mistake to make. Catch it here.
+    abi_h = parse_abi_version(os.path.join(HERE, "src", "btx_abi.h"))
+    abi_lcb = lcb_consts.get("kABIVersion")
+    if abi_h is None:
+        problems.append("could not read BTX_ABI_VERSION from src/btx_abi.h")
+    elif abi_lcb is None:
+        problems.append("missing `constant kABIVersion` in torrent.lcb")
+    elif abi_h != abi_lcb:
+        problems.append("ABI version skew: btx_abi.h BTX_ABI_VERSION=%d but "
+                        "torrent.lcb kABIVersion=%d" % (abi_h, abi_lcb))
+    else:
+        checked += 1
     for cpp_prefix, lcb_prefix in REGISTRIES:
         header_enum = parse_header_enum(htext, cpp_prefix)
         if not header_enum:

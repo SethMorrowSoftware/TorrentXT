@@ -131,7 +131,14 @@ enum FieldId : uint8_t {
     F_FILE_PATH         = 120, /* utf8: file path within the torrent (relative) */
     F_FILE_SIZE         = 121, /* int (64-bit): file size in bytes */
     F_FILE_PROGRESS     = 122, /* int (64-bit): bytes of this file downloaded */
-    F_FILE_PRIORITY     = 123  /* int 0..7: this file's download priority */
+    F_FILE_PRIORITY     = 123, /* int 0..7: this file's download priority */
+
+    /* ---- tracker + web-seed entries (130..139) ---- */
+    F_TRACKER_URL       = 130, /* utf8: announce URL */
+    F_TRACKER_TIER      = 131, /* int: tracker tier (0 == first tier) */
+    F_TRACKER_VERIFIED  = 132, /* int 0/1: has answered at least once this session */
+    F_TRACKER_SOURCE    = 133, /* int: announce_entry source bitmask */
+    F_URL_SEED          = 134  /* utf8: a web-seed (URL seed) address */
 };
 
 /* ------------------------------------------------------------- alert codes */

@@ -119,6 +119,36 @@ MSE / protocol-encryption (PE) policy, mapped straight to libtorrent's
 
 ---
 
+## Session operations
+
+### `btSessionPause(in pSession as Integer) returns Integer` · `btSessionResume(in pSession as Integer) returns Integer`
+Pause / resume the **whole session** - every torrent at once. Distinct from the
+per-torrent `btPause` / `btResume`.
+- **Usage:** command - `btSessionPause sSession`.
+
+### `btSessionIsPaused(in pSession as Integer) returns Boolean`
+`true` if the session is paused. `false` on no session.
+- **Usage:** function - `if btSessionIsPaused(sSession) then ...`.
+
+### `btListenPort(in pSession as Integer) returns Integer`
+The TCP port the session actually ended up listening on, or `0` if it is not
+listening yet (or on a bad handle).
+- **Usage:** function - `put btListenPort(sSession) into tPort`.
+
+### `btFindTorrent(in pSession as Integer, in pInfoHash as String) returns Integer`
+Look up an already-added torrent by its **40-hex (v1) info-hash**; returns the
+torrent handle, or `0` if it is not in this session. Lets you recover a handle
+from a hash you stored earlier instead of keeping the integer around.
+- **Usage:** function - `put btFindTorrent(sSession, tHashHex) into tH`.
+
+### `btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in pPort as Integer) returns Integer`
+Classic **BEP 5** DHT peer announce (not BEP 44): advertise to the DHT that we
+serve peers for `pInfoHash` (40-hex) on `pPort` (`0` == our listen port). Useful
+for announcing your own content's info-hash so others can find you swarm-side.
+- **Usage:** command - `btDhtAnnounce sSession, tHashHex, 0`.
+
+---
+
 ## Add / remove torrents
 
 ### `btAddMagnet(in pSession as Integer, in pURI as String, in pSavePath as String) returns Integer`
@@ -337,6 +367,28 @@ have) for a full piece map. Empty `Data` until the torrent has metadata and
 peers, or on a bad handle.
 - **Usage:** function - `put btPieceAvailability(tH) into tAvail`, then `byte i of tAvail`.
 
+### `btTrackers(in pTorrent as Integer) returns List`
+The torrent's trackers as a `List` of `Array`s, each with keys `url`, `tier`
+(0 == first tier tried), `verified` (`1` once the tracker has answered this
+session), and `source` (the `announce_entry` source bitmask). Empty `List` on a
+bad handle.
+- **Usage:** function - `repeat for each element tTr in btTrackers(tH)` then read `tTr["url"]`.
+
+### `btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier as Integer) returns Integer`
+Add an announce URL at `pTier` (0 == first tier). A URL already in the list is
+ignored by libtorrent.
+- **Usage:** command - `btAddTracker tH, "udp://tracker.example:6969/announce", 0`.
+
+### `btWebSeeds(in pTorrent as Integer) returns List`
+The torrent's HTTP (URL / web) seeds as a `List` of URL `String`s. Empty `List`
+on a bad handle.
+- **Usage:** function - `put btWebSeeds(tH) into tSeeds`.
+
+### `btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer` · `btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer`
+Add or remove an HTTP (URL / web) seed (BEP 19) — a plain web server that can
+serve the torrent's data alongside peers.
+- **Usage:** command - `btAddWebSeed tH, "https://mirror.example/path/"`.
+
 ---
 
 ## Events / poll
@@ -526,6 +578,17 @@ arithmetic.
 | `size` | 121 | int | file size, bytes |
 | `progress` | 122 | int | bytes of this file downloaded |
 | `priority` | 123 | int | this file's download priority, `0..7` |
+
+### Tracker entry (`btTrackers`, one array per tracker)
+
+| key | field id | type | meaning |
+|---|---|---|---|
+| `url` | 130 | utf8 | announce URL |
+| `tier` | 131 | int | tracker tier (`0` == first) |
+| `verified` | 132 | int | `1` once it has answered this session |
+| `source` | 133 | int | `announce_entry` source bitmask |
+
+(`btWebSeeds` returns a plain list of URL strings, not records.)
 
 ### DHT state (`btDhtState`)
 
