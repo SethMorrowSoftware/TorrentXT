@@ -801,8 +801,19 @@ command chPublishFile
       exit chPublishFile
    end if
    chUpdateNowPub
-   chLog "Published '" & tTitle & "' to channel '" & sMyName & "' and seeding it."
+   chLog "Published '" & tTitle & "' to channel '" & chActiveName() & "' and seeding it."
+   if sMyName is empty then
+      chLog "Tip: click Rename to give this channel a name your followers will see."
+   end if
 end chPublishFile
+
+-- the active channel's name for display, or a placeholder when it is unnamed
+function chActiveName
+   if sMyName is empty then
+      return "(unnamed)"
+   end if
+   return sMyName
+end chActiveName
 
 command chUpdateNowPub
    local tN, tName, tTotal, tMsg
