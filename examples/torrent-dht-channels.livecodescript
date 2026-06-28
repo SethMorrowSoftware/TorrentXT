@@ -78,6 +78,8 @@ local sFeedEnc          -- array: feed-list line -> "enc" if that release is enc
 local sFeedOrigName     -- array: feed-list line -> original filename (encrypted release)
 local sPendingPass      -- array: info-hash -> passphrase, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for a download to decrypt
+local sXferName         -- array: info-hash -> real name to SHOW locally for an
+                        --   encrypted transfer (the swarm only ever sees the .enc)
 
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
@@ -795,6 +797,8 @@ command chPublishFile
          exit chPublishFile
       end if
       put true into sMineHashes[toLower(tHash)]
+      -- show OURSELVES the real name for this transfer (the swarm only sees the .enc)
+      put tTitle into sXferName[toLower(tHash)]
       put "magnet:?xt=urn:btih:" & tHash into tMagnet
       -- encrypted release entry: title TAB magnet TAB enc TAB originalFilename
       put chTrunc(tTitle, 60) & tab & tMagnet & tab & "enc" & tab & tOrig into tRel
@@ -1015,6 +1019,8 @@ command chDownloadSelected
       if tHash is not empty then
          put sFollowPass[tKey] into sPendingPass[tHash]
          put sFeedOrigName[tL] into sPendingName[tHash]
+         -- show the real release name locally instead of the neutral .enc name
+         put tTitle into sXferName[tHash]
       end if
       chLog "Downloading ENCRYPTED '" & tTitle & "' - it decrypts automatically when complete."
    else
@@ -1124,7 +1130,7 @@ end chRefreshSubs
 -- ---- transfers dashboard -----------------------------------------------------
 command chRefreshTransfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht
-   local tColors, tErr, tSelH, tSelLine, tSource
+   local tColors, tErr, tSelH, tSelLine, tSource, tDispName, tIH
    if sSession is 0 or sSession is empty then
       exit chRefreshTransfers
    end if
@@ -1161,8 +1167,15 @@ command chRefreshTransfers
       else
          put "30,90,200" into tColors[tLineNum]
       end if
+      -- Show the real name for our own/known encrypted transfers; the swarm only
+      -- ever sees the neutral .enc name, but we should not hide it from ourselves.
+      put tS["name"] into tDispName
+      put toLower(tS["infoHashV1"]) into tIH
+      if tIH is not empty and sXferName[tIH] is not empty then
+         put sXferName[tIH] into tDispName
+      end if
       -- Source | Name | State | Progress | Peers (monospaced; Name trimmed to fit)
-      put tSource & tab & chTrunc(tS["name"], 21) & tab & chXferState(tS) & tab & \
+      put tSource & tab & chTrunc(tDispName, 21) & tab & chXferState(tS) & tab & \
           chProgressBar(tPct) & tab & tS["numPeers"] & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
@@ -1235,13 +1248,14 @@ end chSelectedXferHandle
 -- bar (btFileList - the marquee v5 inspection call). Empty until metadata
 -- arrives (a magnet fetches its file list over the swarm).
 command chShowFiles pHandle
-   local tFiles, tFile, tRows, tPct
+   local tFiles, tFile, tRows, tPct, tIH, tFileName
    if there is no field "chFiles" then
       exit chShowFiles
    end if
    if pHandle is 0 or pHandle is empty then
       put "   Click a transfer above to see its files and per-file progress." into tRows
    else
+      put toLower(btInfoHash(pHandle)) into tIH
       put btFileList(pHandle) into tFiles
       put "" into tRows
       repeat for each element tFile in tFiles
@@ -1250,7 +1264,12 @@ command chShowFiles pHandle
          else
             put 0 into tPct
          end if
-         put chTrunc(tFile["path"], 60) & tab & chFmtBytes(tFile["size"]) & tab \
+         -- an encrypted release is a single .enc file; show its real name to us
+         put tFile["path"] into tFileName
+         if tIH is not empty and sXferName[tIH] is not empty then
+            put sXferName[tIH] into tFileName
+         end if
+         put chTrunc(tFileName, 60) & tab & chFmtBytes(tFile["size"]) & tab \
              & chProgressBar(tPct) & return after tRows
       end repeat
       if the last char of tRows is return then
