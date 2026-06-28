@@ -183,8 +183,15 @@ These are load-bearing and enforced in the code:
 
 ## Examples
 
-Two runnable flagship demos plus the shared poll-dispatcher utility:
+A simple starter, two flagship demos, plus the shared poll-dispatcher utility:
 
+- **[`examples/torrent-quickshare.livecodescript`](examples/torrent-quickshare.livecodescript)**
+  — the simplest possible demo and the best place to start: **drag a file** onto the
+  window to get a short share **code**, send the code to a friend, and they paste it in
+  to **download the file straight from you** — no server, no upload first, no size
+  limit. The code is the torrent's info-hash, so the DHT introduces the two machines
+  with no tracker needed. A live Transfers list shows it working on both ends.
+  (OS drag-and-drop, with click-to-choose as a fallback.)
 - **[`examples/torrent-client.livecodescript`](examples/torrent-client.livecodescript)**
   — the flagship client: a self-building, multi-torrent app with a smart Add box
   (magnet / `.torrent` / HTTP / info-hash), per-torrent controls, create-and-seed, a
