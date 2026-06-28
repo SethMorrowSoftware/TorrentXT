@@ -14,6 +14,8 @@ the OXT pass for the rest. This checker enforces, across every .lcb and example:
      must be wrapped.
   5. Constants declared before first use (.lcb) - OXT resolves constants by
      lexical position; a forward reference silently evaluates to nothing.
+  6. No prefixed name that spells a reserved token (both dialects) - e.g. `tExt`
+     is t-e-x-t = `text`, which xTalk evaluates as the keyword, not a variable.
 
 It is a lexer-level checker, NOT a compiler: it neutralizes comments and strings
 and reasons about block keywords. It errs toward NOT raising false positives;
@@ -371,6 +373,50 @@ def check_lcb_lowercase_names(path, cleaned):
     return problems
 
 
+# A prefixed CamelCase name (t/p/s/k + UpperCamel, the project convention) whose
+# FULL lowercased spelling IS a reserved xTalk token. The classic trap: `tExt`
+# (intended as t + "Ext" for extension) spells t-e-x-t = `text`, so xTalk
+# evaluates it as the `text` keyword, not a variable - a silent, hair-pulling
+# bug that compiles. Only reserved words that BEGIN with a prefix letter
+# (t/p/s/k) can ever collide, so that is the entire set we need to carry. The
+# shape guard `[tpsk][A-Z]` means a normally-written lowercase keyword (`text`,
+# `the`, `put`) never matches - only an accidentally-keyword-spelling identifier
+# does, and such a name is always a real bug (the engine token wins every time).
+PREFIXED_TOKEN_SHADOWS = {
+    # t-
+    "the", "then", "this", "there", "to", "text", "time", "title", "top",
+    "tab", "tan", "true", "target",
+    # p-
+    "pi", "pass", "put", "params", "print",
+    # s-
+    "send", "set", "sin", "sqrt", "sort", "space", "start", "stop", "stack",
+    "script", "selection",
+    # k-
+    "keys",
+}
+
+
+def check_prefixed_token_shadows(path, cleaned):
+    """Flag a t/p/s/k-prefixed name that spells a reserved token (e.g. tExt ->
+    `text`). Applies to both .lcb and .livecodescript - the shadowing is an
+    xTalk evaluation rule, not a dialect quirk."""
+    problems = []
+    seen = set()
+    pat = re.compile(r"\b([tpsk][A-Z][A-Za-z0-9_]*)\b")
+    for lineno, line in cleaned:
+        for m in pat.finditer(line):
+            name = m.group(1)
+            if name in seen:
+                continue
+            if name.lower() in PREFIXED_TOKEN_SHADOWS:
+                seen.add(name)
+                problems.append(Problem(path, lineno,
+                    "name `%s` spells the reserved token `%s` - xTalk evaluates it "
+                    "as that keyword, not a variable; rename it with a distinctive, "
+                    "multi-word stem (e.g. tExt -> tSuffix)" % (name, name.lower())))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -395,6 +441,8 @@ def check_file(path):
         problems += check_lcb_lowercase_names(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
+    # universal xTalk rule (both dialects): no name that spells a reserved token
+    problems += check_prefixed_token_shadows(path, cleaned)
     return problems
 
 

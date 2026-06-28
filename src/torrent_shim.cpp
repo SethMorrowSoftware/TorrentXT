@@ -2121,6 +2121,27 @@ extern "C" BTX_API int BTX_CALL btx_dht_get_immutable(int s, const char *targetH
     });
 }
 
+/* Sign a mutable-item STRING value the BEP44 way, setting the entry `e` that
+ * libtorrent will store. THE SIGNATURE MUST COVER THE BENCODED VALUE (a string
+ * "hi" bencodes to "2:hi"), because that is exactly what every storing node and
+ * every getter verifies it against — signing the raw bytes yields a signature
+ * that verifies against nothing, so nodes reject the store and getters never
+ * surface the item, and a whole signed channel feed silently disappears.
+ * Mirrors libtorrent's own examples/dht_put.cpp. `out_signed` receives the
+ * bencoded buffer that was signed so a caller (the smoke test) can re-verify
+ * with verify_mutable_item; the production put callback and that test hook both
+ * route through here, so the test exercises the REAL signing path. */
+static lt::dht::signature sign_mutable_string_entry(
+        lt::entry &e, const std::vector<char> &val, const std::string &salt,
+        std::int64_t seq, const lt::dht::public_key &pk,
+        const lt::dht::secret_key &sk, std::vector<char> &out_signed) {
+    e = lt::entry(std::string(val.begin(), val.end()));
+    out_signed.clear();
+    lt::bencode(std::back_inserter(out_signed), e);
+    return lt::dht::sign_mutable_item(out_signed, salt,
+                                      lt::dht::sequence_number(seq), pk, sk);
+}
+
 extern "C" BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKeyHex,
                                                     const char *secretKeyHex,
                                                     const char *salt,
@@ -2143,10 +2164,10 @@ extern "C" BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKey
         st->ses->dht_put_item(pk.bytes,
             [val, salt_s, pk, sk](lt::entry &e, std::array<char, 64> &sig,
                                   std::int64_t &seq, std::string const &) {
-                e = lt::entry(std::string(val.begin(), val.end()));
                 seq = seq + 1;  /* monotonic: bump past the current value */
-                lt::dht::signature sg = lt::dht::sign_mutable_item(
-                    val, salt_s, lt::dht::sequence_number(seq), pk, sk);
+                std::vector<char> signed_buf;  /* the bencoded value we signed */
+                lt::dht::signature sg = sign_mutable_string_entry(
+                    e, val, salt_s, seq, pk, sk, signed_buf);
                 sig = sg.bytes;
             }, salt_s);
         return BTX_OK;  /* confirmation -> A_DHT_PUT alert */
@@ -2279,6 +2300,50 @@ int force_throw(void) {
 
 int live_session_count(void) {
     return static_cast<int>(g_sessions.live_count());
+}
+
+int dht_mutable_sign_verifies(const char *publicKeyHex, const char *secretKeyHex,
+                              const char *salt, const void *data, int len) {
+    /* Sign a mutable value through the SAME helper the production put uses, then
+     * check it with libtorrent's own verify_mutable_item — the exact gate a
+     * follower's libtorrent applies before surfacing the item. A pass proves the
+     * BEP44 signing contract holds (sign the bencoded value); a regression here
+     * is the silent "feeds never arrive" failure. Wrapped in the firewall like
+     * every entry, so a throw becomes a negative code, never a CHECK crash. */
+    BTX_GUARD_ACTION({
+        lt::dht::public_key pk;
+        lt::dht::secret_key sk;
+        if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) return 0;
+        if (!hex_to_buf(secretKeyHex, sk.bytes.data(), 64)) return 0;
+        std::string salt_s = salt ? salt : "";
+        const char *p = static_cast<const char *>(data);
+        std::vector<char> val(p, p + (len < 0 ? 0 : len));
+        lt::entry e;
+        std::vector<char> signed_buf;     /* the bencoded value v that was signed */
+        const std::int64_t seq = 1;
+        lt::dht::signature sg =
+            sign_mutable_string_entry(e, val, salt_s, seq, pk, sk, signed_buf);
+        /* Reconstruct the BEP44 canonical signed message exactly as a remote
+         * verifier does — [4:salt<len>:<salt>] 3:seqi<seq>e 1:v <bencoded v> —
+         * and check the signature with ed25519_verify, the same primitive a
+         * follower's libtorrent applies. (verify_mutable_item itself is
+         * TORRENT_EXTRA_EXPORT, not in the shared lib, so we use the public
+         * ed25519 verify against the canonical string instead.) If the value was
+         * signed bencoded (correct) this passes; if signed raw (the bug) it
+         * fails — so this assertion is the regression guard for that silent bug. */
+        std::string canon;
+        if (!salt_s.empty()) {
+            canon += "4:salt";
+            canon += std::to_string(salt_s.size());
+            canon += ":";
+            canon += salt_s;
+        }
+        canon += "3:seqi";
+        canon += std::to_string(seq);
+        canon += "e1:v";
+        canon.append(signed_buf.begin(), signed_buf.end());
+        return lt::dht::ed25519_verify(sg, canon, pk) ? 1 : 0;
+    });
 }
 
 }  // namespace test

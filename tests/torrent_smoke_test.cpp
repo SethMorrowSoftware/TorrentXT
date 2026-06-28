@@ -545,6 +545,19 @@ static void test_dht_bep44() {
     CHECK(btx_dht_get_mutable(s, pubHex.c_str(), "myapp") == BTX_OK);
     CHECK(btx_dht_get_mutable(s, pubHex.c_str(), "") == BTX_OK);  /* empty salt */
 
+    /* The BEP44 SIGNING CONTRACT (the bug that made every channel feed silently
+     * fail): a mutable value must be signed over its BENCODED form, the way a
+     * follower's libtorrent verifies it before surfacing the item. btx_dht_put_*
+     * only returns OK that the call wired up - the signing itself runs later in a
+     * network-thread callback - so this hook signs through the SAME helper and
+     * checks it with libtorrent's own verify_mutable_item. A real feed string,
+     * with empty and non-empty salt, must both verify. */
+    const char *feed = "name=Alice\nr=Demo Release\tmagnet:?xt=urn:btih:0123456789abcdef";
+    const int feedlen = static_cast<int>(std::strlen(feed));
+    CHECK(btx::test::dht_mutable_sign_verifies(pubHex.c_str(), secHex.c_str(), "", feed, feedlen) == 1);
+    CHECK(btx::test::dht_mutable_sign_verifies(pubHex.c_str(), secHex.c_str(), "myapp", feed, feedlen) == 1);
+    CHECK(btx::test::dht_mutable_sign_verifies(pubHex.c_str(), secHex.c_str(), "", val, vlen) == 1);
+
     /* bad hex / wrong key length / oversize value -> clean BTX_ERR_INVALID_ARG. */
     CHECK(btx_dht_get_immutable(s, "not-hex") == BTX_ERR_INVALID_ARG);
     CHECK(btx_dht_get_mutable(s, "short", "") == BTX_ERR_INVALID_ARG);
