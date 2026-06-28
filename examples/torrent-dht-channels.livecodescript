@@ -70,6 +70,11 @@ local sFeedMag          -- array: feed-list line -> magnet
 local sFeedTitle        -- array: feed-list line -> release title
 local sXferHandle       -- array: transfers-list line -> torrent handle
 
+-- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
+-- the stack's stored version differs, so updating the script in a saved stack
+-- picks up the new layout instead of keeping the old one.
+constant kUiVersion = "channels-ui-2025-06b"
+
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
    chBuild
@@ -174,9 +179,14 @@ end menuPick
 
 -- ---- self-building UI (idempotent) -------------------------------------------
 command chBuild
-   if there is a field "chLog" then
+   -- Rebuild when the UI version changes (not just "is it built?"). Otherwise a
+   -- stack saved by an OLDER version keeps its old controls - including buttons
+   -- this script no longer handles (e.g. the old chNewId/chSetName) - and never
+   -- gets the new ones. Wipe our generated controls and rebuild on any mismatch.
+   if the uUiVersion of this stack is kUiVersion then
       exit chBuild
    end if
+   chClearGeneratedUI
    lock screen
    -- two columns so the whole app fits a 720p (1280x720) screen
    set the width of this stack to 1180
@@ -271,8 +281,24 @@ command chBuild
    set the textSize of field "chFollowKey" to 9
    set the textSize of field "chMagnetField" to 9
    chAddTips
+   set the uUiVersion of this stack to kUiVersion
    unlock screen
 end chBuild
+
+-- Remove the controls THIS script generates (all named with the "ch" prefix), so
+-- chBuild can rebuild a clean current UI over a stack an older version built.
+-- Iterates top-down so deleting by index never shifts an index we have yet to
+-- visit; only ch-prefixed controls are touched, so anything else is left alone.
+command chClearGeneratedUI
+   local tI
+   lock screen
+   repeat with tI = the number of controls of this card down to 1
+      if the short name of control tI of this card begins with "ch" then
+         delete control tI of this card
+      end if
+   end repeat
+   unlock screen
+end chClearGeneratedUI
 
 command chMakeLabel pName, pText, pRect, pSize
    if there is no field pName then
@@ -554,7 +580,7 @@ end chRenameChannel
 -- magnet that a follower decrypts still works for anyone. Share the passphrase
 -- with followers out-of-band (never on the DHT).
 command chSetPrivacy
-   local tPass
+   local tPass, tName, tR
    if not sCanEncrypt then
       answer "This OpenXTalk build cannot encrypt (no OpenSSL), so private channels are unavailable on this machine."
       exit chSetPrivacy
@@ -568,13 +594,20 @@ command chSetPrivacy
    put it into tPass
    put tPass into sChannels[sActive]["pass"]
    chSaveChannels
-   get chPublishActiveFeed()   -- re-announce under the new privacy setting
+   put chPublishActiveFeed() into tR   -- re-announce under the new privacy setting
    chUpdateChannelMenu
    chUpdateNowPub
+   put sMyName into tName
+   if tName is empty then
+      put "(unnamed - click Rename)" into tName
+   end if
    if tPass is empty then
-      chLog "Channel '" & sMyName & "' is now PUBLIC."
+      chLog "Channel '" & tName & "' is now PUBLIC."
+   else if tR is 0 then
+      -- the put was issued; the 'Announced to N node(s)' line confirms it landed
+      chLog "Channel '" & tName & "' is now PRIVATE - its ENCRYPTED feed was just published (watch for 'Announced to N node(s)'). Give followers the passphrase out-of-band. NOTE: the files themselves are not yet encrypted."
    else
-      chLog "Channel '" & sMyName & "' is now PRIVATE (file list hidden). Give followers the passphrase out-of-band. The files themselves are not yet encrypted."
+      chLog "Channel '" & tName & "' is set PRIVATE but its encrypted feed could not be published right now - it will retry on the next 60-second tick."
    end if
 end chSetPrivacy
 
