@@ -27,7 +27,10 @@ script "dhtChannelsApp"
 -- channel's secret key could have published it).
 --
 -- Click any transfer to see the files inside it with a live per-file progress
--- bar (btFileList). The transfers table shows inline progress bars too.
+-- bar (btFileList); the transfers table shows inline progress bars too. Pause,
+-- Resume, Remove (keep or delete files), or Open Folder act on the selected
+-- transfer (double-click a row to open its folder), and the Add Magnet box adds
+-- any magnet link or info-hash directly, not only releases from channels.
 --
 -- It also includes a "Quick drop" panel using IMMUTABLE items: pin a short text,
 -- get a 40-character content-address code, and fetch any code back.
@@ -94,6 +97,21 @@ on mouseUp
       case "chXfers"
          chShowFilesForSelection
          break
+      case "chAddMagnet"
+         chAddMagnetManual
+         break
+      case "chPauseXfer"
+         chPauseSelected
+         break
+      case "chResumeXfer"
+         chResumeSelected
+         break
+      case "chRemoveXfer"
+         chRemoveSelected
+         break
+      case "chOpenFolder"
+         chOpenSelectedFolder
+         break
       case "chUnfollow"
          chUnfollow
          break
@@ -112,11 +130,16 @@ on mouseUp
 end mouseUp
 
 on mouseDoubleUp
-   if the short name of the target is "chSubs" then
-      chDownloadSelected
-   else
-      pass mouseDoubleUp
-   end if
+   switch the short name of the target
+      case "chSubs"
+         chDownloadSelected
+         break
+      case "chXfers"
+         chOpenSelectedFolder
+         break
+      default
+         pass mouseDoubleUp
+   end switch
 end mouseDoubleUp
 
 -- ---- self-building UI (idempotent) -------------------------------------------
@@ -160,18 +183,27 @@ command chBuild
    -- ===== RIGHT COLUMN (x 596..1164): transfers + selected-transfer detail =====
    chSection "chSecXfer", "3.  Transfers - live upload + download activity", "596,38,1164,58"
    chMakeLabel "chXferHeader", "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "596,62,1164,80", 10
-   chMakeList "chXfers", "596,82,1164,264", false
-   chMakeLabel "chTotals", "", "596,268,1164,288", 10
-   set the tabStops of field "chXferHeader" to "26,300,400,540"
-   set the tabStops of field "chXfers" to "26,300,400,540"
+   chMakeList "chXfers", "596,82,1164,238", false
+   -- tabStops pull Peers in clear of the vertical scrollbar so it is not clipped
+   set the tabStops of field "chXferHeader" to "26,250,340,470"
+   set the tabStops of field "chXfers" to "26,250,340,470"
    set the textFont of field "chXferHeader" to "Courier"
    set the textFont of field "chXfers" to "Courier"
    set the textSize of field "chXferHeader" to 10
    set the textSize of field "chXfers" to 10
+   -- add any magnet link or info-hash directly, not only channel releases
+   chMakeField "chMagnetField", "596,244,948,266", false
+   chMakeButton "chAddMagnet", "Add Magnet", "954,244,1080,266"
+   -- act on the selected transfer (click a row first)
+   chMakeButton "chPauseXfer", "Pause", "596,272,690,294"
+   chMakeButton "chResumeXfer", "Resume", "696,272,790,294"
+   chMakeButton "chRemoveXfer", "Remove", "796,272,902,294"
+   chMakeButton "chOpenFolder", "Open Folder", "908,272,1054,294"
+   chMakeLabel "chTotals", "", "596,300,1164,318", 10
    -- 3b. Contents of the selected transfer (live per-file progress via btFileList)
-   chMakeLabel "chFilesCaption", "Click a transfer above to see the files inside it, with a live per-file progress bar.", "596,296,1164,318", 9
-   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,322,1164,340", 10
-   chMakeList "chFiles", "596,342,1164,470", true
+   chMakeLabel "chFilesCaption", "Click a transfer above to see the files inside it (double-click opens its folder).", "596,324,1164,340", 9
+   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,344,1164,362", 10
+   chMakeList "chFiles", "596,364,1164,470", true
    set the tabStops of field "chFilesHeader" to "340,440"
    set the tabStops of field "chFiles" to "340,440"
    set the textFont of field "chFilesHeader" to "Courier"
@@ -193,8 +225,10 @@ command chBuild
    set the textFont of field "chFollowKey" to "Courier"
    set the textFont of field "chPinCode" to "Courier"
    set the textFont of field "chFetchCode" to "Courier"
+   set the textFont of field "chMagnetField" to "Courier"
    set the textSize of field "chMyKey" to 9
    set the textSize of field "chFollowKey" to 9
+   set the textSize of field "chMagnetField" to 9
    chAddTips
    unlock screen
 end chBuild
@@ -268,7 +302,13 @@ command chAddTips
    set the tooltip of button "chDownload" to "Download the selected file - it transfers peer-to-peer from the publisher."
    set the tooltip of button "chCopyMag" to "Copy the selected file's magnet link to the clipboard."
    set the tooltip of button "chUnfollow" to "Stop following the selected file's channel."
-   set the tooltip of field "chXfers" to "Click a transfer to see its files and per-file progress below."
+   set the tooltip of field "chXfers" to "Click a transfer to see its files below; double-click to open its folder."
+   set the tooltip of field "chMagnetField" to "Paste any magnet link or info-hash to download it directly."
+   set the tooltip of button "chAddMagnet" to "Add the pasted magnet/info-hash and start downloading it."
+   set the tooltip of button "chPauseXfer" to "Pause the selected transfer (stops its upload + download)."
+   set the tooltip of button "chResumeXfer" to "Resume the selected paused transfer."
+   set the tooltip of button "chRemoveXfer" to "Remove the selected transfer; you choose whether to delete its files."
+   set the tooltip of button "chOpenFolder" to "Open the selected transfer's download folder in your file manager."
    set the tooltip of field "chFiles" to "Files inside the selected transfer, with live per-file progress."
    set the tooltip of field "chPinText" to "Type any short text (up to 1000 bytes) to pin to the network."
    set the tooltip of button "chPin" to "Store the text on the DHT and get back a short share code."
@@ -290,7 +330,8 @@ command chHelp
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
    put tMsg & "   so it is tamper-proof." & return & return into tMsg
    put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving. Click one to see" & return into tMsg
-   put tMsg & "   the files inside it, each with its own live per-file progress bar." & return & return into tMsg
+   put tMsg & "   the files inside it (double-click to open its folder), and use Pause, Resume," & return into tMsg
+   put tMsg & "   Remove, or Open Folder. You can also paste any magnet link to download it directly." & return & return into tMsg
    put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return & return into tMsg
    put tMsg & "TRY IT on two machines: Copy your card on one, Follow it on the other, then share a file." into tMsg
    answer tMsg with "Got it"
@@ -761,9 +802,14 @@ command chRefreshTransfers
          put tLineNum into tSelLine
       end if
       put (the round of (tS["progress"] * 1000) / 10) into tPct
-      put chStateColor(tS["state"], tS["error"]) into tColors[tLineNum]
-      -- Progress column is now an inline ASCII bar (the field is monospaced)
-      put tLineNum & tab & chTrunc(tS["name"], 40) & tab & chStateName(tS["state"]) & tab & \
+      if tS["isPaused"] is true or tS["isPaused"] is 1 then
+         put "120,120,120" into tColors[tLineNum]   -- paused rows go grey
+      else
+         put chStateColor(tS["state"], tS["error"]) into tColors[tLineNum]
+      end if
+      -- Progress column is an inline ASCII bar (the field is monospaced); the
+      -- Name is trimmed to fit its column so it never pushes the others right.
+      put tLineNum & tab & chTrunc(tS["name"], 32) & tab & chXferState(tS) & tab & \
           chProgressBar(tPct) & tab & tS["numPeers"] & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
@@ -870,6 +916,137 @@ end chShowFiles
 command chShowFilesForSelection
    chShowFiles chSelectedXferHandle()
 end chShowFilesForSelection
+
+-- ---- transfer actions (operate on the selected transfer) --------------------
+
+-- Add any magnet link or 40/64-char info-hash directly, not only the releases
+-- shared by channels you follow. The download lands in the same default folder.
+command chAddMagnetManual
+   local tMag, tH
+   if sSession is 0 then
+      chLog "No session."
+      exit chAddMagnetManual
+   end if
+   put chTrim(field "chMagnetField") into tMag
+   if tMag is empty then
+      chLog "Paste a magnet link or info-hash into the box first."
+      exit chAddMagnetManual
+   end if
+   -- accept a bare 40-hex (v1) or 64-hex (v2) info-hash by wrapping it as a magnet
+   if not (tMag begins with "magnet:") then
+      if the number of chars of tMag is 40 or the number of chars of tMag is 64 then
+         put "magnet:?xt=urn:btih:" & tMag into tMag
+      else
+         chLog "That is not a magnet link or a 40/64-character info-hash."
+         exit chAddMagnetManual
+      end if
+   end if
+   put btAddMagnet(sSession, tMag, chDefaultSave()) into tH
+   if tH is 0 then
+      chLog "Add failed:" && btLastError()
+      exit chAddMagnetManual
+   end if
+   put empty into field "chMagnetField"
+   chLog "Added a magnet - downloading to" && chDefaultSave() & "."
+   chRefreshTransfers
+end chAddMagnetManual
+
+command chPauseSelected
+   local tH, tR
+   put chSelectedXferHandle() into tH
+   if tH is 0 then
+      chLog "Select a transfer to pause."
+      exit chPauseSelected
+   end if
+   put btPause(tH) into tR
+   if tR is 0 then
+      chLog "Paused that transfer."
+   else
+      chLog "Pause failed:" && btLastError()
+   end if
+   chRefreshTransfers
+end chPauseSelected
+
+command chResumeSelected
+   local tH, tR
+   put chSelectedXferHandle() into tH
+   if tH is 0 then
+      chLog "Select a transfer to resume."
+      exit chResumeSelected
+   end if
+   put btResume(tH) into tR
+   if tR is 0 then
+      chLog "Resumed that transfer."
+   else
+      chLog "Resume failed:" && btLastError()
+   end if
+   chRefreshTransfers
+end chResumeSelected
+
+-- Remove the selected transfer from the session. The user chooses whether to
+-- also delete the downloaded files from disk (a deliberate, separate choice).
+command chRemoveSelected
+   local tH, tS, tName, tDelete, tR
+   put chSelectedXferHandle() into tH
+   if tH is 0 then
+      chLog "Select a transfer to remove."
+      exit chRemoveSelected
+   end if
+   put btTorrentStatus(tH) into tS
+   put tS["name"] into tName
+   if tName is empty then
+      put "this transfer" into tName
+   end if
+   answer "Remove" && quote & chTrunc(tName, 40) & quote & "?" & return & \
+      "Keep the downloaded files, or delete them from disk?" with \
+      "Cancel" or "Keep Files" or "Delete Files"
+   if it is "Cancel" then
+      exit chRemoveSelected
+   end if
+   put (it is "Delete Files") into tDelete
+   put btRemoveTorrent(sSession, tH, tDelete) into tR
+   if tR is not 0 then
+      chLog "Remove failed:" && btLastError()
+      exit chRemoveSelected
+   end if
+   if tDelete then
+      chLog "Removed" && quote & tName & quote && "and deleted its files."
+   else
+      chLog "Removed" && quote & tName & quote && "(files kept on disk)."
+   end if
+   chRefreshTransfers
+end chRemoveSelected
+
+-- Open the selected transfer's download folder in the OS file manager, and log
+-- the path regardless (so the user always knows where the files landed).
+command chOpenSelectedFolder
+   local tH, tS, tFolder, tErr
+   put chSelectedXferHandle() into tH
+   if tH is 0 then
+      chLog "Select a transfer, then click Open Folder (or double-click the row)."
+      exit chOpenSelectedFolder
+   end if
+   put btTorrentStatus(tH) into tS
+   put tS["savePath"] into tFolder
+   if tFolder is empty then
+      chLog "No download location for that transfer yet."
+      exit chOpenSelectedFolder
+   end if
+   try
+      launch document tFolder
+   catch tErr
+   end try
+   chLog "Download folder:" && tFolder
+end chOpenSelectedFolder
+
+-- State text for a transfer row: "paused" overrides the activity phase, since a
+-- paused seeding/downloading torrent is stopped even though its phase is set.
+function chXferState pStatus
+   if pStatus["isPaused"] is true or pStatus["isPaused"] is 1 then
+      return "paused"
+   end if
+   return chStateName(pStatus["state"])
+end chXferState
 
 -- a 10-segment ASCII progress bar, e.g. [####------] 42%  (monospaced fields)
 function chProgressBar pPct
