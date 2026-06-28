@@ -475,7 +475,9 @@ command chUpdateChannelMenu
    if the last char of tItems is return then
       delete the last char of tItems
    end if
-   set the menuItems of button "chChannelMenu" to tItems
+   -- a menu button's items live in its `text` (return-delimited); there is no
+   -- `menuItems` property in xTalk. menuHistory then selects the active one.
+   set the text of button "chChannelMenu" to tItems
    set the menuHistory of button "chChannelMenu" to sActive
 end chUpdateChannelMenu
 
