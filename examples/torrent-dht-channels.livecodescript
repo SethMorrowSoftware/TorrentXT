@@ -29,12 +29,16 @@ script "dhtChannelsApp"
 --
 -- PRIVACY (optional): a channel is PUBLIC by default - anyone with its address
 -- reads the file list, anyone with a magnet downloads the file. Click "Privacy"
--- to set a passphrase and the channel's FEED is AES-encrypted before the DHT put,
--- so only someone with the passphrase (shared out-of-band) can read the file list.
--- This is metadata privacy: the files themselves are NOT yet encrypted (a magnet a
--- follower decrypts still works for anyone), and it does not hide your IP. Real
--- file encryption is the planned next step. Fail-closed: a private channel that
--- cannot be encrypted is never published in the clear.
+-- to set a passphrase, and that channel encrypts BOTH its feed AND every file you
+-- publish to it (AES-256). The feed is encrypted before the DHT put (the file list
+-- is hidden), and each file is encrypted in chunks before it is shared, so the
+-- torrent carries ciphertext under a neutral name - a leaked magnet is useless
+-- without the passphrase, which followers get out-of-band. Downloads are decrypted
+-- automatically. It still does NOT hide your IP or that you are sharing something,
+-- and the passphrase KDF is the engine's (use a long, random passphrase); the
+-- hardened version is the planned libsodium upgrade. Private publishing is one
+-- file at a time and pauses briefly on a very large file. Fail-closed: a private
+-- channel that cannot be encrypted is never published in the clear.
 --
 -- Click any transfer to see the files inside it with a live per-file progress
 -- bar (btFileList); the transfers table shows inline progress bars too. Pause,
@@ -70,10 +74,18 @@ local sFeedMag          -- array: feed-list line -> magnet
 local sFeedTitle        -- array: feed-list line -> release title
 local sXferHandle       -- array: transfers-list line -> torrent handle
 
+local sFeedEnc          -- array: feed-list line -> "enc" if that release is encrypted
+local sFeedOrigName     -- array: feed-list line -> original filename (encrypted release)
+local sPendingPass      -- array: info-hash -> passphrase, for a download to decrypt
+local sPendingName      -- array: info-hash -> original filename, for a download to decrypt
+
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
 constant kUiVersion = "channels-ui-2025-06b"
+-- file-encryption framing (Phase 2): an 8-byte magic, then [u32be len][cipher]...
+constant kEncChunk = 4194304     -- 4 MiB of plaintext per encrypted chunk
+constant kEncMagic = "BTXFENC1"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -365,7 +377,7 @@ command chAddTips
    set the tooltip of button "chCopyKey" to "Copy this channel's card (its name + address) to the clipboard."
    set the tooltip of button "chRename" to "Give the active channel a friendly display name its followers will see."
    set the tooltip of button "chPublish" to "Pick a folder. It is packaged, seeded, and added to the active channel's feed."
-   set the tooltip of button "chPrivacy" to "Set a passphrase to hide this channel's file LIST (files are not yet encrypted)."
+   set the tooltip of button "chPrivacy" to "Set a passphrase to encrypt this channel's feed AND the files you publish to it."
    set the tooltip of field "chFollowKey" to "Paste someone's channel card or 64-character address, then click Follow."
    set the tooltip of button "chFollow" to "Subscribe to that channel and fetch its signed list of files."
    set the tooltip of button "chRefresh" to "Re-fetch the latest files from every channel you follow."
@@ -397,11 +409,11 @@ command chHelp
    put tMsg & "1) YOUR CHANNELS - each is a personal feed. Publish a file and it is shared under that" & return into tMsg
    put tMsg & "   channel's own cryptographic key, so nobody else can post to it or forge it. You can" & return into tMsg
    put tMsg & "   keep several channels (New Channel / Rename / Delete) and switch between them." & return & return into tMsg
-   put tMsg & "   PRIVACY: by default a channel is PUBLIC - anyone with its address can read the file" & return into tMsg
-   put tMsg & "   list, and anyone with a magnet can download the file. Click Privacy to set a passphrase:" & return into tMsg
-   put tMsg & "   that hides the file LIST from people without it (share it out-of-band, never on the DHT)." & return into tMsg
-   put tMsg & "   NOTE: the files themselves are not yet encrypted, so this hides the directory, not the" & return into tMsg
-   put tMsg & "   contents, and it does not hide your IP address. Do not put anything truly sensitive here." & return & return into tMsg
+   put tMsg & "   PRIVACY: by default a channel is PUBLIC - anyone with its address reads the file list" & return into tMsg
+   put tMsg & "   and anyone with a magnet downloads the file. Click Privacy to set a passphrase, and that" & return into tMsg
+   put tMsg & "   channel encrypts BOTH its feed AND the files you publish (the file is encrypted before" & return into tMsg
+   put tMsg & "   it is shared; downloads decrypt automatically). Share the passphrase out-of-band, never" & return into tMsg
+   put tMsg & "   on the DHT. It still does not hide your IP, and private publishing is one file at a time." & return & return into tMsg
    put tMsg & "2) CHANNELS YOU FOLLOW - paste someone's channel card to see their latest files. Pick" & return into tMsg
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
    put tMsg & "   so it is tamper-proof. For a PRIVATE channel, Follow asks for its passphrase." & return & return into tMsg
@@ -575,10 +587,11 @@ command chRenameChannel
 end chRenameChannel
 
 -- Make the active channel private (set a passphrase) or public again (clear it).
--- PHASE 1: this encrypts the FEED only - it hides your file list from anyone
--- without the passphrase, but the files themselves are NOT yet encrypted, so a
--- magnet that a follower decrypts still works for anyone. Share the passphrase
--- with followers out-of-band (never on the DHT).
+-- A private channel encrypts BOTH its feed AND every file published to it: the
+-- file list is hidden, and each file is encrypted before sharing so a leaked
+-- magnet is useless. Share the passphrase with followers out-of-band (never on
+-- the DHT). It does not hide your IP, private publishing is one file at a time,
+-- and the passphrase KDF is the engine's - use a long, random one.
 command chSetPrivacy
    local tPass, tName, tR
    if not sCanEncrypt then
@@ -586,7 +599,7 @@ command chSetPrivacy
       exit chSetPrivacy
    end if
    ask "Passphrase for this channel (leave blank to make it PUBLIC)." & return & \
-      "PRIVACY NOTE: this hides your file LIST from people without the passphrase. The files themselves are not yet encrypted - a magnet a follower decrypts still works for anyone. Share the passphrase out-of-band." \
+      "PRIVACY NOTE: a private channel encrypts its file list AND every file you publish to it. Share the passphrase out-of-band, never on the DHT. It does not hide your IP, and private publishing is one file at a time. Use a long, random passphrase." \
       with sChannels[sActive]["pass"]
    if it is empty and the result is "Cancel" then
       exit chSetPrivacy
@@ -605,7 +618,7 @@ command chSetPrivacy
       chLog "Channel '" & tName & "' is now PUBLIC."
    else if tR is 0 then
       -- the put was issued; the 'Announced to N node(s)' line confirms it landed
-      chLog "Channel '" & tName & "' is now PRIVATE - its ENCRYPTED feed was just published (watch for 'Announced to N node(s)'). Give followers the passphrase out-of-band. NOTE: the files themselves are not yet encrypted."
+      chLog "Channel '" & tName & "' is now PRIVATE - its encrypted feed was just published, and files you Publish to it from now on are encrypted before sharing. Give followers the passphrase out-of-band."
    else
       chLog "Channel '" & tName & "' is set PRIVATE but its encrypted feed could not be published right now - it will retry on the next 60-second tick."
    end if
@@ -727,18 +740,73 @@ command chChannelTick
 end chChannelTick
 
 -- ---- my channel --------------------------------------------------------------
+-- A PRIVATE channel encrypts a single FILE before sharing it; a PUBLIC channel
+-- packages a FOLDER in the clear, as before. The shared tail (feed update +
+-- announce) is chAddReleaseAndPublish.
 command chPublishFile
-   local tPath, tParent, tTitle, tData, tH, tHash, tMagnet, tRel, tR
+   local tPath, tParent, tTitle, tData, tH, tHash, tMagnet, tRel, tOrig, tEnc, tErr
    if sSession is 0 then
       chLog "No session."
       exit chPublishFile
    end if
+   if sChannels[sActive]["pass"] is not empty then
+      -- ---- PRIVATE: encrypt one file (chunked) before sharing it ----
+      if not sCanEncrypt then
+         chLog "This channel is private but this build cannot encrypt - publish is unavailable."
+         exit chPublishFile
+      end if
+      answer file "Choose a FILE to share privately (it is encrypted before it leaves your machine):"
+      put it into tPath
+      if tPath is empty then
+         exit chPublishFile
+      end if
+      replace "\" with "/" in tPath
+      set the itemDelimiter to "/"
+      put the last item of tPath into tOrig
+      put tOrig into tTitle
+      ask "Title for this release:" with tTitle
+      if it is not empty then
+         put it into tTitle
+      end if
+      replace return with space in tTitle
+      replace tab with space in tTitle
+      put chTempEncPath() into tEnc
+      set the itemDelimiter to "/"
+      put item 1 to -2 of tEnc into tParent   -- the temp folder the .enc lives in
+      chLog "Encrypting '" & tTitle & "' before sharing - the app may pause briefly on a large file..."
+      put chEncryptFile(tPath, tEnc, sChannels[sActive]["pass"]) into tErr
+      if tErr is not empty then
+         chLog "Could not encrypt:" && tErr
+         exit chPublishFile
+      end if
+      put btCreateTorrent(tEnc, 0, 0, chTrackers()) into tData
+      if tData is empty then
+         chLog "Create failed:" && btLastError()
+         exit chPublishFile
+      end if
+      put btAddTorrentFile(sSession, tData, tParent) into tH
+      if tH is 0 then
+         chLog "Seed-add failed:" && btLastError()
+         exit chPublishFile
+      end if
+      put btInfoHash(tH) into tHash
+      if tHash is empty then
+         chLog "No info-hash yet - try Publish again in a moment."
+         exit chPublishFile
+      end if
+      put true into sMineHashes[toLower(tHash)]
+      put "magnet:?xt=urn:btih:" & tHash into tMagnet
+      -- encrypted release entry: title TAB magnet TAB enc TAB originalFilename
+      put chTrunc(tTitle, 60) & tab & tMagnet & tab & "enc" & tab & tOrig into tRel
+      chAddReleaseAndPublish tRel, tTitle, "ENCRYPTED"
+      exit chPublishFile
+   end if
+   -- ---- PUBLIC: package a folder in the clear (any size), as before ----
    answer folder "Choose a folder to publish to your channel:"
    put it into tPath
    if tPath is empty then
       exit chPublishFile
    end if
-   -- separator-agnostic: normalise to "/" so the parent split works on Windows too
    replace "\" with "/" in tPath
    if the last char of tPath is "/" then
       delete the last char of tPath
@@ -771,40 +839,10 @@ command chPublishFile
       chLog "No info-hash yet - try Publish again in a moment."
       exit chPublishFile
    end if
-   -- remember this is something WE posted, so Transfers can mark it (vs downloads)
    put true into sMineHashes[toLower(tHash)]
    put "magnet:?xt=urn:btih:" & tHash & "&dn=" & urlEncode(tTitle) into tMagnet
-   -- prepend to our feed (newest first); each entry is "title TAB magnet"
    put chTrunc(tTitle, 60) & tab & tMagnet into tRel
-   if sMyReleases is empty then
-      put tRel into sMyReleases
-   else
-      put tRel & return & sMyReleases into sMyReleases
-   end if
-   put chBuildFeed(sMyName, sMyReleases) into sMyPost
-   -- drop the oldest releases until the feed fits the BEP44 1000-byte limit
-   repeat while (the number of bytes in textEncode(sMyPost, "UTF-8")) > 950 and the number of lines of sMyReleases > 1
-      delete the last line of sMyReleases
-      put chBuildFeed(sMyName, sMyReleases) into sMyPost
-   end repeat
-   -- persist the updated feed under the active channel so it survives a restart
-   put sMyReleases into sChannels[sActive]["releases"]
-   chSaveChannels
-   -- announce the feed (encrypted if this is a private channel; fail-closed)
-   put chPublishActiveFeed() into tR
-   if tR is -1 then
-      chLog "File is seeding, but this PRIVATE channel's feed could not be encrypted, so it was NOT announced. Fix its passphrase (Privacy) or make it public."
-      exit chPublishFile
-   end if
-   if tR is not 0 then
-      chLog "Publish to DHT failed:" && btLastError()
-      exit chPublishFile
-   end if
-   chUpdateNowPub
-   chLog "Published '" & tTitle & "' to channel '" & chActiveName() & "' and seeding it."
-   if sMyName is empty then
-      chLog "Tip: click Rename to give this channel a name your followers will see."
-   end if
+   chAddReleaseAndPublish tRel, tTitle, "PLAIN"
 end chPublishFile
 
 -- the active channel's name for display, or a placeholder when it is unnamed
@@ -949,7 +987,7 @@ command chUnfollow
 end chUnfollow
 
 command chDownloadSelected
-   local tL, tMag, tTitle, tH
+   local tL, tMag, tTitle, tH, tKey, tHash
    if sSession is 0 then
       exit chDownloadSelected
    end if
@@ -969,7 +1007,19 @@ command chDownloadSelected
       chLog "Download add failed:" && btLastError()
       exit chDownloadSelected
    end if
-   chLog "Downloading '" & tTitle & "'..."
+   if sFeedEnc[tL] is "enc" then
+      -- encrypted release: remember how to decrypt it once the .enc finishes.
+      -- We hold the channel's passphrase already (we decrypted its feed to see this).
+      put sFeedKey[tL] into tKey
+      put chHashFromMagnet(tMag) into tHash
+      if tHash is not empty then
+         put sFollowPass[tKey] into sPendingPass[tHash]
+         put sFeedOrigName[tL] into sPendingName[tHash]
+      end if
+      chLog "Downloading ENCRYPTED '" & tTitle & "' - it decrypts automatically when complete."
+   else
+      chLog "Downloading '" & tTitle & "'..."
+   end if
 end chDownloadSelected
 
 command chCopySelectedMagnet
@@ -997,6 +1047,8 @@ command chRefreshSubs
    put empty into sFeedKey
    put empty into sFeedMag
    put empty into sFeedTitle
+   put empty into sFeedEnc
+   put empty into sFeedOrigName
    repeat for each line tKey in sFollows
       if tKey is empty then
          next repeat
@@ -1029,7 +1081,14 @@ command chRefreshSubs
             put tKey into sFeedKey[tLineNum]
             put tMag into sFeedMag[tLineNum]
             put tTitle into sFeedTitle[tLineNum]
-            put tName & tab & chTrunc(tTitle, 50) & tab & chShortKey(tKey) & return after tRows
+            -- item 3 = "enc" marker, item 4 = original filename (encrypted release)
+            put item 3 of tRel into sFeedEnc[tLineNum]
+            put item 4 of tRel into sFeedOrigName[tLineNum]
+            if sFeedEnc[tLineNum] is "enc" then
+               put tName & tab & "[encrypted] " & chTrunc(tTitle, 38) & tab & chShortKey(tKey) & return after tRows
+            else
+               put tName & tab & chTrunc(tTitle, 50) & tab & chShortKey(tKey) & return after tRows
+            end if
          end if
       end repeat
    end repeat
@@ -1462,6 +1521,8 @@ command chHandleEvent pEvent
          break
       case "torrentFinished"
          chLog "* finished - now seeding torrent" && pEvent["torrent"]
+         -- if it was an encrypted download we tracked, decrypt it now
+         chMaybeDecryptFinished pEvent["torrent"]
          break
       default
          break
@@ -1480,12 +1541,11 @@ function chBuildFeed pName, pReleases
    return tFeed
 end chBuildFeed
 
--- ---- OPTIONAL feed encryption (Phase 1: metadata privacy) ---------------------
+-- ---- OPTIONAL feed encryption (the channel's file LIST) ----------------------
 -- A channel can carry a passphrase. If it does, its feed is AES-encrypted before
--- the DHT put, so only someone with the passphrase can read the file LIST. The
--- files themselves are NOT encrypted yet (a downloaded magnet still works for
--- anyone) - this hides the directory, not the contents. The feed stays
--- ed25519-signed on top, so authenticity is unchanged.
+-- the DHT put, so only someone with the passphrase can read the file LIST (the
+-- FILES are encrypted separately - see "Phase 2: actual FILE encryption" below).
+-- The feed stays ed25519-signed on top, so authenticity is unchanged.
 
 -- the 8-byte tag that marks an encrypted feed value on the wire
 function chEncMarker
@@ -1566,6 +1626,202 @@ function chPublishActiveFeed
    end if
    return btDhtPutMutable(sSession, sPub, sSec, "", tVal)
 end chPublishActiveFeed
+
+-- ---- Phase 2: actual FILE encryption (chunked) -------------------------------
+-- A private channel encrypts the FILE itself, not just the feed. We stream it in
+-- fixed chunks so a big file never has to fit in memory: read a chunk, AES-encrypt
+-- it (each chunk carries its own random salt via the engine), and frame it as
+-- [u32be cipherLen][cipher] after an 8-byte magic. The torrent then carries
+-- CIPHERTEXT under a neutral name, so a leaked magnet is useless; the real
+-- filename rides in the (encrypted) feed and is restored on download. BitTorrent's
+-- own piece hashes cover the ciphertext's integrity and ordering in transit.
+-- NOTE: encryption runs synchronously, so the UI pauses on a very large file - a
+-- streaming/async version is the planned libsodium upgrade.
+
+-- big-endian u32 <-> 4 bytes, so the framing is the same on every machine
+function chU32be pN
+   return numToByte((pN div 16777216) mod 256) & numToByte((pN div 65536) mod 256) & \
+      numToByte((pN div 256) mod 256) & numToByte(pN mod 256)
+end chU32be
+
+function chU32beDecode pBytes
+   return (byteToNum(byte 1 of pBytes) * 16777216) + (byteToNum(byte 2 of pBytes) * 65536) + \
+      (byteToNum(byte 3 of pBytes) * 256) + byteToNum(byte 4 of pBytes)
+end chU32beDecode
+
+-- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
+function chTempEncPath
+   local tBase
+   put specialFolderPath("temporary") into tBase
+   if tBase is empty then
+      put specialFolderPath("documents") into tBase
+   end if
+   return tBase & "/btxshare-" & the milliseconds & "-" & random(999999) & ".enc"
+end chTempEncPath
+
+-- the v1 info-hash inside a magnet, lowercased, or "" if none
+function chHashFromMagnet pMag
+   local tHash
+   if pMag contains "btih:" then
+      set the itemDelimiter to "btih:"
+      put item 2 of pMag into tHash
+      set the itemDelimiter to "&"
+      put item 1 of tHash into tHash
+      return toLower(tHash)
+   end if
+   return ""
+end chHashFromMagnet
+
+-- Encrypt pSrc to pDst in chunks. Returns "" on success, else an error string.
+function chEncryptFile pSrc, pDst, pPass
+   local tChunk, tCipher, tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      open file pSrc for binary read
+      if the result is not empty then
+         return ("cannot open the file to read: " & the result)
+      end if
+      open file pDst for binary write
+      if the result is not empty then
+         close file pSrc
+         return ("cannot open the encrypted file to write: " & the result)
+      end if
+      write textEncode(kEncMagic, "ASCII") to file pDst
+      repeat
+         read from file pSrc for kEncChunk
+         put it into tChunk
+         if tChunk is empty then
+            exit repeat
+         end if
+         encrypt tChunk using "aes-256-cbc" with password pPass
+         if the result is not empty then
+            close file pSrc
+            close file pDst
+            return ("encrypt error: " & the result)
+         end if
+         put it into tCipher
+         write chU32be(the number of bytes in tCipher) & tCipher to file pDst
+      end repeat
+      close file pSrc
+      close file pDst
+      return ""
+   catch tErr
+      return tErr
+   end try
+end chEncryptFile
+
+-- Decrypt pSrc (a .enc) to pDst. Returns "" on success, else an error string.
+function chDecryptFile pSrc, pDst, pPass
+   local tHdr, tLenBytes, tLen, tCipher, tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      open file pSrc for binary read
+      if the result is not empty then
+         return ("cannot open the encrypted file to read: " & the result)
+      end if
+      read from file pSrc for 8
+      put it into tHdr
+      if textDecode(tHdr, "ASCII") is not kEncMagic then
+         close file pSrc
+         return "not a TorrentXT encrypted file"
+      end if
+      open file pDst for binary write
+      if the result is not empty then
+         close file pSrc
+         return ("cannot open the output file to write: " & the result)
+      end if
+      repeat
+         read from file pSrc for 4
+         put it into tLenBytes
+         if tLenBytes is empty then
+            exit repeat
+         end if
+         if the number of bytes in tLenBytes < 4 then
+            close file pSrc
+            close file pDst
+            return "the encrypted file is truncated"
+         end if
+         put chU32beDecode(tLenBytes) into tLen
+         read from file pSrc for tLen
+         put it into tCipher
+         decrypt tCipher using "aes-256-cbc" with password pPass
+         if the result is not empty then
+            close file pSrc
+            close file pDst
+            return "wrong passphrase, or the file is corrupt"
+         end if
+         write it to file pDst
+      end repeat
+      close file pSrc
+      close file pDst
+      return ""
+   catch tErr
+      return tErr
+   end try
+end chDecryptFile
+
+-- Shared publish tail: prepend a release to the active channel's feed, trim it to
+-- the BEP44 budget, persist, and announce (encrypted if the channel is private).
+command chAddReleaseAndPublish pRel, pTitle, pKind
+   local tR
+   if sMyReleases is empty then
+      put pRel into sMyReleases
+   else
+      put pRel & return & sMyReleases into sMyReleases
+   end if
+   put chBuildFeed(sMyName, sMyReleases) into sMyPost
+   repeat while (the number of bytes in textEncode(sMyPost, "UTF-8")) > 950 and the number of lines of sMyReleases > 1
+      delete the last line of sMyReleases
+      put chBuildFeed(sMyName, sMyReleases) into sMyPost
+   end repeat
+   put sMyReleases into sChannels[sActive]["releases"]
+   chSaveChannels
+   put chPublishActiveFeed() into tR
+   if tR is -1 then
+      chLog "Seeding, but this PRIVATE channel's feed could not be encrypted, so it was NOT announced. Fix its passphrase (Privacy) or make it public."
+      exit chAddReleaseAndPublish
+   end if
+   if tR is not 0 then
+      chLog "Publish to DHT failed:" && btLastError()
+      exit chAddReleaseAndPublish
+   end if
+   chUpdateNowPub
+   if pKind is "ENCRYPTED" then
+      chLog "Published '" & pTitle & "' ENCRYPTED to channel '" & chActiveName() & "' and seeding it."
+   else
+      chLog "Published '" & pTitle & "' to channel '" & chActiveName() & "' and seeding it."
+   end if
+   if sMyName is empty then
+      chLog "Tip: click Rename to give this channel a name your followers will see."
+   end if
+end chAddReleaseAndPublish
+
+-- A download just finished: if we were tracking it as an encrypted release,
+-- decrypt the .enc to its original filename next to the download.
+command chMaybeDecryptFinished pTorrent
+   local tS, tHash, tSave, tEncName, tOut, tErr
+   put btTorrentStatus(pTorrent) into tS
+   put toLower(tS["infoHashV1"]) into tHash
+   if tHash is empty or sPendingPass[tHash] is empty then
+      exit chMaybeDecryptFinished   -- not an encrypted download we are tracking
+   end if
+   put tS["savePath"] into tSave
+   put tS["name"] into tEncName        -- the neutral .enc filename
+   put tSave & "/" & sPendingName[tHash] into tOut
+   chLog "Decrypting '" & sPendingName[tHash] & "' - the app may pause briefly on a large file..."
+   put chDecryptFile(tSave & "/" & tEncName, tOut, sPendingPass[tHash]) into tErr
+   if tErr is not empty then
+      chLog "Could not decrypt '" & sPendingName[tHash] & "':" && tErr
+   else
+      chLog "Decrypted to '" & sPendingName[tHash] & "' in" && tSave & ". (The encrypted copy is kept so you keep sharing it.)"
+   end if
+   put empty into sPendingPass[tHash]
+   put empty into sPendingName[tHash]
+end chMaybeDecryptFinished
 
 function chTrackers
    return "udp://tracker.opentrackr.org:1337/announce"
