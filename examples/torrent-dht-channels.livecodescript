@@ -27,6 +27,15 @@ script "dhtChannelsApp"
 -- every entry is cryptographically signed by its channel (tamper-proof: only the
 -- channel's secret key could have published it).
 --
+-- PRIVACY (optional): a channel is PUBLIC by default - anyone with its address
+-- reads the file list, anyone with a magnet downloads the file. Click "Privacy"
+-- to set a passphrase and the channel's FEED is AES-encrypted before the DHT put,
+-- so only someone with the passphrase (shared out-of-band) can read the file list.
+-- This is metadata privacy: the files themselves are NOT yet encrypted (a magnet a
+-- follower decrypts still works for anyone), and it does not hide your IP. Real
+-- file encryption is the planned next step. Fail-closed: a private channel that
+-- cannot be encrypted is never published in the clear.
+--
 -- Click any transfer to see the files inside it with a live per-file progress
 -- bar (btFileList); the transfers table shows inline progress bars too. Pause,
 -- Resume, Remove (keep or delete files), or Open Folder act on the selected
@@ -44,8 +53,10 @@ script "dhtChannelsApp"
 -- ---- stack-local state -------------------------------------------------------
 local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the loops are armed
-local sChannels         -- array: index -> {seed, name, releases} - all YOUR channels
+local sChannels         -- array: index -> {seed, name, releases, pass} - YOUR channels
 local sActive           -- index of the active channel (drives the sMy* cache below)
+local sCanEncrypt       -- "true" if the engine can encrypt/decrypt (OpenSSL present)
+local sFollowPass       -- array: followed pubkey -> its passphrase ("" = public)
 local sPub              -- active channel public key (hex) - shareable
 local sSec              -- active channel secret key (hex) - script only, never shown
 local sMyName           -- active channel display name
@@ -88,6 +99,9 @@ on mouseUp
          break
       case "chPublish"
          chPublishFile
+         break
+      case "chPrivacy"
+         chSetPrivacy
          break
       case "chFollow"
          chFollow
@@ -188,8 +202,9 @@ command chBuild
    chMakeField "chMyKey", "16,106,360,130", true
    chMakeButton "chCopyKey", "Copy", "368,106,452,130"
    chMakeButton "chRename", "Rename", "458,106,552,130"
-   chMakeButton "chPublish", "Publish a File...", "16,136,290,158"
-   chMakeLabel "chNowPub", "Not publishing yet.", "298,140,580,158", 9
+   chMakeButton "chPublish", "Publish a File...", "16,136,250,158"
+   chMakeButton "chPrivacy", "Privacy...", "256,136,372,158"
+   chMakeLabel "chNowPub", "Not publishing yet.", "378,140,580,158", 9
    chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,168,580,188"
    chMakeField "chFollowKey", "16,192,400,216", false
    chMakeButton "chFollow", "Follow", "408,192,492,216"
@@ -324,6 +339,7 @@ command chAddTips
    set the tooltip of button "chCopyKey" to "Copy this channel's card (its name + address) to the clipboard."
    set the tooltip of button "chRename" to "Give the active channel a friendly display name its followers will see."
    set the tooltip of button "chPublish" to "Pick a folder. It is packaged, seeded, and added to the active channel's feed."
+   set the tooltip of button "chPrivacy" to "Set a passphrase to hide this channel's file LIST (files are not yet encrypted)."
    set the tooltip of field "chFollowKey" to "Paste someone's channel card or 64-character address, then click Follow."
    set the tooltip of button "chFollow" to "Subscribe to that channel and fetch its signed list of files."
    set the tooltip of button "chRefresh" to "Re-fetch the latest files from every channel you follow."
@@ -355,9 +371,14 @@ command chHelp
    put tMsg & "1) YOUR CHANNELS - each is a personal feed. Publish a file and it is shared under that" & return into tMsg
    put tMsg & "   channel's own cryptographic key, so nobody else can post to it or forge it. You can" & return into tMsg
    put tMsg & "   keep several channels (New Channel / Rename / Delete) and switch between them." & return & return into tMsg
+   put tMsg & "   PRIVACY: by default a channel is PUBLIC - anyone with its address can read the file" & return into tMsg
+   put tMsg & "   list, and anyone with a magnet can download the file. Click Privacy to set a passphrase:" & return into tMsg
+   put tMsg & "   that hides the file LIST from people without it (share it out-of-band, never on the DHT)." & return into tMsg
+   put tMsg & "   NOTE: the files themselves are not yet encrypted, so this hides the directory, not the" & return into tMsg
+   put tMsg & "   contents, and it does not hide your IP address. Do not put anything truly sensitive here." & return & return into tMsg
    put tMsg & "2) CHANNELS YOU FOLLOW - paste someone's channel card to see their latest files. Pick" & return into tMsg
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
-   put tMsg & "   so it is tamper-proof." & return & return into tMsg
+   put tMsg & "   so it is tamper-proof. For a PRIVATE channel, Follow asks for its passphrase." & return & return into tMsg
    put tMsg & "3) TRANSFERS - a live view of what you are sending and receiving. GREEN rows are files" & return into tMsg
    put tMsg & "   you POSTED; BLUE rows are files you DOWNLOADED. Click one to see the files inside it" & return into tMsg
    put tMsg & "   (double-click opens its folder), and use Pause, Resume, Remove, or Open Folder. You" & return into tMsg
@@ -385,9 +406,14 @@ command chStart
    btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
+   -- can this build encrypt? gates the optional private-channel feature
+   put chCanEncrypt() into sCanEncrypt
    chEnsureIdentity
    chLoadFollows
    chUpdateNowPub
+   if not sCanEncrypt then
+      chLog "Note: this build cannot encrypt (no OpenSSL), so private channels are unavailable."
+   end if
    chLog "Session ready. DHT bootstrapping - give it a few seconds of peers before publishing or following."
    put "true" into sPolling
    send "chPollOnce" to me in 0 milliseconds
@@ -470,6 +496,9 @@ command chUpdateChannelMenu
       if tName is empty then
          put ("(unnamed channel " & tI & ")") into tName
       end if
+      if sChannels[tI]["pass"] is not empty then
+         put tName && "(private)" into tName
+      end if
       put tName & return after tItems
    end repeat
    if the last char of tItems is return then
@@ -513,14 +542,41 @@ command chRenameChannel
    put tName into sMyName
    put tName into sChannels[sActive]["name"]
    chSaveChannels
-   if sSession is not 0 and sSession is not empty then
-      put chBuildFeed(sMyName, sMyReleases) into sMyPost
-      btDhtPutMutable sSession, sPub, sSec, "", textEncode(sMyPost, "UTF-8")
-   end if
+   get chPublishActiveFeed()   -- re-announce so followers see the new name
    chUpdateChannelMenu
    chUpdateNowPub
    chLog "Renamed this channel to '" & sMyName & "'."
 end chRenameChannel
+
+-- Make the active channel private (set a passphrase) or public again (clear it).
+-- PHASE 1: this encrypts the FEED only - it hides your file list from anyone
+-- without the passphrase, but the files themselves are NOT yet encrypted, so a
+-- magnet that a follower decrypts still works for anyone. Share the passphrase
+-- with followers out-of-band (never on the DHT).
+command chSetPrivacy
+   local tPass
+   if not sCanEncrypt then
+      answer "This OpenXTalk build cannot encrypt (no OpenSSL), so private channels are unavailable on this machine."
+      exit chSetPrivacy
+   end if
+   ask "Passphrase for this channel (leave blank to make it PUBLIC)." & return & \
+      "PRIVACY NOTE: this hides your file LIST from people without the passphrase. The files themselves are not yet encrypted - a magnet a follower decrypts still works for anyone. Share the passphrase out-of-band." \
+      with sChannels[sActive]["pass"]
+   if it is empty and the result is "Cancel" then
+      exit chSetPrivacy
+   end if
+   put it into tPass
+   put tPass into sChannels[sActive]["pass"]
+   chSaveChannels
+   get chPublishActiveFeed()   -- re-announce under the new privacy setting
+   chUpdateChannelMenu
+   chUpdateNowPub
+   if tPass is empty then
+      chLog "Channel '" & sMyName & "' is now PUBLIC."
+   else
+      chLog "Channel '" & sMyName & "' is now PRIVATE (file list hidden). Give followers the passphrase out-of-band. The files themselves are not yet encrypted."
+   end if
+end chSetPrivacy
 
 -- delete the active channel (you must always keep at least one)
 command chDeleteChannel
@@ -545,6 +601,7 @@ command chDeleteChannel
          put sChannels[tI]["seed"] into tNew[tIdx]["seed"]
          put sChannels[tI]["name"] into tNew[tIdx]["name"]
          put sChannels[tI]["releases"] into tNew[tIdx]["releases"]
+         put sChannels[tI]["pass"] into tNew[tIdx]["pass"]
       end if
    end repeat
    put tNew into sChannels
@@ -555,9 +612,19 @@ command chDeleteChannel
 end chDeleteChannel
 
 command chLoadFollows
-   local tKey
+   local tKey, tEnc, tErr
    put the uFollows of this stack into sFollows
    put empty into sFollowFeeds
+   -- restore the per-channel passphrases for private channels we follow
+   put empty into sFollowPass
+   put the uFollowPass of this stack into tEnc
+   if tEnc is not empty then
+      try
+         put arrayDecode(tEnc) into sFollowPass
+      catch tErr
+         put empty into sFollowPass
+      end try
+   end if
    chRefreshSubs
    repeat for each line tKey in sFollows
       if tKey is not empty then
@@ -602,15 +669,20 @@ end chDashOnce
 -- every 60 s: keep EVERY one of your channels alive in the DHT (not just the
 -- active one, so they all stay reachable) and re-pull your subscriptions
 command chChannelTick
-   local tKey, tI, tKp, tFeed
+   local tKey, tI, tKp, tFeed, tVal
    if sPolling is not "true" then
       exit chChannelTick
    end if
    if sSession is not 0 and sSession is not empty then
       repeat with tI = 1 to chChannelCount()
          put chBuildFeed(sChannels[tI]["name"], sChannels[tI]["releases"]) into tFeed
-         put btDhtKeypair(sChannels[tI]["seed"]) into tKp
-         btDhtPutMutable sSession, tKp["publicKey"], tKp["secretKey"], "", textEncode(tFeed, "UTF-8")
+         -- encrypted for private channels; skip a private one we cannot encrypt
+         -- rather than ever re-announcing it in the clear (fail-closed)
+         put chFeedValue(tFeed, sChannels[tI]["pass"]) into tVal
+         if tVal is not empty then
+            put btDhtKeypair(sChannels[tI]["seed"]) into tKp
+            btDhtPutMutable sSession, tKp["publicKey"], tKp["secretKey"], "", tVal
+         end if
       end repeat
       repeat for each line tKey in sFollows
          if tKey is not empty then
@@ -685,7 +757,12 @@ command chPublishFile
    -- persist the updated feed under the active channel so it survives a restart
    put sMyReleases into sChannels[sActive]["releases"]
    chSaveChannels
-   put btDhtPutMutable(sSession, sPub, sSec, "", textEncode(sMyPost, "UTF-8")) into tR
+   -- announce the feed (encrypted if this is a private channel; fail-closed)
+   put chPublishActiveFeed() into tR
+   if tR is -1 then
+      chLog "File is seeding, but this PRIVATE channel's feed could not be encrypted, so it was NOT announced. Fix its passphrase (Privacy) or make it public."
+      exit chPublishFile
+   end if
    if tR is not 0 then
       chLog "Publish to DHT failed:" && btLastError()
       exit chPublishFile
@@ -703,12 +780,15 @@ command chUpdateNowPub
    end if
    put chChannelCount() into tTotal
    if tN is 0 then
-      put ("Active channel: " & tName & " - nothing published yet.") into tMsg
+      put ("Active: " & tName & " - nothing published yet.") into tMsg
    else
-      put ("Active channel: " & tName & " - seeding " & tN & " release(s).") into tMsg
+      put ("Active: " & tName & " - seeding " & tN & " release(s).") into tMsg
+   end if
+   if sChannels[sActive]["pass"] is not empty then
+      put tMsg && "[PRIVATE: file list hidden]" into tMsg
    end if
    if tTotal > 1 then
-      put tMsg && "(" & tTotal & " channels total.)" into tMsg
+      put tMsg && "(" & tTotal & " total)" into tMsg
    end if
    set the text of field "chNowPub" to tMsg
 end chUpdateNowPub
@@ -732,7 +812,7 @@ end chCopyKey
 
 -- ---- subscriptions / unified feed --------------------------------------------
 command chFollow
-   local tKey, tRaw
+   local tKey, tRaw, tPass, tDup
    if sSession is 0 then
       chLog "No session."
       exit chFollow
@@ -752,20 +832,32 @@ command chFollow
       chLog "That is your own channel."
       exit chFollow
    end if
-   if tKey is among the lines of sFollows then
-      chLog "Already following that channel."
+   put (tKey is among the lines of sFollows) into tDup
+   -- a private channel needs its passphrase; blank = public. Pre-fills the
+   -- existing one so following again is also how you set/change the passphrase.
+   ask "If this is a PRIVATE channel, enter its passphrase (leave blank for a public channel):" with sFollowPass[tKey]
+   if it is empty and the result is "Cancel" then
       exit chFollow
    end if
-   if sFollows is empty then
-      put tKey into sFollows
-   else
-      put sFollows & return & tKey into sFollows
+   put it into tPass
+   put tPass into sFollowPass[tKey]
+   set the uFollowPass of this stack to arrayEncode(sFollowPass)
+   if not tDup then
+      if sFollows is empty then
+         put tKey into sFollows
+      else
+         put sFollows & return & tKey into sFollows
+      end if
+      set the uFollows of this stack to sFollows
    end if
-   set the uFollows of this stack to sFollows
    put empty into field "chFollowKey"
    chRefreshSubs
    btDhtGetMutable sSession, tKey, ""
-   chLog "Following" && chShortKey(tKey) & ". Fetching their feed..."
+   if tDup then
+      chLog "Updated the passphrase for" && chShortKey(tKey) & ". Re-fetching its feed..."
+   else
+      chLog "Following" && chShortKey(tKey) & ". Fetching their feed..."
+   end if
 end chFollow
 
 command chRefreshAll
@@ -806,6 +898,8 @@ command chUnfollow
    put tLeft into sFollows
    set the uFollows of this stack to sFollows
    put empty into sFollowFeeds[tKey]
+   put empty into sFollowPass[tKey]
+   set the uFollowPass of this stack to arrayEncode(sFollowPass)
    chRefreshSubs
    chLog "Unfollowed" && chShortKey(tKey) & "."
 end chUnfollow
@@ -1288,13 +1382,25 @@ command chHandleEvent pEvent
    switch pEvent["name"]
       case "dhtMutableItem"
          put pEvent["publicKey"] into tKey
-         put textDecode(pEvent["value"], "UTF-8") into tVal
-         put tVal into sFollowFeeds[tKey]
-         chRefreshSubs
+         -- decrypt if this is a private channel we hold the passphrase for;
          -- libtorrent only surfaces a mutable item after verifying its ed25519
-         -- signature against the public key, so arrival == cryptographically verified
-         put chCountReleases(tVal) into tN
-         chLog "Channel" && chShortKey(tKey) && "feed: signature verified, v" & pEvent["seq"] & "," && tN && "release(s)."
+         -- signature, so arrival == cryptographically authentic (encryption rides
+         -- on top of that for confidentiality).
+         put chReadFeed(pEvent["value"], sFollowPass[tKey]) into tVal
+         if tVal is "LOCKED" then
+            put ("name=" & chShortKey(tKey) & " (private - needs passphrase)") into sFollowFeeds[tKey]
+            chRefreshSubs
+            chLog "Channel" && chShortKey(tKey) && "is private. Click Follow again with its passphrase to read it."
+         else if tVal is "BADPASS" then
+            put ("name=" & chShortKey(tKey) & " (wrong passphrase)") into sFollowFeeds[tKey]
+            chRefreshSubs
+            chLog "Channel" && chShortKey(tKey) && ": that passphrase did not unlock the feed."
+         else
+            put tVal into sFollowFeeds[tKey]
+            chRefreshSubs
+            put chCountReleases(tVal) into tN
+            chLog "Channel" && chShortKey(tKey) && "feed: signature verified, v" & pEvent["seq"] & "," && tN && "release(s)."
+         end if
          break
       case "dhtImmutableItem"
          set the text of field "chDropResult" to textDecode(pEvent["value"], "UTF-8")
@@ -1329,6 +1435,93 @@ function chBuildFeed pName, pReleases
    end repeat
    return tFeed
 end chBuildFeed
+
+-- ---- OPTIONAL feed encryption (Phase 1: metadata privacy) ---------------------
+-- A channel can carry a passphrase. If it does, its feed is AES-encrypted before
+-- the DHT put, so only someone with the passphrase can read the file LIST. The
+-- files themselves are NOT encrypted yet (a downloaded magnet still works for
+-- anyone) - this hides the directory, not the contents. The feed stays
+-- ed25519-signed on top, so authenticity is unchanged.
+
+-- the 8-byte tag that marks an encrypted feed value on the wire
+function chEncMarker
+   return "BTXENC1:"
+end chEncMarker
+
+-- one-time capability probe: can this engine actually encrypt/decrypt? (Some OXT
+-- builds ship without OpenSSL.) Result is cached in sCanEncrypt at startup.
+function chCanEncrypt
+   local tProbe, tCipher
+   put textEncode("probe", "ASCII") into tProbe
+   encrypt tProbe using "aes-256-cbc" with password "probe-key"
+   if the result is not empty then
+      return false
+   end if
+   put it into tCipher
+   decrypt tCipher using "aes-256-cbc" with password "probe-key"
+   if the result is not empty then
+      return false
+   end if
+   return (it is tProbe)
+end chCanEncrypt
+
+-- The bytes to publish for a feed: plaintext UTF-8 when public; marker+ciphertext
+-- when the channel has a passphrase. Returns EMPTY for a private channel we
+-- cannot encrypt, so the caller refuses to publish it in the clear (fail-closed).
+function chFeedValue pFeed, pPass
+   local tCipher
+   if pPass is empty then
+      return textEncode(pFeed, "UTF-8")
+   end if
+   if not sCanEncrypt then
+      return ""
+   end if
+   encrypt textEncode(pFeed, "UTF-8") using "aes-256-cbc" with password pPass
+   if the result is not empty then
+      return ""
+   end if
+   put it into tCipher
+   return (textEncode(chEncMarker(), "ASCII") & tCipher)
+end chFeedValue
+
+-- Turn a received feed value back into feed text. Returns the plaintext feed, or
+-- the sentinel "LOCKED" (encrypted, no passphrase) / "BADPASS" (passphrase did
+-- not work). A valid feed always begins with "name=", so it never collides.
+function chReadFeed pRaw, pPass
+   local tCipher, tPlain
+   if (the number of bytes in pRaw) > 8 and (textDecode(byte 1 to 8 of pRaw, "ASCII") is chEncMarker()) then
+      if pPass is empty or not sCanEncrypt then
+         return "LOCKED"
+      end if
+      put byte 9 to -1 of pRaw into tCipher
+      decrypt tCipher using "aes-256-cbc" with password pPass
+      if the result is not empty then
+         return "BADPASS"
+      end if
+      put textDecode(it, "UTF-8") into tPlain
+      if not (tPlain begins with "name=") then
+         return "BADPASS"
+      end if
+      return tPlain
+   end if
+   return textDecode(pRaw, "UTF-8")
+end chReadFeed
+
+-- Build the active channel's feed value and publish it (encrypted if private).
+-- Returns 0 on success, -1 if a private feed could not be encrypted (so it was
+-- NOT published), or the DHT put's own non-zero error code.
+function chPublishActiveFeed
+   local tVal
+   if sSession is 0 or sSession is empty then
+      return 0
+   end if
+   put chBuildFeed(sMyName, sMyReleases) into sMyPost
+   put chFeedValue(sMyPost, sChannels[sActive]["pass"]) into tVal
+   if tVal is empty then
+      return -1
+   end if
+   return btDhtPutMutable(sSession, sPub, sSec, "", tVal)
+end chPublishActiveFeed
 
 function chTrackers
    return "udp://tracker.opentrackr.org:1337/announce"
