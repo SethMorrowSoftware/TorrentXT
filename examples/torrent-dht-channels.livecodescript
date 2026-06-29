@@ -30,15 +30,21 @@ script "dhtChannelsApp"
 -- PRIVACY (optional): a channel is PUBLIC by default - anyone with its address
 -- reads the file list, anyone with a magnet downloads the file. Click "Privacy"
 -- to set a passphrase, and that channel encrypts BOTH its feed AND every file you
--- publish to it (AES-256). The feed is encrypted before the DHT put (the file list
--- is hidden), and each file is encrypted in chunks before it is shared, so the
--- torrent carries ciphertext under a neutral name - a leaked magnet is useless
--- without the passphrase, which followers get out-of-band. Downloads are decrypted
--- automatically. It still does NOT hide your IP or that you are sharing something,
--- and the passphrase KDF is the engine's (use a long, random passphrase); the
--- hardened version is the planned libsodium upgrade. Private publishing is one
--- file at a time and pauses briefly on a very large file. Fail-closed: a private
--- channel that cannot be encrypted is never published in the clear.
+-- publish to it with cryptoXT (libsodium): the key is derived from the passphrase
+-- with Argon2id (salted by the channel's public key), the feed is sealed with
+-- crypto_secretbox before the DHT put (the file list is hidden), and each file is
+-- sealed with crypto_secretstream before it is shared, so the torrent carries
+-- AUTHENTICATED ciphertext under a neutral name - a leaked magnet is useless
+-- without the passphrase, which followers get out-of-band, and tampering or
+-- truncation is detected on decrypt. Downloads are decrypted automatically. It
+-- still does NOT hide your IP or that you are sharing something. Private
+-- publishing is one file at a time and pauses briefly on a very large file.
+-- Fail-closed: a private channel that cannot be encrypted is never published in
+-- the clear.
+--
+-- REQUIRES, for the privacy features only, the cryptoXT extension
+-- (org.openxtalk.library.sodium) to be installed alongside this. Public channels
+-- and all non-encryption features work without it.
 --
 -- Click any transfer to see the files inside it with a live per-file progress
 -- bar (btFileList); the transfers table shows inline progress bars too. Pause,
@@ -59,7 +65,8 @@ local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the loops are armed
 local sChannels         -- array: index -> {seed, name, releases, pass} - YOUR channels
 local sActive           -- index of the active channel (drives the sMy* cache below)
-local sCanEncrypt       -- "true" if the engine can encrypt/decrypt (OpenSSL present)
+local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
+local sKeyCache         -- array: pubkeyHex&":"&pass -> 32-byte master key (Argon2id is slow)
 local sFollowPass       -- array: followed pubkey -> its passphrase ("" = public)
 local sPub              -- active channel public key (hex) - shareable
 local sSec              -- active channel secret key (hex) - script only, never shown
@@ -76,7 +83,7 @@ local sXferHandle       -- array: transfers-list line -> torrent handle
 
 local sFeedEnc          -- array: feed-list line -> "enc" if that release is encrypted
 local sFeedOrigName     -- array: feed-list line -> original filename (encrypted release)
-local sPendingPass      -- array: info-hash -> passphrase, for a download to decrypt
+local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for a download to decrypt
 local sXferName         -- array: info-hash -> real name to SHOW locally for an
                         --   encrypted transfer (the swarm only ever sees the .enc)
@@ -85,9 +92,6 @@ local sXferName         -- array: info-hash -> real name to SHOW locally for an
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
 constant kUiVersion = "channels-ui-2025-06b"
--- file-encryption framing (Phase 2): an 8-byte magic, then [u32be len][cipher]...
-constant kEncChunk = 4194304     -- 4 MiB of plaintext per encrypted chunk
-constant kEncMagic = "BTXFENC1"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -452,7 +456,7 @@ command chStart
    chLoadFollows
    chUpdateNowPub
    if not sCanEncrypt then
-      chLog "Note: this build cannot encrypt (no OpenSSL), so private channels are unavailable."
+      chLog "Note: cryptoXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
    end if
    chLog "Session ready. DHT bootstrapping - give it a few seconds of peers before publishing or following."
    put "true" into sPolling
@@ -597,7 +601,7 @@ end chRenameChannel
 command chSetPrivacy
    local tPass, tName, tR
    if not sCanEncrypt then
-      answer "This OpenXTalk build cannot encrypt (no OpenSSL), so private channels are unavailable on this machine."
+      answer "Private channels need cryptoXT (the org.openxtalk.library.sodium extension), which is not installed on this machine. Install it to use passphrases."
       exit chSetPrivacy
    end if
    ask "Passphrase for this channel (leave blank to make it PUBLIC)." & return & \
@@ -724,11 +728,11 @@ command chChannelTick
    if sSession is not 0 and sSession is not empty then
       repeat with tI = 1 to chChannelCount()
          put chBuildFeed(sChannels[tI]["name"], sChannels[tI]["releases"]) into tFeed
+         put btDhtKeypair(sChannels[tI]["seed"]) into tKp
          -- encrypted for private channels; skip a private one we cannot encrypt
          -- rather than ever re-announcing it in the clear (fail-closed)
-         put chFeedValue(tFeed, sChannels[tI]["pass"]) into tVal
+         put chFeedValue(tFeed, sChannels[tI]["pass"], tKp["publicKey"]) into tVal
          if tVal is not empty then
-            put btDhtKeypair(sChannels[tI]["seed"]) into tKp
             btDhtPutMutable sSession, tKp["publicKey"], tKp["secretKey"], "", tVal
          end if
       end repeat
@@ -754,7 +758,7 @@ command chPublishFile
    if sChannels[sActive]["pass"] is not empty then
       -- ---- PRIVATE: encrypt one file (chunked) before sharing it ----
       if not sCanEncrypt then
-         chLog "This channel is private but this build cannot encrypt - publish is unavailable."
+         chLog "This channel is private but cryptoXT is not installed - publish is unavailable. Install org.openxtalk.library.sodium."
          exit chPublishFile
       end if
       answer file "Choose a FILE to share privately (it is encrypted before it leaves your machine):"
@@ -776,7 +780,7 @@ command chPublishFile
       set the itemDelimiter to "/"
       put item 1 to -2 of tEnc into tParent   -- the temp folder the .enc lives in
       chLog "Encrypting '" & tTitle & "' before sharing - the app may pause briefly on a large file..."
-      put chEncryptFile(tPath, tEnc, sChannels[sActive]["pass"]) into tErr
+      put chEncryptFile(tPath, tEnc, chFileKey(sChannels[sActive]["pass"], sPub)) into tErr
       if tErr is not empty then
          chLog "Could not encrypt:" && tErr
          exit chPublishFile
@@ -1012,12 +1016,13 @@ command chDownloadSelected
       exit chDownloadSelected
    end if
    if sFeedEnc[tL] is "enc" then
-      -- encrypted release: remember how to decrypt it once the .enc finishes.
-      -- We hold the channel's passphrase already (we decrypted its feed to see this).
+      -- encrypted release: derive the file key now (we hold the channel's
+      -- passphrase, since we decrypted its feed to see this) and stash it so the
+      -- download can decrypt itself once the .enc finishes.
       put sFeedKey[tL] into tKey
       put chHashFromMagnet(tMag) into tHash
       if tHash is not empty then
-         put sFollowPass[tKey] into sPendingPass[tHash]
+         put chFileKey(sFollowPass[tKey], tKey) into sPendingKey[tHash]
          put sFeedOrigName[tL] into sPendingName[tHash]
          -- show the real release name locally instead of the neutral .enc name
          put tTitle into sXferName[tHash]
@@ -1508,7 +1513,7 @@ command chHandleEvent pEvent
          -- libtorrent only surfaces a mutable item after verifying its ed25519
          -- signature, so arrival == cryptographically authentic (encryption rides
          -- on top of that for confidentiality).
-         put chReadFeed(pEvent["value"], sFollowPass[tKey]) into tVal
+         put chReadFeed(pEvent["value"], sFollowPass[tKey], tKey) into tVal
          if tVal is "LOCKED" then
             put ("name=" & chShortKey(tKey) & " (private - needs passphrase)") into sFollowFeeds[tKey]
             chRefreshSubs
@@ -1561,67 +1566,101 @@ function chBuildFeed pName, pReleases
 end chBuildFeed
 
 -- ---- OPTIONAL feed encryption (the channel's file LIST) ----------------------
--- A channel can carry a passphrase. If it does, its feed is AES-encrypted before
--- the DHT put, so only someone with the passphrase can read the file LIST (the
--- FILES are encrypted separately - see "Phase 2: actual FILE encryption" below).
--- The feed stays ed25519-signed on top, so authenticity is unchanged.
+-- A channel can carry a passphrase. If it does, its feed is encrypted with
+-- cryptoXT (libsodium crypto_secretbox, XSalsa20-Poly1305) before the DHT put, so
+-- only someone with the passphrase can read the file LIST (the FILES are
+-- encrypted separately - see "Phase 2: actual FILE encryption" below). The
+-- symmetric key is derived from the passphrase with Argon2id (sxPwHash), salted
+-- by the channel's public key so publisher and followers derive the SAME key. The
+-- feed stays ed25519-signed on top, so authenticity is unchanged. Requires the
+-- org.openxtalk.library.sodium extension (cryptoXT) to be installed.
 
--- the 8-byte tag that marks an encrypted feed value on the wire
+-- the 8-byte tag that marks an encrypted feed value on the wire (v2 = libsodium;
+-- the old v1 AES format is intentionally not readable by this build)
 function chEncMarker
-   return "BTXENC1:"
+   return "BTXENC2:"
 end chEncMarker
 
--- one-time capability probe: can this engine actually encrypt/decrypt? (Some OXT
--- builds ship without OpenSSL.) Result is cached in sCanEncrypt at startup.
+-- A symmetric master key from the channel passphrase + the channel's PUBLIC key
+-- as the salt. The public key is shareable, which is fine for a salt: it just
+-- makes the derivation per-channel (the same passphrase on two channels yields
+-- different keys). Argon2id is deliberately slow, so cache the result per
+-- (pubkey, passphrase) and never re-derive it on the feed-refresh timer.
+function chMasterKey pPass, pPubHex
+   local tSalt, tCacheKey, tMaster
+   put pPubHex & ":" & pPass into tCacheKey
+   if sKeyCache[tCacheKey] is not empty then
+      return sKeyCache[tCacheKey]
+   end if
+   put byte 1 to 16 of sxHex2Bin(textEncode(pPubHex, "ASCII")) into tSalt
+   put sxPwHash(textEncode(pPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tMaster
+   put tMaster into sKeyCache[tCacheKey]
+   return tMaster
+end chMasterKey
+
+-- Distinct 32-byte subkeys for the feed vs the files, from the one master key, so
+-- a feed key never doubles as a file key. crypto_kdf (sxKdfDerive) is fast.
+function chFeedKey pPass, pPubHex
+   return sxKdfDerive(chMasterKey(pPass, pPubHex), "1", textEncode("btxfeed1", "ASCII"), 32)
+end chFeedKey
+
+function chFileKey pPass, pPubHex
+   return sxKdfDerive(chMasterKey(pPass, pPubHex), "2", textEncode("btxfile1", "ASCII"), 32)
+end chFileKey
+
+-- one-time capability probe: is cryptoXT (libsodium) installed and working? We do
+-- a real secretbox round-trip with a random key (fast - no Argon2id), wrapped in a
+-- try so a missing org.openxtalk.library.sodium is a clean "no", not an error.
+-- Result is cached in sCanEncrypt at startup.
 function chCanEncrypt
-   local tProbe, tCipher
-   put textEncode("probe", "ASCII") into tProbe
-   encrypt tProbe using "aes-256-cbc" with password "probe-key"
-   if the result is not empty then
+   local tKey, tBox, tOut, tErr
+   try
+      put sxRandomBytes(32) into tKey
+      put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
+      put sxSecretBoxOpen(tBox, tKey) into tOut
+   catch tErr
       return false
-   end if
-   put it into tCipher
-   decrypt tCipher using "aes-256-cbc" with password "probe-key"
-   if the result is not empty then
-      return false
-   end if
-   return (it is tProbe)
+   end try
+   return (textDecode(tOut, "ASCII") is "probe")
 end chCanEncrypt
 
--- The bytes to publish for a feed: plaintext UTF-8 when public; marker+ciphertext
--- when the channel has a passphrase. Returns EMPTY for a private channel we
--- cannot encrypt, so the caller refuses to publish it in the clear (fail-closed).
-function chFeedValue pFeed, pPass
-   local tCipher
+-- The bytes to publish for a feed: plaintext UTF-8 when public; marker+secretbox
+-- when the channel has a passphrase (the secretbox output is nonce || ciphertext
+-- || MAC, a fresh random nonce each publish). Returns EMPTY for a private channel
+-- we cannot encrypt, so the caller refuses to publish in the clear (fail-closed).
+function chFeedValue pFeed, pPass, pPubHex
+   local tBox, tErr
    if pPass is empty then
       return textEncode(pFeed, "UTF-8")
    end if
    if not sCanEncrypt then
       return ""
    end if
-   encrypt textEncode(pFeed, "UTF-8") using "aes-256-cbc" with password pPass
-   if the result is not empty then
+   try
+      put sxSecretBox(textEncode(pFeed, "UTF-8"), chFeedKey(pPass, pPubHex)) into tBox
+   catch tErr
       return ""
-   end if
-   put it into tCipher
-   return (textEncode(chEncMarker(), "ASCII") & tCipher)
+   end try
+   return (textEncode(chEncMarker(), "ASCII") & tBox)
 end chFeedValue
 
 -- Turn a received feed value back into feed text. Returns the plaintext feed, or
 -- the sentinel "LOCKED" (encrypted, no passphrase) / "BADPASS" (passphrase did
--- not work). A valid feed always begins with "name=", so it never collides.
-function chReadFeed pRaw, pPass
-   local tCipher, tPlain
+-- not work, OR the value was tampered - secretbox authenticates). A valid feed
+-- always begins with "name=", so it never collides with a sentinel.
+function chReadFeed pRaw, pPass, pPubHex
+   local tBox, tPlainData, tPlain, tErr
    if (the number of bytes in pRaw) > 8 and (textDecode(byte 1 to 8 of pRaw, "ASCII") is chEncMarker()) then
       if pPass is empty or not sCanEncrypt then
          return "LOCKED"
       end if
-      put byte 9 to -1 of pRaw into tCipher
-      decrypt tCipher using "aes-256-cbc" with password pPass
-      if the result is not empty then
+      put byte 9 to -1 of pRaw into tBox
+      try
+         put sxSecretBoxOpen(tBox, chFeedKey(pPass, pPubHex)) into tPlainData
+      catch tErr
          return "BADPASS"
-      end if
-      put textDecode(it, "UTF-8") into tPlain
+      end try
+      put textDecode(tPlainData, "UTF-8") into tPlain
       if not (tPlain begins with "name=") then
          return "BADPASS"
       end if
@@ -1639,34 +1678,23 @@ function chPublishActiveFeed
       return 0
    end if
    put chBuildFeed(sMyName, sMyReleases) into sMyPost
-   put chFeedValue(sMyPost, sChannels[sActive]["pass"]) into tVal
+   put chFeedValue(sMyPost, sChannels[sActive]["pass"], sPub) into tVal
    if tVal is empty then
       return -1
    end if
    return btDhtPutMutable(sSession, sPub, sSec, "", tVal)
 end chPublishActiveFeed
 
--- ---- Phase 2: actual FILE encryption (chunked) -------------------------------
--- A private channel encrypts the FILE itself, not just the feed. We stream it in
--- fixed chunks so a big file never has to fit in memory: read a chunk, AES-encrypt
--- it (each chunk carries its own random salt via the engine), and frame it as
--- [u32be cipherLen][cipher] after an 8-byte magic. The torrent then carries
--- CIPHERTEXT under a neutral name, so a leaked magnet is useless; the real
--- filename rides in the (encrypted) feed and is restored on download. BitTorrent's
--- own piece hashes cover the ciphertext's integrity and ordering in transit.
--- NOTE: encryption runs synchronously, so the UI pauses on a very large file - a
--- streaming/async version is the planned libsodium upgrade.
-
--- big-endian u32 <-> 4 bytes, so the framing is the same on every machine
-function chU32be pN
-   return numToByte((pN div 16777216) mod 256) & numToByte((pN div 65536) mod 256) & \
-      numToByte((pN div 256) mod 256) & numToByte(pN mod 256)
-end chU32be
-
-function chU32beDecode pBytes
-   return (byteToNum(byte 1 of pBytes) * 16777216) + (byteToNum(byte 2 of pBytes) * 65536) + \
-      (byteToNum(byte 3 of pBytes) * 256) + byteToNum(byte 4 of pBytes)
-end chU32beDecode
+-- ---- Phase 2: actual FILE encryption (cryptoXT secretstream) -----------------
+-- A private channel encrypts the FILE itself, not just the feed. cryptoXT streams
+-- it through libsodium's crypto_secretstream (XChaCha20-Poly1305) entirely C-side
+-- (sxEncryptFile), so a big file never enters a LiveCode Data and the per-chunk
+-- authentication + FINAL tag make truncation or tampering detectable on decrypt.
+-- The torrent then carries CIPHERTEXT under a neutral name, so a leaked magnet is
+-- useless; the real filename rides in the (encrypted) feed and is restored on
+-- download. The file key is chFileKey (derived from the passphrase, distinct from
+-- the feed key). NOTE: encryption is synchronous, so the UI pauses on a very large
+-- file. Requires the org.openxtalk.library.sodium extension (cryptoXT).
 
 -- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
 function chTempEncPath
@@ -1691,96 +1719,31 @@ function chHashFromMagnet pMag
    return ""
 end chHashFromMagnet
 
--- Encrypt pSrc to pDst in chunks. Returns "" on success, else an error string.
-function chEncryptFile pSrc, pDst, pPass
-   local tChunk, tCipher, tErr
+-- Encrypt pSrc to pDst with the 32-byte file key pKey (cryptoXT secretstream,
+-- streamed C-side). Returns "" on success, else an error string.
+function chEncryptFile pSrc, pDst, pKey
+   local tErr
    try
       if there is a file pDst then
          delete file pDst
       end if
-      open file pSrc for binary read
-      if the result is not empty then
-         return ("cannot open the file to read: " & the result)
-      end if
-      open file pDst for binary write
-      if the result is not empty then
-         close file pSrc
-         return ("cannot open the encrypted file to write: " & the result)
-      end if
-      write textEncode(kEncMagic, "ASCII") to file pDst
-      repeat
-         read from file pSrc for kEncChunk
-         put it into tChunk
-         if tChunk is empty then
-            exit repeat
-         end if
-         encrypt tChunk using "aes-256-cbc" with password pPass
-         if the result is not empty then
-            close file pSrc
-            close file pDst
-            return ("encrypt error: " & the result)
-         end if
-         put it into tCipher
-         write chU32be(the number of bytes in tCipher) & tCipher to file pDst
-      end repeat
-      close file pSrc
-      close file pDst
-      return ""
+      sxEncryptFile pSrc, pDst, pKey
    catch tErr
       return tErr
    end try
+   return ""
 end chEncryptFile
 
--- Decrypt pSrc (a .enc) to pDst. Returns "" on success, else an error string.
-function chDecryptFile pSrc, pDst, pPass
-   local tHdr, tLenBytes, tLen, tCipher, tErr
+-- Decrypt pSrc (a .enc) to pDst with the 32-byte file key pKey. cryptoXT throws on
+-- a wrong key or a truncated/corrupt input. Returns "" on success, else the error.
+function chDecryptFile pSrc, pDst, pKey
+   local tErr
    try
-      if there is a file pDst then
-         delete file pDst
-      end if
-      open file pSrc for binary read
-      if the result is not empty then
-         return ("cannot open the encrypted file to read: " & the result)
-      end if
-      read from file pSrc for 8
-      put it into tHdr
-      if textDecode(tHdr, "ASCII") is not kEncMagic then
-         close file pSrc
-         return "not a TorrentXT encrypted file"
-      end if
-      open file pDst for binary write
-      if the result is not empty then
-         close file pSrc
-         return ("cannot open the output file to write: " & the result)
-      end if
-      repeat
-         read from file pSrc for 4
-         put it into tLenBytes
-         if tLenBytes is empty then
-            exit repeat
-         end if
-         if the number of bytes in tLenBytes < 4 then
-            close file pSrc
-            close file pDst
-            return "the encrypted file is truncated"
-         end if
-         put chU32beDecode(tLenBytes) into tLen
-         read from file pSrc for tLen
-         put it into tCipher
-         decrypt tCipher using "aes-256-cbc" with password pPass
-         if the result is not empty then
-            close file pSrc
-            close file pDst
-            return "wrong passphrase, or the file is corrupt"
-         end if
-         write it to file pDst
-      end repeat
-      close file pSrc
-      close file pDst
-      return ""
+      sxDecryptFile pSrc, pDst, pKey
    catch tErr
       return tErr
    end try
+   return ""
 end chDecryptFile
 
 -- Shared publish tail: prepend a release to the active channel's feed, trim it to
@@ -1793,7 +1756,9 @@ command chAddReleaseAndPublish pRel, pTitle, pKind
       put pRel & return & sMyReleases into sMyReleases
    end if
    put chBuildFeed(sMyName, sMyReleases) into sMyPost
-   repeat while (the number of bytes in textEncode(sMyPost, "UTF-8")) > 950 and the number of lines of sMyReleases > 1
+   -- 920, not the full ~1000 BEP44 budget: a private channel's secretbox adds 48
+   -- bytes (8 marker + 24 nonce + 16 MAC), so the encrypted value still fits.
+   repeat while (the number of bytes in textEncode(sMyPost, "UTF-8")) > 920 and the number of lines of sMyReleases > 1
       delete the last line of sMyReleases
       put chBuildFeed(sMyName, sMyReleases) into sMyPost
    end repeat
@@ -1822,23 +1787,24 @@ end chAddReleaseAndPublish
 -- A download just finished: if we were tracking it as an encrypted release,
 -- decrypt the .enc to its original filename next to the download.
 command chMaybeDecryptFinished pTorrent
-   local tS, tHash, tSave, tEncName, tOut, tErr
+   local tS, tHash, tSave, tEncName, tEncPath, tOut, tErr
    put btTorrentStatus(pTorrent) into tS
    put toLower(tS["infoHashV1"]) into tHash
-   if tHash is empty or sPendingPass[tHash] is empty then
+   if tHash is empty or sPendingKey[tHash] is empty then
       exit chMaybeDecryptFinished   -- not an encrypted download we are tracking
    end if
    put tS["savePath"] into tSave
    put tS["name"] into tEncName        -- the neutral .enc filename
+   put tSave & "/" & tEncName into tEncPath
    put tSave & "/" & sPendingName[tHash] into tOut
    chLog "Decrypting '" & sPendingName[tHash] & "' - the app may pause briefly on a large file..."
-   put chDecryptFile(tSave & "/" & tEncName, tOut, sPendingPass[tHash]) into tErr
+   put chDecryptFile(tEncPath, tOut, sPendingKey[tHash]) into tErr
    if tErr is not empty then
       chLog "Could not decrypt '" & sPendingName[tHash] & "':" && tErr
    else
       chLog "Decrypted to '" & sPendingName[tHash] & "' in" && tSave & ". (The encrypted copy is kept so you keep sharing it.)"
    end if
-   put empty into sPendingPass[tHash]
+   put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]
 end chMaybeDecryptFinished
 
