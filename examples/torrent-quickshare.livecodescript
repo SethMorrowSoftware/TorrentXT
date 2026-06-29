@@ -20,13 +20,39 @@ script "quickShareApp"
 -- file and lets the DHT introduce the two machines, so no tracker or server is
 -- needed. Keep the sending window open until your friend has the whole file.
 --
+-- OPTIONAL ENCRYPTION: type a passphrase before dropping a file and it is
+-- encrypted end-to-end. Only the CIPHERTEXT (under a neutral .enc name) ever hits
+-- the swarm; the real filename rides inside the (now longer) share code, and the
+-- passphrase - which you give your friend separately - is what unlocks the bytes.
+-- The receiver types the same passphrase, and the file unlocks automatically when
+-- the download completes. Same chunked AES framing as the channels demo.
+--
 -- Single-thread playbook: a 250 ms poll drains events and a 1 s loop repaints the
 -- Transfers list. The heavy bytes move on libtorrent's own threads, never script.
 
 -- ---- stack-local state -------------------------------------------------------
 local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the poll/repaint loops are armed
-local sShareCode        -- the most recent file's share code (info-hash hex)
+local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
+local sCanEncrypt       -- "true" if AES round-trips on this build (probed at start)
+local sPendingPass      -- array: info-hash -> passphrase, for a download to decrypt
+local sPendingName      -- array: info-hash -> original filename, for that download
+local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
+local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned on close)
+
+-- Optional end-to-end encryption (mirrors the channels demo). A passphrase turns
+-- a share into ciphertext under a NEUTRAL name: the swarm only ever sees the .enc
+-- blob, the real filename rides inside the share code, and the passphrase (shared
+-- separately) is what actually unlocks the bytes. Same chunked AES framing as the
+-- channels demo so the two stay in step.
+constant kEncChunk = 4194304     -- 4 MiB of plaintext per encrypted chunk
+constant kEncMagic = "BTXFENC1"  -- 8-byte header at the front of every .enc file
+constant kCodePrefix = "BTXQS1:" -- marks an encrypted share code (vs a bare hash)
+
+-- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
+-- so updating the script in a SAVED stack picks up the new layout (passphrase
+-- fields and all) instead of keeping the old controls around.
+constant kQsUiVersion = "qs-ui-2026-06"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -89,14 +115,17 @@ on mouseUp
    end switch
 end mouseUp
 
--- ---- self-building UI (idempotent) -------------------------------------------
+-- ---- self-building UI (idempotent; rebuilds on a UI-version bump) ------------
 command qsBuild
-   if there is a field "qsLog" then
+   -- a normal re-open with a matching version + the passphrase fields present is
+   -- a fast no-op; a script update that changed the layout rebuilds from scratch.
+   if the uUiVersion of this stack is kQsUiVersion and there is a field "qsSendPass" then
       exit qsBuild
    end if
+   qsClearGeneratedUI
    lock screen
    set the width of this stack to 620
-   set the height of this stack to 610
+   set the height of this stack to 664
    set the backgroundColor of this card to "237,239,243"
    set the title of this stack to "TorrentXT - Quick Share"
    -- title band
@@ -105,10 +134,13 @@ command qsBuild
    set the backgroundColor of field "qsTitle" to "44,90,160"
    set the foregroundColor of field "qsTitle" to "255,255,255"
    set the textStyle of field "qsTitle" to "bold"
-   qsLabel "qsTagline", "Send a file straight to a friend with a short code. No server, no size limit, no upload first - peer-to-peer.", "24,50,596,72", 10
+   qsLabel "qsTagline", "Send a file straight to a friend with a short code. No server, no size limit, no upload first - peer-to-peer.", "24,48,596,70", 10
    set the foregroundColor of field "qsTagline" to "90,96,105"
-   -- SEND: the drop area + the resulting code
-   qsField "qsDrop", "24,84,596,196", true
+   -- SEND: an OPTIONAL passphrase (set it BEFORE dropping to encrypt), the drop
+   -- area, then the resulting code.
+   qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
+   qsField "qsSendPass", "304,74,596,98", false
+   qsField "qsDrop", "24,104,596,206", true
    set the opaque of field "qsDrop" to true
    set the backgroundColor of field "qsDrop" to "245,247,250"
    set the borderWidth of field "qsDrop" to 1
@@ -118,40 +150,62 @@ command qsBuild
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
    set the text of field "qsDrop" to (return & return & "Drag a file here to share" & return & return & "(or click to choose a file)")
-   qsLabel "qsSharing", "", "24,202,596,222", 10
+   qsLabel "qsSharing", "", "24,212,596,232", 10
    set the textStyle of field "qsSharing" to "bold"
-   qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,228,596,246", 10
-   qsField "qsCode", "24,248,490,282", true
+   qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,238,596,256", 10
+   qsField "qsCode", "24,258,490,292", true
    set the textFont of field "qsCode" to "Courier"
-   set the textSize of field "qsCode" to 14
+   set the textSize of field "qsCode" to 12
    set the opaque of field "qsCode" to true
    set the backgroundColor of field "qsCode" to "255,250,225"
-   qsButton "qsCopy", "Copy", "500,250,596,280"
-   -- RECEIVE: paste a code, download
-   qsSection "qsRecvSec", "Receive a file", "24,298,596,320"
-   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,326,596,344", 10
-   qsField "qsRecvCode", "24,348,490,380", false
+   qsButton "qsCopy", "Copy", "500,260,596,290"
+   -- RECEIVE: paste a code, an optional passphrase (only if it is locked), download
+   qsSection "qsRecvSec", "Receive a file", "24,308,596,330"
+   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,336,596,354", 10
+   qsField "qsRecvCode", "24,358,490,390", false
    set the textFont of field "qsRecvCode" to "Courier"
    set the textSize of field "qsRecvCode" to 11
-   qsButton "qsGet", "Download", "500,348,596,380"
+   qsButton "qsGet", "Download", "500,358,596,390"
+   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,396,300,416", 10
+   qsField "qsRecvPass", "304,394,596,418", false
    -- TRANSFERS: see it working
-   qsSection "qsXferSec", "Transfers", "24,396,596,418"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,422,596,440", 9
+   qsSection "qsXferSec", "Transfers", "24,430,596,452"
+   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,456,596,474", 9
    set the tabStops of field "qsXferHead" to "210,330"
    set the textFont of field "qsXferHead" to "Courier"
    set the textSize of field "qsXferHead" to 9
-   qsList "qsXfers", "24,442,596,524", false
+   qsList "qsXfers", "24,476,596,556", false
    set the tabStops of field "qsXfers" to "210,330"
    set the textFont of field "qsXfers" to "Courier"
    set the textSize of field "qsXfers" to 10
-   qsLabel "qsStatus", "", "24,528,596,548", 10
+   qsLabel "qsStatus", "", "24,560,596,580", 10
    set the foregroundColor of field "qsStatus" to "90,96,105"
    -- a small activity log
-   qsList "qsLog", "24,554,596,600", true
+   qsList "qsLog", "24,586,596,652", true
    set the textSize of field "qsLog" to 9
    qsAddTips
+   set the uUiVersion of this stack to kQsUiVersion
    unlock screen
 end qsBuild
+
+-- Delete every generated control (named "qs...") top-down so a kQsUiVersion bump
+-- can rebuild the UI from scratch in a saved stack without leaving stale controls
+-- behind. Controls the user added (not named "qs...") are left untouched.
+command qsClearGeneratedUI
+   local tI
+   lock screen
+   repeat with tI = the number of fields of this card down to 1
+      if the short name of field tI of this card begins with "qs" then
+         delete field tI of this card
+      end if
+   end repeat
+   repeat with tI = the number of buttons of this card down to 1
+      if the short name of button tI of this card begins with "qs" then
+         delete button tI of this card
+      end if
+   end repeat
+   unlock screen
+end qsClearGeneratedUI
 
 command qsLabel pName, pText, pRect, pSize
    if there is no field pName then
@@ -209,10 +263,12 @@ command qsList pName, pRect, pIsLog
 end qsList
 
 command qsAddTips
+   set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
    set the tooltip of field "qsDrop" to "Drag a file here, or click to choose one, to share it."
    set the tooltip of field "qsCode" to "Your file's share code. Click Copy and send it to your friend."
    set the tooltip of button "qsCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
+   set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your Quick Share folder."
    set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
 end qsAddTips
@@ -232,17 +288,35 @@ command qsStart
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    put "true" into sPolling
-   qsLog "Ready. Drag a file to share it, or paste a code to download. Give the network a few seconds first."
+   -- probe AES once so the passphrase fields can fail closed on a build without it
+   put qsCanEncrypt() into sCanEncrypt
+   if sCanEncrypt then
+      qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
+   else
+      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption is unavailable on this build.)"
+   end if
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
 
 command qsStop
+   local tKey, tErr
    put "false" into sPolling
    if sSession is not empty and sSession is not 0 then
       btStopSession sSession
    end if
    put empty into sSession
+   -- the session is stopped (so we are no longer seeding them); remove any temp
+   -- .enc files we created for encrypted shares so they do not pile up.
+   repeat for each key tKey in sTempEnc
+      try
+         if there is a file sTempEnc[tKey] then
+            delete file sTempEnc[tKey]
+         end if
+      catch tErr
+      end try
+   end repeat
+   put empty into sTempEnc
 end qsStop
 
 command qsPollOnce
@@ -269,8 +343,13 @@ command qsDashOnce
 end qsDashOnce
 
 -- ---- sending: turn a dropped/chosen file into a seeded torrent + a code ------
+-- Without a passphrase this is the original flow: package the file and seed it,
+-- the code IS its info-hash. With a passphrase we encrypt the file to a temp .enc
+-- first and seed THAT (a neutral name, ciphertext bytes); the code then carries
+-- the hash plus the real filename so the receiver can name + unlock it.
 command qsShareFile pPath
-   local tData, tH, tHash, tParent, tName
+   local tData, tH, tHash, tParent, tName, tPass
+   local tEncPath, tEncParent, tErr
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsShareFile
@@ -293,27 +372,69 @@ command qsShareFile pPath
    if tParent is empty then
       put "/" into tParent
    end if
-   qsLog "Packaging" && quote & tName & quote & "..."
-   -- create the torrent (auto piece size, a public tracker to help) and seed it
-   put btCreateTorrent(pPath, 0, 0, qsTracker()) into tData
-   if tData is empty then
-      qsLog "Could not package that file:" && btLastError()
-      exit qsShareFile
+   put qsTrim(field "qsSendPass") into tPass
+   if tPass is not empty and not sCanEncrypt then
+      qsLog "This OXT build cannot encrypt (AES unavailable) - sharing WITHOUT a passphrase."
+      put empty into tPass
    end if
-   put btAddTorrentFile(sSession, tData, tParent) into tH
-   if tH is 0 then
-      qsLog "Could not start sharing:" && btLastError()
-      exit qsShareFile
+   if tPass is empty then
+      -- plaintext share (original behaviour): seed the file as-is
+      qsLog "Packaging" && quote & tName & quote & "..."
+      put btCreateTorrent(pPath, 0, 0, qsTracker()) into tData
+      if tData is empty then
+         qsLog "Could not package that file:" && btLastError()
+         exit qsShareFile
+      end if
+      put btAddTorrentFile(sSession, tData, tParent) into tH
+      if tH is 0 then
+         qsLog "Could not start sharing:" && btLastError()
+         exit qsShareFile
+      end if
+      put btInfoHash(tH) into tHash
+      if tHash is empty then
+         qsLog "Almost - the code is not ready yet. Drop the file again in a moment."
+         exit qsShareFile
+      end if
+      put tHash into sShareCode
+      set the text of field "qsCode" to tHash
+      set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " (not encrypted) - keep this window open so your friend can download.")
+      qsLog "Got a code for" && quote & tName & quote & ". Click Copy and send it to your friend."
+   else
+      -- encrypted share: encrypt to a temp .enc, then seed the ciphertext
+      put qsTempEncPath() into tEncPath
+      qsLog "Encrypting" && quote & tName & quote & "- the app may pause briefly on a large file..."
+      put qsEncryptFile(pPath, tEncPath, tPass) into tErr
+      if tErr is not empty then
+         qsLog "Could not encrypt" && quote & tName & quote & ":" && tErr
+         exit qsShareFile
+      end if
+      set the itemDelimiter to "/"
+      put item 1 to -2 of tEncPath into tEncParent
+      if tEncParent is empty then
+         put "/" into tEncParent
+      end if
+      put btCreateTorrent(tEncPath, 0, 0, qsTracker()) into tData
+      if tData is empty then
+         qsLog "Could not package the encrypted file:" && btLastError()
+         exit qsShareFile
+      end if
+      put btAddTorrentFile(sSession, tData, tEncParent) into tH
+      if tH is 0 then
+         qsLog "Could not start sharing:" && btLastError()
+         exit qsShareFile
+      end if
+      put btInfoHash(tH) into tHash
+      if tHash is empty then
+         qsLog "Almost - the code is not ready yet. Drop the file again in a moment."
+         exit qsShareFile
+      end if
+      put tName into sXferName[toLower(tHash)]    -- show the REAL name locally
+      put tEncPath into sTempEnc[toLower(tHash)]  -- clean up on close
+      put qsMakeCode(tHash, tName) into sShareCode
+      set the text of field "qsCode" to sShareCode
+      set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " ENCRYPTED - send the code AND tell your friend the passphrase separately.")
+      qsLog "Encrypted" && quote & tName & quote & ". Send the code (Copy) AND the passphrase - your friend needs both."
    end if
-   put btInfoHash(tH) into tHash
-   if tHash is empty then
-      qsLog "Almost - the code is not ready yet. Drop the file again in a moment."
-      exit qsShareFile
-   end if
-   put tHash into sShareCode
-   set the text of field "qsCode" to tHash
-   set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " - keep this window open so your friend can download.")
-   qsLog "Got a code for" && quote & tName & quote & ". Click Copy and send it to your friend."
 end qsShareFile
 
 command qsBrowseFile
@@ -334,8 +455,12 @@ command qsCopyCode
 end qsCopyCode
 
 -- ---- receiving: a code becomes a download ------------------------------------
+-- A plain code is a magnet or a bare info-hash (the original flow). A code that
+-- begins with the BTXQS1: prefix is a LOCKED share: it carries the info-hash and
+-- the real filename, and needs the passphrase. We stash the passphrase + name
+-- against the hash so qsMaybeDecryptFinished can unlock the .enc when it lands.
 command qsGetFile
-   local tCode, tMag, tH
+   local tCode, tMag, tH, tHash, tName, tPass, tRest, tB64
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsGetFile
@@ -345,29 +470,67 @@ command qsGetFile
       qsLog "Paste a code from your friend first."
       exit qsGetFile
    end if
-   -- accept a full magnet link, or a bare 40-hex (v1) / 64-hex (v2) info-hash
-   if tCode begins with "magnet:" then
-      put tCode into tMag
-   else
-      put toLower(tCode) into tCode
-      if the number of chars of tCode is not 40 and the number of chars of tCode is not 64 then
-         qsLog "That does not look like a share code (it should be 40 characters)."
+   put qsTrim(field "qsRecvPass") into tPass
+   if tCode begins with kCodePrefix then
+      -- locked share code: BTXQS1:<hash>:<base64 of the original filename>
+      if not sCanEncrypt then
+         qsLog "This code is locked, but this OXT build cannot decrypt (AES unavailable)."
          exit qsGetFile
       end if
-      put "magnet:?xt=urn:btih:" & tCode & "&tr=" & qsTracker() into tMag
+      if tPass is empty then
+         qsLog "This code is LOCKED - type the passphrase your friend gave you, then click Download."
+         exit qsGetFile
+      end if
+      put char ((the number of chars of kCodePrefix) + 1) to -1 of tCode into tRest
+      set the itemDelimiter to ":"
+      put item 1 of tRest into tHash
+      put item 2 of tRest into tB64
+      put toLower(tHash) into tHash
+      if the number of chars of tHash is not 40 and the number of chars of tHash is not 64 then
+         qsLog "That locked code looks damaged (bad hash)."
+         exit qsGetFile
+      end if
+      put textDecode(base64Decode(tB64), "UTF-8") into tName
+      if tName is empty then
+         put ("shared-file-" & tHash) into tName
+      end if
+      put tPass into sPendingPass[tHash]
+      put tName into sPendingName[tHash]
+      put tName into sXferName[tHash]            -- show the real name while it downloads
+      put "magnet:?xt=urn:btih:" & tHash & "&tr=" & qsTracker() into tMag
+      put btAddMagnet(sSession, tMag, qsSaveFolder()) into tH
+      if tH is 0 then
+         qsLog "Could not start the download:" && btLastError()
+         exit qsGetFile
+      end if
+      put empty into field "qsRecvCode"
+      qsLog "Downloading the locked file" && quote & tName & quote & " to" && qsSaveFolder() & " - it unlocks automatically when complete."
+   else
+      -- accept a full magnet link, or a bare 40-hex (v1) / 64-hex (v2) info-hash
+      if tCode begins with "magnet:" then
+         put tCode into tMag
+      else
+         put toLower(tCode) into tCode
+         if the number of chars of tCode is not 40 and the number of chars of tCode is not 64 then
+            qsLog "That does not look like a share code (it should be 40 characters)."
+            exit qsGetFile
+         end if
+         put "magnet:?xt=urn:btih:" & tCode & "&tr=" & qsTracker() into tMag
+      end if
+      put btAddMagnet(sSession, tMag, qsSaveFolder()) into tH
+      if tH is 0 then
+         qsLog "Could not start the download:" && btLastError()
+         exit qsGetFile
+      end if
+      put empty into field "qsRecvCode"
+      qsLog "Downloading to" && qsSaveFolder() & ". Watch the Transfers list - your friend must be online."
    end if
-   put btAddMagnet(sSession, tMag, qsSaveFolder()) into tH
-   if tH is 0 then
-      qsLog "Could not start the download:" && btLastError()
-      exit qsGetFile
-   end if
-   put empty into field "qsRecvCode"
-   qsLog "Downloading to" && qsSaveFolder() & ". Watch the Transfers list - your friend must be online."
 end qsGetFile
 
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
+   local tIH, tDisp, tDir
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
    end if
@@ -384,7 +547,16 @@ command qsRefreshXfers
       put btTorrentStatus(tH) into tS
       add 1 to tLineNum
       put (the round of (tS["progress"] * 1000) / 10) into tPct
-      put qsTrunc(tS["name"], 26) & tab & qsRole(tS["state"]) & tab & qsBar(tPct) & return after tRows
+      -- show the REAL name for an encrypted transfer (the swarm sees the .enc
+      -- name); mark it "(locked)" so it is obvious it is end-to-end encrypted.
+      put toLower(tS["infoHashV1"]) into tIH
+      put tS["name"] into tDisp
+      put qsRole(tS["state"]) into tDir
+      if tIH is not empty and sXferName[tIH] is not empty then
+         put sXferName[tIH] into tDisp
+         put tDir && "(locked)" into tDir
+      end if
+      put qsTrunc(tDisp, 26) & tab & tDir & tab & qsBar(tPct) & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
    end repeat
@@ -416,6 +588,8 @@ command qsHandleEvent pEvent
          qsLog "Got the details for" && pEvent["torrentName"] & " - downloading the file now..."
          break
       case "torrentFinished"
+         -- a locked download decrypts itself here (a no-op for a plain download)
+         qsMaybeDecryptFinished pEvent["torrent"]
          qsLog "Download complete. Saved in" && qsSaveFolder() & "."
          qsRefreshXfers
          break
@@ -510,6 +684,175 @@ function qsTrim pText
    end repeat
    return tT
 end qsTrim
+
+-- ---- optional end-to-end encryption (chunked AES, mirrors the channels demo) -
+-- Does AES round-trip on this build? Probed once at start so the passphrase
+-- fields can fail closed rather than silently sharing in the clear.
+function qsCanEncrypt
+   local tProbe, tCipher
+   put textEncode("probe", "ASCII") into tProbe
+   encrypt tProbe using "aes-256-cbc" with password "probe-key"
+   if the result is not empty then
+      return false
+   end if
+   put it into tCipher
+   decrypt tCipher using "aes-256-cbc" with password "probe-key"
+   if the result is not empty then
+      return false
+   end if
+   return (it is tProbe)
+end qsCanEncrypt
+
+-- Build the locked share code: a prefix, the .enc info-hash, and the original
+-- filename (base64'd so it survives as plain ASCII inside the code). The colon is
+-- a safe delimiter because neither a hex hash nor base64 ever contains one.
+function qsMakeCode pHash, pName
+   local tB64
+   put base64Encode(textEncode(pName, "UTF-8")) into tB64
+   -- base64Encode wraps long input; strip CR + LF so the code stays a single line
+   replace numToChar(13) with "" in tB64
+   replace numToChar(10) with "" in tB64
+   return kCodePrefix & pHash & ":" & tB64
+end qsMakeCode
+
+-- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
+function qsTempEncPath
+   local tBase
+   put specialFolderPath("temporary") into tBase
+   if tBase is empty then
+      put specialFolderPath("documents") into tBase
+   end if
+   return tBase & "/btxshare-" & the milliseconds & "-" & random(999999) & ".enc"
+end qsTempEncPath
+
+-- big-endian u32 <-> 4 bytes, so the chunk framing is identical on every machine
+function qsU32be pN
+   return numToByte((pN div 16777216) mod 256) & numToByte((pN div 65536) mod 256) & \
+      numToByte((pN div 256) mod 256) & numToByte(pN mod 256)
+end qsU32be
+
+function qsU32beDecode pBytes
+   return (byteToNum(byte 1 of pBytes) * 16777216) + (byteToNum(byte 2 of pBytes) * 65536) + \
+      (byteToNum(byte 3 of pBytes) * 256) + byteToNum(byte 4 of pBytes)
+end qsU32beDecode
+
+-- Encrypt pSrc to pDst in fixed chunks so a big file never has to fit in memory:
+-- an 8-byte magic, then repeated [u32be cipherLen][cipher]. Returns "" on success,
+-- else an error string. Each chunk carries its own random salt via the engine.
+function qsEncryptFile pSrc, pDst, pPass
+   local tChunk, tCipher, tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      open file pSrc for binary read
+      if the result is not empty then
+         return ("cannot open the file to read: " & the result)
+      end if
+      open file pDst for binary write
+      if the result is not empty then
+         close file pSrc
+         return ("cannot open the encrypted file to write: " & the result)
+      end if
+      write textEncode(kEncMagic, "ASCII") to file pDst
+      repeat
+         read from file pSrc for kEncChunk
+         put it into tChunk
+         if tChunk is empty then
+            exit repeat
+         end if
+         encrypt tChunk using "aes-256-cbc" with password pPass
+         if the result is not empty then
+            close file pSrc
+            close file pDst
+            return ("encrypt error: " & the result)
+         end if
+         put it into tCipher
+         write qsU32be(the number of bytes in tCipher) & tCipher to file pDst
+      end repeat
+      close file pSrc
+      close file pDst
+      return ""
+   catch tErr
+      return tErr
+   end try
+end qsEncryptFile
+
+-- Decrypt pSrc (a .enc) to pDst. Returns "" on success, else an error string.
+function qsDecryptFile pSrc, pDst, pPass
+   local tHdr, tLenBytes, tLen, tCipher, tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      open file pSrc for binary read
+      if the result is not empty then
+         return ("cannot open the encrypted file to read: " & the result)
+      end if
+      read from file pSrc for 8
+      put it into tHdr
+      if textDecode(tHdr, "ASCII") is not kEncMagic then
+         close file pSrc
+         return "not a TorrentXT encrypted file"
+      end if
+      open file pDst for binary write
+      if the result is not empty then
+         close file pSrc
+         return ("cannot open the output file to write: " & the result)
+      end if
+      repeat
+         read from file pSrc for 4
+         put it into tLenBytes
+         if tLenBytes is empty then
+            exit repeat
+         end if
+         if the number of bytes in tLenBytes < 4 then
+            close file pSrc
+            close file pDst
+            return "the encrypted file is truncated"
+         end if
+         put qsU32beDecode(tLenBytes) into tLen
+         read from file pSrc for tLen
+         put it into tCipher
+         decrypt tCipher using "aes-256-cbc" with password pPass
+         if the result is not empty then
+            close file pSrc
+            close file pDst
+            return "wrong passphrase, or the file is corrupt"
+         end if
+         write it to file pDst
+      end repeat
+      close file pSrc
+      close file pDst
+      return ""
+   catch tErr
+      return tErr
+   end try
+end qsDecryptFile
+
+-- When a LOCKED download finishes, decrypt the .enc to its real name beside it.
+-- A no-op for a plain download (nothing stashed against its info-hash). The .enc
+-- is left in place so the receiver keeps seeding it to the swarm.
+command qsMaybeDecryptFinished pTorrent
+   local tS, tHash, tSave, tEncName, tOut, tErr
+   put btTorrentStatus(pTorrent) into tS
+   put toLower(tS["infoHashV1"]) into tHash
+   if tHash is empty or sPendingPass[tHash] is empty then
+      exit qsMaybeDecryptFinished
+   end if
+   put tS["savePath"] into tSave
+   put tS["name"] into tEncName            -- the neutral .enc filename
+   put tSave & "/" & sPendingName[tHash] into tOut
+   qsLog "Unlocking" && quote & sPendingName[tHash] & quote & "- the app may pause briefly on a large file..."
+   put qsDecryptFile(tSave & "/" & tEncName, tOut, sPendingPass[tHash]) into tErr
+   if tErr is not empty then
+      qsLog "Could not unlock" && quote & sPendingName[tHash] & quote & ":" && tErr
+   else
+      qsLog "Unlocked to" && quote & sPendingName[tHash] & quote & "in" && tSave & "."
+   end if
+   put empty into sPendingPass[tHash]
+   put empty into sPendingName[tHash]
+end qsMaybeDecryptFinished
 
 command qsLog pMsg
    if there is no field "qsLog" then
