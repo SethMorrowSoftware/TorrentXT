@@ -9,18 +9,22 @@ script "torrentClient"
 -- UI and starts a TorrentXT session automatically. Needs only the loaded
 -- org.openxtalk.library.torrent library - no helper stack, no manual UI.
 --
+-- Layout (modern-client style, fits inside a 720p screen): a smart Add row, a
+-- single compact toolbar of actions, the torrent table, a one-line detail strip,
+-- and a bottom PANEL with Files / Peers / Trackers / Log tabs, over a status bar.
+--
 -- Features: smart Add (magnet / http(s) .torrent / local .torrent / 40-hex
 -- info-hash) with DUPLICATE DETECTION, or just DRAG a .torrent / magnet onto the
 -- window; per-torrent Pause/Resume/Recheck/Reannounce/Remove(+Data), Open Folder,
 -- Copy Magnet, Save Resume; a live INSPECTOR for the selected torrent with
 -- Files / Peers / Trackers tabs (double-click a file to set skip/normal/high
--- priority); a Stream toggle (sequential download) and queue Up/Down; session
--- Pause All / Resume All; a global upload cap; a live colour-coded table with
--- inline progress bars; keyboard shortcuts (Enter adds, Space toggles
--- pause/resume, Delete removes); a detail line with share ratio; session totals
--- with a state breakdown and ratio; remembered settings + a resizable window; a
--- self-rebuild on script update (kUiVersion); a "What is this?" help dialog; and
--- an event log.
+-- priority) plus a Log tab; a Stream toggle (sequential download) and queue
+-- Up/Down; session Pause All / Resume All; a global upload cap; a live
+-- colour-coded table with inline progress bars; keyboard shortcuts (Enter adds,
+-- Space toggles pause/resume, Delete removes); a detail strip with share ratio; a
+-- status bar with a state breakdown, rates, and ratio; remembered settings + a
+-- resizable window; a self-rebuild on script update (kUiVersion); and a "What is
+-- this?" help dialog.
 --
 -- Design (single-thread playbook): one 250 ms poll loop drains events with a
 -- single btPoll; one 800 ms refresh enumerates the torrents and repaints. The
@@ -31,13 +35,13 @@ script "torrentClient"
 local sSession          -- the live session handle (0/empty = none)
 local sLineHandles      -- array: table line number -> torrent handle (per refresh)
 local sPolling          -- "true" while the loops are armed
-local sPanelTab         -- the active inspector tab: "files" / "peers" / "trackers"
+local sPanelTab         -- active bottom-panel tab: "files"/"peers"/"trackers"/"log"
 local sSeqOn            -- array: torrent handle -> "true" while sequential is on
 
 -- Bump when the generated UI changes; tcBuildUI rebuilds the controls on a
 -- mismatch so updating the script in a SAVED stack picks up the new layout
 -- instead of keeping the old controls (and dead buttons) around.
-constant kUiVersion = "client-ui-2026-06"
+constant kUiVersion = "client-ui-2026-07"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -114,6 +118,9 @@ on mouseUp
          break
       case "tcTabTrackers"
          tcSetTab "trackers"
+         break
+      case "tcTabLog"
+         tcSetTab "log"
          break
       case "tcStream"
          tcStreamToggle
@@ -240,41 +247,56 @@ command tcBuildUI
    set the title of this stack to "TorrentXT Client"
    set the width of this stack to 860
    -- vertically resizable: lock the width, remember the user's height across runs,
-   -- and let the three list regions (table / inspector / log) share the extra
-   -- vertical space (see resizeStack / tcRelayout).
+   -- and let the table + the bottom panel share the extra vertical space (see
+   -- resizeStack / tcRelayout). Sized to sit comfortably inside a 720p screen.
    set the minWidth of this stack to 860
    set the maxWidth of this stack to 860
-   -- taller now that an inspector (Files/Peers/Trackers) sits between the control
-   -- block and the log; the three list regions share the extra vertical space.
-   set the minHeight of this stack to 680
-   if the uHeight of this stack is a number and the uHeight of this stack >= 680 then
+   set the minHeight of this stack to 500
+   if the uHeight of this stack is a number and the uHeight of this stack >= 500 then
       set the height of this stack to (the uHeight of this stack)
    else
-      set the height of this stack to 820
+      set the height of this stack to 648
    end if
-   -- a full-width brand title bar
-   tcMakeLabel "tcTitle", "  TorrentXT Client", "0,0,860,34", 16
+   -- a slim brand title bar
+   tcMakeLabel "tcTitle", "  TorrentXT Client", "0,0,860,28", 15
    set the opaque of field "tcTitle" to true
    set the backgroundColor of field "tcTitle" to "44,90,160"
    set the foregroundColor of field "tcTitle" to "255,255,255"
    set the textStyle of field "tcTitle" to "bold"
-   tcMakeLabel "tcSubtitle", "BitTorrent for OpenXTalk - powered by libtorrent  ", "440,9,840,29", 11
+   tcMakeLabel "tcSubtitle", "BitTorrent for OpenXTalk - powered by libtorrent  ", "440,6,840,24", 10
    set the foregroundColor of field "tcSubtitle" to "208,221,240"
    set the textAlign of field "tcSubtitle" to "right"
-   -- add row
-   tcMakeField "tcInput", "16,38,560,64", false
-   tcMakeButton "tcAdd", "Add", "568,38,650,64"
-   tcMakeButton "tcAddFile", "Open .torrent", "658,38,844,64"
-   -- save + seed row (Browse picks the download folder)
-   tcMakeLabel "tcSaveLabel", "Save to:", "16,72,66,92", 11
-   tcMakeField "tcSavePath", "70,70,470,94", false
-   tcMakeButton "tcBrowse", "Browse...", "474,70,558,94"
-   tcMakeButton "tcSeed", "Create + Seed Folder", "568,70,844,94"
+   -- add row: the smart input + the two add buttons
+   tcMakeField "tcInput", "16,32,560,54", false
+   tcMakeButton "tcAdd", "Add", "568,32,650,54"
+   tcMakeButton "tcAddFile", "Open .torrent", "658,32,844,54"
+   -- save + seed row, with the global upload cap tucked on the right
+   tcMakeLabel "tcSaveLabel", "Save to:", "16,60,62,78", 10
+   tcMakeField "tcSavePath", "66,58,392,80", false
+   tcMakeButton "tcBrowse", "Browse...", "396,58,468,80"
+   tcMakeButton "tcSeed", "Create + Seed", "472,58,604,80"
+   tcMakeLabel "tcLimitLabel", "Up KB/s:", "616,60,684,78", 10
+   tcMakeField "tcUpLimit", "688,58,740,80", false
+   tcMakeButton "tcApplyLimit", "Apply", "744,58,816,80"
+   -- a single compact toolbar of per-torrent + session actions (modern-client
+   -- style; the full names live in the tooltips). Three visual clusters: torrent
+   -- state, then torrent info, then session-wide.
+   tcMakeButton "tcPause", "Pause", "16,84,80,106"
+   tcMakeButton "tcResume", "Resume", "82,84,146,106"
+   tcMakeButton "tcRecheck", "Recheck", "148,84,218,106"
+   tcMakeButton "tcReannounce", "Announce", "220,84,298,106"
+   tcMakeButton "tcRemove", "Remove", "300,84,366,106"
+   tcMakeButton "tcRemoveData", "Remove+Data", "368,84,464,106"
+   tcMakeButton "tcOpenFolder", "Open", "474,84,534,106"
+   tcMakeButton "tcCopyMagnet", "Magnet", "536,84,600,106"
+   tcMakeButton "tcSaveResume", "Save Res", "602,84,674,106"
+   tcMakeButton "tcPauseAll", "Pause All", "684,84,760,106"
+   tcMakeButton "tcResumeAll", "Resume All", "762,84,844,106"
    -- table header + selectable list (double-click a row to open its folder)
    tcMakeLabel "tcHeader", \
       "#" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Down" & tab & "Up" & tab & "Peers" & tab & "Size", \
-      "16,102,844,120", 10
-   tcMakeList "tcTorrents", "16,122,844,358", false
+      "16,110,844,126", 10
+   tcMakeList "tcTorrents", "16,128,844,360", false
    set the tabStops of field "tcHeader" to "26,250,350,510,590,670,720"
    set the tabStops of field "tcTorrents" to "26,250,350,510,590,670,720"
    -- a fixed-width font lets the inline progress bars and the right-hand byte
@@ -291,55 +313,41 @@ command tcBuildUI
    set the backgroundColor of field "tcHeader" to "216,221,230"
    set the foregroundColor of field "tcHeader" to "28,38,58"
    set the textStyle of field "tcHeader" to "bold"
-   -- per-torrent controls (row 1)
-   tcMakeButton "tcPause", "Pause", "16,364,104,390"
-   tcMakeButton "tcResume", "Resume", "108,364,196,390"
-   tcMakeButton "tcRecheck", "Recheck", "200,364,288,390"
-   tcMakeButton "tcReannounce", "Reannounce", "292,364,402,390"
-   tcMakeButton "tcRemove", "Remove", "406,364,494,390"
-   tcMakeButton "tcRemoveData", "Remove + Data", "498,364,620,390"
-   -- per-torrent + session controls (row 2)
-   tcMakeButton "tcOpenFolder", "Open Folder", "16,396,120,422"
-   tcMakeButton "tcCopyMagnet", "Copy Magnet", "124,396,228,422"
-   tcMakeButton "tcSaveResume", "Save Resume", "232,396,336,422"
-   tcMakeButton "tcPauseAll", "Pause All", "360,396,448,422"
-   tcMakeButton "tcResumeAll", "Resume All", "452,396,540,422"
-   -- settings: a global upload cap (handy when seeding)
-   tcMakeLabel "tcLimitLabel", "Up KB/s (0=off):", "560,400,672,420", 11
-   tcMakeField "tcUpLimit", "676,398,740,422", false
-   tcMakeButton "tcApplyLimit", "Apply", "748,398,820,422"
-   -- detail line for the selected torrent, then session totals
-   tcMakeLabel "tcDetail", "Select a torrent to see its details.", "16,430,844,450", 10
-   tcMakeLabel "tcTotals", "", "16,454,844,474", 11
-   set the opaque of field "tcTotals" to true
-   set the backgroundColor of field "tcTotals" to "224,228,235"
-   set the textStyle of field "tcTotals" to "bold"
-   -- ---- live inspector: Files / Peers / Trackers for the selected torrent ----
-   -- a tab row (the three tabs + a Stream toggle + queue + help), a column header,
-   -- and a selectable list. tcRelayout positions all of these; the rects here are
-   -- placeholders. The active tab is shown by disabling its button (see tcSetTab).
-   tcMakeButton "tcTabFiles", "Files", "16,476,86,500"
-   tcMakeButton "tcTabPeers", "Peers", "90,476,160,500"
-   tcMakeButton "tcTabTrackers", "Trackers", "164,476,254,500"
-   tcMakeButton "tcStream", "Stream: off", "300,476,410,500"
-   tcMakeButton "tcQUp", "Q Up", "420,476,490,500"
-   tcMakeButton "tcQDown", "Q Down", "494,476,574,500"
-   tcMakeButton "tcHelp", "What is this?", "740,476,844,500"
+   -- detail strip for the selected torrent (just under the table)
+   tcMakeLabel "tcDetail", "Select a torrent to see its details.", "16,364,844,382", 10
+   -- ---- bottom panel: Files / Peers / Trackers / Log + per-torrent actions ----
+   -- a tab row, a column header, and one of two stacked fields shown per tab (the
+   -- inspector list, or the event log). tcRelayout positions all of these; the
+   -- rects here are placeholders. The active tab is shown by disabling its button.
+   tcMakeButton "tcTabFiles", "Files", "16,386,80,408"
+   tcMakeButton "tcTabPeers", "Peers", "82,386,146,408"
+   tcMakeButton "tcTabTrackers", "Trackers", "148,386,222,408"
+   tcMakeButton "tcTabLog", "Log", "224,386,280,408"
+   tcMakeButton "tcStream", "Stream: off", "300,386,396,408"
+   tcMakeButton "tcQUp", "Q Up", "400,386,452,408"
+   tcMakeButton "tcQDown", "Q Down", "456,386,520,408"
+   tcMakeButton "tcHelp", "What is this?", "760,386,844,408"
    tcMakeLabel "tcInspectHdr", \
-      "Name" & tab & "Size" & tab & "Progress" & tab & "Priority", "16,504,844,522", 10
+      "Name" & tab & "Size" & tab & "Progress" & tab & "Priority", "16,412,844,430", 10
    set the opaque of field "tcInspectHdr" to true
    set the backgroundColor of field "tcInspectHdr" to "216,221,230"
    set the foregroundColor of field "tcInspectHdr" to "28,38,58"
    set the textStyle of field "tcInspectHdr" to "bold"
    set the textFont of field "tcInspectHdr" to "Courier"
    set the textSize of field "tcInspectHdr" to 11
-   tcMakeList "tcInspect", "16,524,844,640", false
+   -- the inspector list and the event log share the SAME region; tcSetTab shows
+   -- one and hides the other, so the Log reads as just another tab.
+   tcMakeList "tcInspect", "16,432,844,560", false
    set the textFont of field "tcInspect" to "Courier"
    set the textSize of field "tcInspect" to 11
-   -- same pale hilite as the table so coloured rows stay legible when selected
    set the hiliteColor of field "tcInspect" to "200,221,242"
-   -- event log
-   tcMakeList "tcLog", "16,480,844,702", true
+   tcMakeList "tcLog", "16,432,844,560", true
+   set the textSize of field "tcLog" to 10
+   -- session status bar pinned along the bottom edge
+   tcMakeLabel "tcTotals", "", "16,566,844,586", 10
+   set the opaque of field "tcTotals" to true
+   set the backgroundColor of field "tcTotals" to "224,228,235"
+   set the textStyle of field "tcTotals" to "bold"
    -- defaults (restore the remembered save path + upload cap if present)
    if the uSavePath of this stack is not empty then
       put the uSavePath of this stack into field "tcSavePath"
@@ -376,6 +384,7 @@ command tcBuildUI
    set the tooltip of button "tcTabFiles" to "Show the selected torrent's files (double-click a file to change its priority)"
    set the tooltip of button "tcTabPeers" to "Show the peers connected for the selected torrent"
    set the tooltip of button "tcTabTrackers" to "Show the trackers for the selected torrent"
+   set the tooltip of button "tcTabLog" to "Show the event log"
    set the tooltip of button "tcStream" to "Toggle sequential (streaming) download for the selected torrent"
    set the tooltip of button "tcQUp" to "Move the selected torrent up in the priority queue"
    set the tooltip of button "tcQDown" to "Move the selected torrent down in the priority queue"
@@ -437,48 +446,44 @@ command tcMakeList pName, pRect, pIsLog
    end if
 end tcMakeList
 
--- Reflow the three list regions (table, inspector, log), the two control rows,
--- the inspector tab row, and the detail/totals lines for the current (resizable)
--- height. The width is locked, so only vertical space is shared: the table takes
--- ~42% of the free space, the inspector ~32%, and the log fills the remainder
--- down to the bottom margin. Laid out top-to-bottom from the fixed table top so
--- the arithmetic stays readable. Called on build and resize; no-op until ready.
+-- Reflow the two resizable list regions (the torrent table and the bottom panel)
+-- plus the detail strip, tab row, panel header, and status bar for the current
+-- height. The width is locked, so only vertical space is shared: the table and
+-- the panel split the free height 50/50. Everything else - the 128px fixed top
+-- block, the 18px detail strip, the tab row, the panel header, the status bar,
+-- the gaps, and an 8px margin - is fixed. The inspector list and the log occupy
+-- the SAME panel rect (tcSetTab shows one). Called on build + resize; no-op until
+-- the UI exists. tcTotals is the last control built, so it gates "ready".
 command tcRelayout
-   local tH, tRight, tBottom, tAvail, tY, tTableH, tInspH
-   if there is no field "tcLog" then   -- the last control built; UI not ready yet
+   local tH, tRight, tAvail, tY, tTableH, tPanelH
+   if there is no field "tcTotals" then
       exit tcRelayout
    end if
    put the height of this stack into tH
    put (the width of this stack) - 16 into tRight
-   put tH - 10 into tBottom                  -- bottom margin
-   -- Vertical budget the three list regions share. Everything else below the
-   -- table top (122) is fixed: the 116px control block, a 30px inspector tab row,
-   -- an 18px inspector header, two 6px gaps, and the 10px bottom margin.
-   put (tH - 122 - 116 - 30 - 18 - 12 - 10) into tAvail
-   if tAvail < 300 then
-      put 300 into tAvail
+   -- table + panel share whatever is left after the fixed chrome (230px total:
+   -- the 128px top block, an 18px detail strip, a 24px tab row, an 18px panel
+   -- header, a 20px status bar, the inter-region gaps, and an 8px bottom margin).
+   put (tH - 230) into tAvail
+   if tAvail < 240 then
+      put 240 into tAvail
    end if
-   put the round of (tAvail * 0.42) into tTableH
-   put the round of (tAvail * 0.32) into tInspH
+   put the round of (tAvail * 0.5) into tTableH
+   put tAvail - tTableH into tPanelH
    -- top-to-bottom cursor from the fixed table top
-   put 122 into tY
+   put 128 into tY
    set the rect of field "tcTorrents" to ("16," & tY & comma & tRight & comma & (tY + tTableH))
-   put tY + tTableH + 6 into tY              -- gap, then the control block
-   tcRowTop "tcPause,tcResume,tcRecheck,tcReannounce,tcRemove,tcRemoveData", tY
-   tcRowTop "tcOpenFolder,tcCopyMagnet,tcSaveResume,tcPauseAll,tcResumeAll", (tY + 32)
-   set the top of field "tcLimitLabel" to (tY + 36)
-   set the top of field "tcUpLimit" to (tY + 34)
-   set the top of button "tcApplyLimit" to (tY + 34)
-   set the top of field "tcDetail" to (tY + 66)
-   set the top of field "tcTotals" to (tY + 90)
-   put tY + 116 into tY                       -- below the 116px control block
-   tcRowTop "tcTabFiles,tcTabPeers,tcTabTrackers,tcStream,tcQUp,tcQDown,tcHelp", (tY + 2)
-   put tY + 30 into tY                        -- below the tab row
+   put tY + tTableH + 4 into tY                 -- gap, then the detail strip
+   set the rect of field "tcDetail" to ("16," & tY & comma & tRight & comma & (tY + 18))
+   put tY + 22 into tY                          -- below the detail strip + gap
+   tcRowTop "tcTabFiles,tcTabPeers,tcTabTrackers,tcTabLog,tcStream,tcQUp,tcQDown,tcHelp", tY
+   put tY + 26 into tY                          -- below the tab row
    set the rect of field "tcInspectHdr" to ("16," & tY & comma & tRight & comma & (tY + 18))
-   put tY + 18 into tY                        -- below the inspector header
-   set the rect of field "tcInspect" to ("16," & tY & comma & tRight & comma & (tY + tInspH))
-   put tY + tInspH + 6 into tY                -- gap, then the log fills the rest
-   set the rect of field "tcLog" to ("16," & tY & comma & tRight & comma & tBottom)
+   put tY + 18 into tY                          -- below the panel header
+   set the rect of field "tcInspect" to ("16," & tY & comma & tRight & comma & (tY + tPanelH))
+   set the rect of field "tcLog" to ("16," & tY & comma & tRight & comma & (tY + tPanelH))
+   put tY + tPanelH + 4 into tY                 -- gap, then the status bar
+   set the rect of field "tcTotals" to ("16," & tY & comma & tRight & comma & (tY + 20))
 end tcRelayout
 
 -- Move a comma-list of buttons to a common top (x / width / height preserved).
@@ -1168,14 +1173,26 @@ command tcOnSelect
    tcUpdatePanel
 end tcOnSelect
 
--- Switch the inspector to a tab. The active tab's button is disabled so it reads
--- as "current"; the per-tab column header + tab stops are set here (tab stops are
--- absolute pixels and must stay inside the field), then the panel repaints.
+-- Switch the bottom panel to a tab. The active tab's button is disabled so it
+-- reads as "current". The Log tab shows the event-log field in the same region;
+-- the data tabs show the inspector list with a per-tab header + tab stops (tab
+-- stops are absolute pixels and must stay inside the field), then repaint.
 command tcSetTab pTab
    put pTab into sPanelTab
    set the disabled of button "tcTabFiles" to (pTab is "files")
    set the disabled of button "tcTabPeers" to (pTab is "peers")
    set the disabled of button "tcTabTrackers" to (pTab is "trackers")
+   set the disabled of button "tcTabLog" to (pTab is "log")
+   if pTab is "log" then
+      set the tabStops of field "tcInspectHdr" to empty
+      put "  Event log" into field "tcInspectHdr"
+      set the visible of field "tcInspect" to false
+      set the visible of field "tcLog" to true
+      set the vScroll of field "tcLog" to the formattedHeight of field "tcLog"
+      exit tcSetTab
+   end if
+   set the visible of field "tcLog" to false
+   set the visible of field "tcInspect" to true
    switch pTab
       case "peers"
          set the tabStops of field "tcInspectHdr" to "210,370,450,530"
@@ -1203,6 +1220,9 @@ command tcUpdatePanel
    local tH, tList, tRow, tOut, tPct, tLine, tColors, tErr, tKeepLine, tStatus
    if there is no field "tcInspect" then
       exit tcUpdatePanel
+   end if
+   if sPanelTab is "log" then
+      exit tcUpdatePanel        -- the Log tab is up; the inspector is hidden
    end if
    put tcSelectedHandle() into tH
    if tH is 0 then
@@ -1384,7 +1404,7 @@ end tcQueue
 command tcHelp
    answer "TorrentXT Client - a multi-torrent BitTorrent client in pure xTalk." & return & return & \
       "ADD: paste a magnet, an http(s) .torrent URL, a local .torrent path, or a 40-hex info-hash - or just drag a .torrent / magnet onto the window." & return & return & \
-      "INSPECT: select a torrent, then use the Files / Peers / Trackers tabs. On Files, double-click a row to cycle its priority (skip -> normal -> high); skipped files are not downloaded." & return & return & \
+      "INSPECT: select a torrent, then use the Files / Peers / Trackers / Log tabs in the bottom panel. On Files, double-click a row to cycle its priority (skip -> normal -> high); skipped files are not downloaded." & return & return & \
       "STREAM turns on sequential download so a media file fills front-to-back. Q Up / Q Down reorder which torrents run first." & return & return & \
       "Shortcuts: Space pauses/resumes, Delete removes, double-click a row opens its folder." \
       with "OK"
