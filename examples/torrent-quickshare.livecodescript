@@ -26,9 +26,12 @@ script "quickShareApp"
 -- neutral .enc name) ever hits the swarm; the real filename and the salt ride
 -- inside the (now longer) share code, and the passphrase - which you give your
 -- friend separately - is what unlocks the bytes. The receiver types the same
--- passphrase, and the file unlocks automatically when the download completes.
--- The encryption features REQUIRE the cryptoXT extension
--- (org.openxtalk.library.sodium); plain sharing works without it.
+-- passphrase; it is checked UP FRONT against a small authenticator in the code,
+-- so a wrong passphrase is caught immediately and nothing is downloaded. On a
+-- correct passphrase the file downloads, unlocks automatically, and the encrypted
+-- .enc copy is cleaned up so only the real file is left. The encryption features
+-- REQUIRE the cryptoXT extension (org.openxtalk.library.sodium); plain sharing
+-- works without it.
 --
 -- Single-thread playbook: a 250 ms poll drains events and a 1 s loop repaints the
 -- Transfers list. The heavy bytes move on libtorrent's own threads, never script.
@@ -49,6 +52,10 @@ local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned o
 -- ride inside the share code, and the passphrase (shared separately) is what
 -- actually unlocks the bytes. Requires the org.openxtalk.library.sodium extension.
 constant kCodePrefix = "BTXQS1:" -- marks an encrypted share code (vs a bare hash)
+-- a fixed token sealed with the file key and carried in the share code, so the
+-- receiver can verify the passphrase LOCALLY before downloading anything (a wrong
+-- passphrase never pulls a useless .enc to disk).
+constant kQsVerify = "BTXQSVERIFY"
 
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
@@ -350,7 +357,7 @@ end qsDashOnce
 -- the hash plus the real filename so the receiver can name + unlock it.
 command qsShareFile pPath
    local tData, tH, tHash, tParent, tName, tPass
-   local tEncPath, tEncParent, tErr, tSalt, tKey
+   local tEncPath, tEncParent, tErr, tSalt, tKey, tVerifier
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsShareFile
@@ -407,6 +414,8 @@ command qsShareFile pPath
       put qsTempEncPath() into tEncPath
       put sxRandomBytes(16) into tSalt
       put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      -- a small authenticator so the receiver can check the passphrase up front
+      put sxSecretBox(textEncode(kQsVerify, "ASCII"), tKey) into tVerifier
       qsLog "Encrypting" && quote & tName & quote & "- the app may pause briefly on a large file..."
       put qsEncryptFile(pPath, tEncPath, tKey) into tErr
       if tErr is not empty then
@@ -435,7 +444,7 @@ command qsShareFile pPath
       end if
       put tName into sXferName[toLower(tHash)]    -- show the REAL name locally
       put tEncPath into sTempEnc[toLower(tHash)]  -- clean up on close
-      put qsMakeCode(tHash, tName, tSalt) into sShareCode
+      put qsMakeCode(tHash, tName, tSalt, tVerifier) into sShareCode
       set the text of field "qsCode" to sShareCode
       set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " ENCRYPTED - send the code AND tell your friend the passphrase separately.")
       qsLog "Encrypted" && quote & tName & quote & ". Send the code (Copy) AND the passphrase - your friend needs both."
@@ -465,7 +474,7 @@ end qsCopyCode
 -- the real filename, and needs the passphrase. We stash the passphrase + name
 -- against the hash so qsMaybeDecryptFinished can unlock the .enc when it lands.
 command qsGetFile
-   local tCode, tMag, tH, tHash, tName, tPass, tRest, tB64, tB64Salt, tSalt, tKey
+   local tCode, tMag, tH, tHash, tName, tPass, tRest, tB64, tB64Salt, tB64Verify, tSalt, tKey
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsGetFile
@@ -477,7 +486,7 @@ command qsGetFile
    end if
    put qsTrim(field "qsRecvPass") into tPass
    if tCode begins with kCodePrefix then
-      -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>
+      -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>:<base64 verifier>
       if not sCanEncrypt then
          qsLog "This code is locked, but cryptoXT (org.openxtalk.library.sodium) is not installed - cannot decrypt."
          exit qsGetFile
@@ -491,6 +500,7 @@ command qsGetFile
       put item 1 of tRest into tHash
       put item 2 of tRest into tB64
       put item 3 of tRest into tB64Salt
+      put item 4 of tRest into tB64Verify
       put toLower(tHash) into tHash
       if the number of chars of tHash is not 40 and the number of chars of tHash is not 64 then
          qsLog "That locked code looks damaged (bad hash)."
@@ -507,6 +517,17 @@ command qsGetFile
       -- derive the same key the sender used (passphrase + the salt from the code)
       put base64Decode(tB64Salt) into tSalt
       put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      -- CHECK THE PASSPHRASE NOW, before downloading anything: if the verifier in
+      -- the code does not open with this key, the passphrase is wrong, so we ask
+      -- again and never pull the .enc to disk. (Older codes have no verifier; those
+      -- fall back to verify-on-finish.)
+      if tB64Verify is not empty and not qsKeyOpensVerifier(tKey, tB64Verify) then
+         qsLog "That passphrase does not match this file. Check it and click Download again."
+         answer "That passphrase does not match this locked file." & return & return & \
+            "Check the passphrase your friend gave you and try again." with "OK"
+         select the text of field "qsRecvPass"
+         exit qsGetFile
+      end if
       put tKey into sPendingKey[tHash]
       put tName into sPendingName[tHash]
       put tName into sXferName[tHash]            -- show the real name while it downloads
@@ -725,11 +746,24 @@ function qsB64 pData
 end qsB64
 
 -- Build the locked share code: a prefix, the .enc info-hash, the original filename,
--- and the Argon2id salt (both base64'd). The colon is a safe delimiter because
--- neither a hex hash nor base64 ever contains one.
-function qsMakeCode pHash, pName, pSalt
-   return kCodePrefix & pHash & ":" & qsB64(textEncode(pName, "UTF-8")) & ":" & qsB64(pSalt)
+-- the Argon2id salt, and a passphrase verifier (all base64'd). The colon is a safe
+-- delimiter because neither a hex hash nor base64 ever contains one.
+function qsMakeCode pHash, pName, pSalt, pVerifier
+   return kCodePrefix & pHash & ":" & qsB64(textEncode(pName, "UTF-8")) & ":" & \
+      qsB64(pSalt) & ":" & qsB64(pVerifier)
 end qsMakeCode
+
+-- Does pKey open the passphrase verifier carried in a share code? Used to check
+-- the passphrase BEFORE downloading, so a wrong one never fetches a .enc.
+function qsKeyOpensVerifier pKey, pB64Verify
+   local tOut, tErr
+   try
+      put sxSecretBoxOpen(base64Decode(pB64Verify), pKey) into tOut
+   catch tErr
+      return false
+   end try
+   return (textDecode(tOut, "ASCII") is kQsVerify)
+end qsKeyOpensVerifier
 
 -- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
 function qsTempEncPath
@@ -783,10 +817,14 @@ command qsMaybeDecryptFinished pTorrent
    put tSave & "/" & sPendingName[tHash] into tOut
    qsLog "Unlocking" && quote & sPendingName[tHash] & quote & "- the app may pause briefly on a large file..."
    put qsDecryptFile(tEncPath, tOut, sPendingKey[tHash]) into tErr
+   -- drop the torrent and DELETE the .enc so no encrypted blob is left in the
+   -- user's folder. btRemoveTorrent (deleteFiles = true) removes the .enc; the
+   -- decrypted real file is not part of the torrent, so it stays.
+   btRemoveTorrent sSession, pTorrent, true
    if tErr is not empty then
-      qsLog "Could not unlock" && quote & sPendingName[tHash] & quote & ":" && tErr
+      qsLog "Could not unlock" && quote & sPendingName[tHash] & quote & ":" && tErr & " (the encrypted copy was removed)."
    else
-      qsLog "Unlocked to" && quote & sPendingName[tHash] & quote & "in" && tSave & "."
+      qsLog "Unlocked to" && quote & sPendingName[tHash] & quote & "in" && tSave & ". (Encrypted copy cleaned up.)"
    end if
    put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]

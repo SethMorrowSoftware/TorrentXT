@@ -1799,10 +1799,14 @@ command chMaybeDecryptFinished pTorrent
    put tSave & "/" & sPendingName[tHash] into tOut
    chLog "Decrypting '" & sPendingName[tHash] & "' - the app may pause briefly on a large file..."
    put chDecryptFile(tEncPath, tOut, sPendingKey[tHash]) into tErr
+   -- drop the torrent and DELETE the downloaded .enc so no encrypted blob is left
+   -- in the user's folder. btRemoveTorrent (deleteFiles = true) removes the .enc;
+   -- the decrypted real file is not part of the torrent, so it stays.
+   btRemoveTorrent sSession, pTorrent, true
    if tErr is not empty then
-      chLog "Could not decrypt '" & sPendingName[tHash] & "':" && tErr
+      chLog "Could not decrypt '" & sPendingName[tHash] & "':" && tErr & " (the encrypted copy was removed)."
    else
-      chLog "Decrypted to '" & sPendingName[tHash] & "' in" && tSave & ". (The encrypted copy is kept so you keep sharing it.)"
+      chLog "Decrypted to '" & sPendingName[tHash] & "' in" && tSave & ". (Encrypted copy cleaned up.)"
    end if
    put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]
