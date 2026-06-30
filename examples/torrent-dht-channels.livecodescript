@@ -8,7 +8,11 @@ script "dhtChannelsApp"
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI and starts a
 -- TorrentXT session. Needs only the loaded org.openxtalk.library.torrent (v3+).
--- Save the stack to keep your channel identity / name / subscriptions across runs.
+-- Your channel identity / names / subscriptions persist automatically to a small
+-- file in your per-user folder, so they survive across runs (and as a standalone
+-- .exe / app, which cannot save its own stack). Click "Lock Identity..." to seal
+-- that file with a passphrase via cryptoXT (Argon2id + secretbox); you then enter
+-- it each launch, and there is no recovery if you lose it.
 --
 -- THE DEMO (run it on two or more machines):
 --   1. (Optional) click "Rename" to give the active channel a display name. You
@@ -62,6 +66,9 @@ script "dhtChannelsApp"
 
 -- ---- stack-local state -------------------------------------------------------
 local sSession          -- the live session handle (0/empty = none)
+local sVaultPass        -- master passphrase protecting the prefs file ("" = none)
+local sPrefLockedOut    -- "true" if the prefs file is locked and we could NOT open
+                        --   it this run, so chPrefSave must never overwrite it
 local sPolling          -- "true" while the loops are armed
 local sChannels         -- array: index -> {seed, name, releases, pass} - YOUR channels
 local sActive           -- index of the active channel (drives the sMy* cache below)
@@ -91,11 +98,16 @@ local sXferName         -- array: info-hash -> real name to SHOW locally for an
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-ui-2025-06b"
+constant kUiVersion = "channels-ui-2025-07"
+-- prefs file header: an 8-byte magic, then a 1-byte mode ("P" plain / "E" sealed).
+-- A SEALED file is [magic]["E"][salt 16][sxSecretBox], the same 16-byte-salt +
+-- Argon2id convention cryptoXT's own file-encrypt demo uses.
+constant kPrefMagic = "BTXPREF1"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
    chBuild
+   chPrefLoad      -- hydrate saved state (and unlock if sealed) BEFORE chStart reads it
    chStart
 end openStack
 
@@ -107,6 +119,9 @@ on mouseUp
    switch the short name of the target
       case "chHelp"
          chHelp
+         break
+      case "chLock"
+         chProtectIdentity
          break
       case "chCopyKey"
          chCopyKey
@@ -217,6 +232,8 @@ command chBuild
    set the foregroundColor of field "chTitle" to "255,255,255"
    set the textStyle of field "chTitle" to "bold"
    chMakeButton "chHelp", "?  What is this?", "1000,4,1164,26"
+   -- lock/unlock the saved identity with a passphrase (label tracks state)
+   chMakeButton "chLock", "Lock Identity...", "820,4,994,26"
    -- ===== LEFT COLUMN (x 16..580): your channel + channels you follow =====
    chSection "chSecMine", "1.  Your channels - publish files under a channel of your own", "16,38,580,58"
    -- channel picker: switch the active channel, or make / delete one
@@ -455,6 +472,7 @@ command chStart
    chEnsureIdentity
    chLoadFollows
    chUpdateNowPub
+   chUpdateLockButton      -- reflect whether the saved identity is passphrase-locked
    if not sCanEncrypt then
       chLog "Note: cryptoXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
    end if
@@ -557,6 +575,7 @@ end chUpdateChannelMenu
 command chSaveChannels
    set the uChannels of this stack to arrayEncode(sChannels)
    set the uActiveChannel of this stack to sActive
+   chPrefSave      -- mirror to the external prefs file (survives a standalone restart)
 end chSaveChannels
 
 -- create a brand-new channel (your other channels keep running) and switch to it
@@ -692,8 +711,182 @@ command chStop
       set the uDhtState of this stack to btDhtSaveState(sSession)
       btStopSession sSession
    end if
+   chPrefSave      -- final flush to the external prefs file on close
    put empty into sSession
 end chStop
+
+-- ---- persistence: keep state in an EXTERNAL file -----------------------------
+-- A standalone app cannot save its own mainstack, so the stack custom properties
+-- (channels, follows, passphrases, DHT cache) would reset every launch. We mirror
+-- them to one file in a per-user folder: hydrated into the properties on open,
+-- written on every change and on close. Optionally SEALED with cryptoXT, so the
+-- ed25519 secret keys + passphrases are not left on disk in the clear. The sealed
+-- layout ([magic]["E"][16-byte salt][secretbox]) matches cryptoXT's file-encrypt
+-- demo: a random 16-byte salt + Argon2id (sxPwHash "2" / Interactive).
+
+-- a writable per-user path for the prefs file (creates the folder if needed)
+function chPrefFile
+   local tBase, tErr
+   put specialFolderPath("preferences") into tBase
+   if tBase is empty or there is no folder tBase then
+      put specialFolderPath("application data") into tBase
+   end if
+   if tBase is empty or there is no folder tBase then
+      put specialFolderPath("documents") into tBase
+   end if
+   put tBase & "/TorrentXT" into tBase
+   if there is no folder tBase then
+      try
+         create folder tBase
+      catch tErr
+      end try
+   end if
+   return tBase & "/channels.prefs"
+end chPrefFile
+
+-- Load saved state into the stack properties the app reads. A SEALED file prompts
+-- to unlock (up to 3 tries); a wrong passphrase or cancel sets sPrefLockedOut so
+-- chPrefSave can never overwrite an identity we did not open. Talks to the user
+-- only through modal dialogs, since it can run before the log field is ready.
+command chPrefLoad
+   local tPath, tRaw, tHeader, tSalt, tSealed, tBody, tA, tErr, tTries, tPass, tOk
+   put empty into sVaultPass
+   put empty into sPrefLockedOut
+   put chPrefFile() into tPath
+   if there is no file tPath then
+      exit chPrefLoad
+   end if
+   put url ("binfile:" & tPath) into tRaw
+   if (the number of bytes in tRaw) < 9 then
+      exit chPrefLoad
+   end if
+   put textDecode(byte 1 to 9 of tRaw, "ASCII") into tHeader
+   if tHeader is (kPrefMagic & "P") then
+      put byte 10 to -1 of tRaw into tBody
+   else if tHeader is (kPrefMagic & "E") then
+      if not sCanEncrypt then
+         answer "Your saved channels are passphrase-locked, but cryptoXT (org.openxtalk.library.sodium) is not installed, so they cannot be unlocked here."
+         put "true" into sPrefLockedOut
+         exit chPrefLoad
+      end if
+      if (the number of bytes in tRaw) < 26 then
+         exit chPrefLoad
+      end if
+      put byte 10 to 25 of tRaw into tSalt
+      put byte 26 to -1 of tRaw into tSealed
+      put 0 into tTries
+      repeat
+         add 1 to tTries
+         ask password "Enter your passphrase to unlock your channel identity:"
+         if it is empty then
+            put "true" into sPrefLockedOut   -- cancelled: keep the file, no identity
+            exit chPrefLoad
+         end if
+         put it into tPass
+         put 0 into tOk
+         try
+            put sxSecretBoxOpen(tSealed, sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive())) into tBody
+            put 1 into tOk
+         catch tErr
+         end try
+         if tOk is 1 then
+            put tPass into sVaultPass
+            exit repeat
+         end if
+         if tTries >= 3 then
+            answer "That passphrase did not unlock your channels. They stay safe in the file - reopen the app to try again."
+            put "true" into sPrefLockedOut
+            exit chPrefLoad
+         end if
+         answer "Wrong passphrase. Try again (" & (3 - tTries) && "left)." with "OK"
+      end repeat
+   else
+      exit chPrefLoad    -- not our file / unknown header: leave it untouched
+   end if
+   try
+      put arrayDecode(tBody) into tA
+   catch tErr
+      exit chPrefLoad
+   end try
+   set the uChannels of this stack to tA["uChannels"]
+   set the uActiveChannel of this stack to tA["uActiveChannel"]
+   set the uFollows of this stack to tA["uFollows"]
+   set the uFollowPass of this stack to tA["uFollowPass"]
+   set the uDhtState of this stack to tA["uDhtState"]
+end chPrefLoad
+
+-- Write current state to the prefs file (plaintext, or sealed if a passphrase is
+-- set). Never overwrites a file we could not unlock this run.
+command chPrefSave
+   local tA, tBody, tOut, tSalt, tKey, tPath
+   if sPrefLockedOut is "true" then
+      exit chPrefSave
+   end if
+   put the uChannels of this stack into tA["uChannels"]
+   put the uActiveChannel of this stack into tA["uActiveChannel"]
+   put the uFollows of this stack into tA["uFollows"]
+   put the uFollowPass of this stack into tA["uFollowPass"]
+   put the uDhtState of this stack into tA["uDhtState"]
+   put arrayEncode(tA) into tBody
+   if sVaultPass is not empty and sCanEncrypt then
+      put sxRandomBytes(16) into tSalt
+      put sxPwHash(textEncode(sVaultPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      put textEncode(kPrefMagic & "E", "ASCII") & tSalt & sxSecretBox(tBody, tKey) into tOut
+   else
+      put textEncode(kPrefMagic & "P", "ASCII") & tBody into tOut
+   end if
+   put chPrefFile() into tPath
+   put tOut into url ("binfile:" & tPath)
+end chPrefSave
+
+-- The "Lock Identity" button: set (or remove) a master passphrase that seals the
+-- prefs file. Setting asks twice - a typo here would lock you out, with no recovery.
+command chProtectIdentity
+   local tP1, tP2
+   if not sCanEncrypt then
+      answer "Locking your identity needs cryptoXT (org.openxtalk.library.sodium), which is not installed."
+      exit chProtectIdentity
+   end if
+   if sVaultPass is empty then
+      ask password "Set a passphrase to protect your saved channel identity on this computer. You enter it each time you open the app, and there is NO recovery if you lose it:"
+      if it is empty then
+         exit chProtectIdentity
+      end if
+      put it into tP1
+      ask password "Confirm the passphrase:"
+      put it into tP2
+      if tP1 is not tP2 then
+         answer "Those did not match - nothing was changed."
+         exit chProtectIdentity
+      end if
+      put tP1 into sVaultPass
+      chPrefSave
+      chUpdateLockButton
+      answer "Your channel identity is now protected. You will be asked for this passphrase each time you open the app."
+      chLog "Identity protection ON - the prefs file is now encrypted."
+   else
+      answer "Remove passphrase protection? Your identity will be stored unencrypted on this computer." with "Cancel" or "Remove"
+      if it is not "Remove" then
+         exit chProtectIdentity
+      end if
+      put empty into sVaultPass
+      chPrefSave
+      chUpdateLockButton
+      chLog "Identity protection OFF - the prefs file is now stored unencrypted."
+   end if
+end chProtectIdentity
+
+-- Reflect lock state on the button label.
+command chUpdateLockButton
+   if there is no button "chLock" then
+      exit chUpdateLockButton
+   end if
+   if sVaultPass is not empty then
+      set the label of button "chLock" to "Identity Locked"
+   else
+      set the label of button "chLock" to "Lock Identity..."
+   end if
+end chUpdateLockButton
 
 command chPollOnce
    local tEvents, tEvent
@@ -940,6 +1133,7 @@ command chFollow
       end if
       set the uFollows of this stack to sFollows
    end if
+   chPrefSave
    put empty into field "chFollowKey"
    chRefreshSubs
    btDhtGetMutable sSession, tKey, ""
@@ -990,6 +1184,7 @@ command chUnfollow
    put empty into sFollowFeeds[tKey]
    put empty into sFollowPass[tKey]
    set the uFollowPass of this stack to arrayEncode(sFollowPass)
+   chPrefSave
    chRefreshSubs
    chLog "Unfollowed" && chShortKey(tKey) & "."
 end chUnfollow

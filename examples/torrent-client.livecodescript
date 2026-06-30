@@ -42,9 +42,13 @@ local sSeqOn            -- array: torrent handle -> "true" while sequential is o
 -- mismatch so updating the script in a SAVED stack picks up the new layout
 -- instead of keeping the old controls (and dead buttons) around.
 constant kUiVersion = "client-ui-2026-07"
+-- prefs file header: 8-byte magic + 1-byte mode. The client keeps no secrets, so
+-- it only ever writes mode "P" (plain); the format matches the channels demo.
+constant kPrefMagic = "BTXPREF1"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
+   tcPrefLoad      -- hydrate saved settings BEFORE tcBuildUI reads them
    tcBuildUI
    tcEnsureSession
 end openStack
@@ -547,7 +551,65 @@ command tcShutdown
       set the uSavePath of this stack to tcTrim(field "tcSavePath")
       set the uUpLimit of this stack to tcTrim(field "tcUpLimit")
    end if
+   tcPrefSave      -- mirror settings to the external prefs file (standalone-safe)
 end tcShutdown
+
+-- ---- persistence: settings survive in an external file -----------------------
+-- A standalone cannot save its own mainstack, so the remembered save path, upload
+-- cap, and window height would reset each launch. We mirror them to one plaintext
+-- file in a per-user folder (no secrets here, so no encryption), hydrated on open
+-- and written on close + on each settings change. Same file format as the channels
+-- demo, mode "P" only.
+function tcPrefFile
+   local tBase, tErr
+   put specialFolderPath("preferences") into tBase
+   if tBase is empty or there is no folder tBase then
+      put specialFolderPath("application data") into tBase
+   end if
+   if tBase is empty or there is no folder tBase then
+      put specialFolderPath("documents") into tBase
+   end if
+   put tBase & "/TorrentXT" into tBase
+   if there is no folder tBase then
+      try
+         create folder tBase
+      catch tErr
+      end try
+   end if
+   return tBase & "/client.prefs"
+end tcPrefFile
+
+command tcPrefLoad
+   local tPath, tRaw, tA, tErr
+   put tcPrefFile() into tPath
+   if there is no file tPath then
+      exit tcPrefLoad
+   end if
+   put url ("binfile:" & tPath) into tRaw
+   if (the number of bytes in tRaw) < 9 then
+      exit tcPrefLoad
+   end if
+   if textDecode(byte 1 to 9 of tRaw, "ASCII") is not (kPrefMagic & "P") then
+      exit tcPrefLoad
+   end if
+   try
+      put arrayDecode(byte 10 to -1 of tRaw) into tA
+   catch tErr
+      exit tcPrefLoad
+   end try
+   set the uSavePath of this stack to tA["uSavePath"]
+   set the uUpLimit of this stack to tA["uUpLimit"]
+   set the uHeight of this stack to tA["uHeight"]
+end tcPrefLoad
+
+command tcPrefSave
+   local tA, tPath
+   put the uSavePath of this stack into tA["uSavePath"]
+   put the uUpLimit of this stack into tA["uUpLimit"]
+   put the uHeight of this stack into tA["uHeight"]
+   put tcPrefFile() into tPath
+   put textEncode(kPrefMagic & "P", "ASCII") & arrayEncode(tA) into url ("binfile:" & tPath)
+end tcPrefSave
 
 function tcHaveSession
    if sSession is 0 or sSession is empty then
@@ -670,6 +732,7 @@ command tcBrowseSave
    end if
    put it into field "tcSavePath"
    set the uSavePath of this stack to it
+   tcPrefSave
    tcLogMsg "Save folder set to" && it
 end tcBrowseSave
 
@@ -922,6 +985,7 @@ command tcApplyUpLimit
    -- value crosses as a STRING (settings can be 64-bit); 0 == unlimited
    btSetInt sSession, "upload_rate_limit", (trunc(tKB * 1024) & "")
    set the uUpLimit of this stack to tKB
+   tcPrefSave
    tcLogMsg "Upload limit set to" && tKB && "KB/s"
 end tcApplyUpLimit
 
