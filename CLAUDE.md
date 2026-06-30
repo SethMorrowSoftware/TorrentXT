@@ -185,6 +185,30 @@ redraws.** The rules:
 - **Payload never crosses the FFI into script** (rule 3, above) — the gigabytes stay
   engine ⇄ disk.
 
+## Example demos: cryptoXT dependency (the channels + quickshare demos)
+
+The `torrent-dht-channels` and `torrent-quickshare` example demos do their **optional
+encryption** through **cryptoXT** (the sibling `org.openxtalk.library.sodium` / SodiumXT
+extension, libsodium), NOT OpenXTalk's built-in `encrypt using "aes-256-cbc"`. The flow is:
+a passphrase derives a key with **Argon2id** (`sxPwHash`), the channel feed is sealed with
+**`sxSecretBox`** (XSalsa20-Poly1305), and files are sealed with **`sxEncryptFile`**
+(streaming `crypto_secretstream`, authenticated). The channels demo salts the KDF with the
+channel's public key (so publisher and followers derive the same key); the quickshare demo
+uses a random salt carried in the share code.
+
+Consequences for anyone editing these demos:
+- The encryption features **require cryptoXT to be installed** alongside the torrent
+  extension. Each demo probes it once at startup (a guarded `sxSecretBox` round-trip in a
+  `try`) into `sCanEncrypt`; when absent, the private/passphrase features fail closed with a
+  clear "install org.openxtalk.library.sodium" message and **every other feature still
+  works**. Never call an `sx*` handler outside an `sCanEncrypt` guard or a `try`.
+- This was a deliberate "drop the weak AES path" decision. Data encrypted by the **old**
+  AES format does **not** open in these versions (the feed marker moved `BTXENC1:` ->
+  `BTXENC2:`); that breakage was accepted.
+- KDF parameters (opslimit `"2"` + `sxPwMemInteractive()`) must stay **identical on both
+  ends** or the derived keys differ. If you change them, change both sides and bump the
+  on-wire format.
+
 ## Git / workflow
 
 - Develop on the per-task branch (e.g. `claude/...`); commit there, open a **draft PR**

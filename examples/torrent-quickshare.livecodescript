@@ -21,11 +21,17 @@ script "quickShareApp"
 -- needed. Keep the sending window open until your friend has the whole file.
 --
 -- OPTIONAL ENCRYPTION: type a passphrase before dropping a file and it is
--- encrypted end-to-end. Only the CIPHERTEXT (under a neutral .enc name) ever hits
--- the swarm; the real filename rides inside the (now longer) share code, and the
--- passphrase - which you give your friend separately - is what unlocks the bytes.
--- The receiver types the same passphrase, and the file unlocks automatically when
--- the download completes. Same chunked AES framing as the channels demo.
+-- encrypted end-to-end with cryptoXT (libsodium): the key is derived with Argon2id
+-- and the file is sealed with crypto_secretstream. Only the CIPHERTEXT (under a
+-- neutral .enc name) ever hits the swarm; the real filename and the salt ride
+-- inside the (now longer) share code, and the passphrase - which you give your
+-- friend separately - is what unlocks the bytes. The receiver types the same
+-- passphrase; it is checked UP FRONT against a small authenticator in the code,
+-- so a wrong passphrase is caught immediately and nothing is downloaded. On a
+-- correct passphrase the file downloads, unlocks automatically, and the encrypted
+-- .enc copy is cleaned up so only the real file is left. The encryption features
+-- REQUIRE the cryptoXT extension (org.openxtalk.library.sodium); plain sharing
+-- works without it.
 --
 -- Single-thread playbook: a 250 ms poll drains events and a 1 s loop repaints the
 -- Transfers list. The heavy bytes move on libtorrent's own threads, never script.
@@ -34,20 +40,22 @@ script "quickShareApp"
 local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the poll/repaint loops are armed
 local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
-local sCanEncrypt       -- "true" if AES round-trips on this build (probed at start)
-local sPendingPass      -- array: info-hash -> passphrase, for a download to decrypt
+local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
+local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
 local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned on close)
 
--- Optional end-to-end encryption (mirrors the channels demo). A passphrase turns
--- a share into ciphertext under a NEUTRAL name: the swarm only ever sees the .enc
--- blob, the real filename rides inside the share code, and the passphrase (shared
--- separately) is what actually unlocks the bytes. Same chunked AES framing as the
--- channels demo so the two stay in step.
-constant kEncChunk = 4194304     -- 4 MiB of plaintext per encrypted chunk
-constant kEncMagic = "BTXFENC1"  -- 8-byte header at the front of every .enc file
+-- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
+-- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
+-- the swarm only ever sees the .enc blob, the real filename and the Argon2id salt
+-- ride inside the share code, and the passphrase (shared separately) is what
+-- actually unlocks the bytes. Requires the org.openxtalk.library.sodium extension.
 constant kCodePrefix = "BTXQS1:" -- marks an encrypted share code (vs a bare hash)
+-- a fixed token sealed with the file key and carried in the share code, so the
+-- receiver can verify the passphrase LOCALLY before downloading anything (a wrong
+-- passphrase never pulls a useless .enc to disk).
+constant kQsVerify = "BTXQSVERIFY"
 
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
@@ -288,12 +296,12 @@ command qsStart
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    put "true" into sPolling
-   -- probe AES once so the passphrase fields can fail closed on a build without it
+   -- probe cryptoXT once so the passphrase fields can fail closed when it is absent
    put qsCanEncrypt() into sCanEncrypt
    if sCanEncrypt then
       qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
-      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption is unavailable on this build.)"
+      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
@@ -349,7 +357,7 @@ end qsDashOnce
 -- the hash plus the real filename so the receiver can name + unlock it.
 command qsShareFile pPath
    local tData, tH, tHash, tParent, tName, tPass
-   local tEncPath, tEncParent, tErr
+   local tEncPath, tEncParent, tErr, tSalt, tKey, tVerifier
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsShareFile
@@ -374,7 +382,7 @@ command qsShareFile pPath
    end if
    put qsTrim(field "qsSendPass") into tPass
    if tPass is not empty and not sCanEncrypt then
-      qsLog "This OXT build cannot encrypt (AES unavailable) - sharing WITHOUT a passphrase."
+      qsLog "cryptoXT (org.openxtalk.library.sodium) is not installed - sharing WITHOUT a passphrase. Install it to encrypt."
       put empty into tPass
    end if
    if tPass is empty then
@@ -400,10 +408,16 @@ command qsShareFile pPath
       set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " (not encrypted) - keep this window open so your friend can download.")
       qsLog "Got a code for" && quote & tName & quote & ". Click Copy and send it to your friend."
    else
-      -- encrypted share: encrypt to a temp .enc, then seed the ciphertext
+      -- encrypted share: derive a key from the passphrase + a fresh random salt
+      -- (the salt rides in the share code), encrypt to a temp .enc with cryptoXT,
+      -- then seed the ciphertext.
       put qsTempEncPath() into tEncPath
+      put sxRandomBytes(16) into tSalt
+      put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      -- a small authenticator so the receiver can check the passphrase up front
+      put sxSecretBox(textEncode(kQsVerify, "ASCII"), tKey) into tVerifier
       qsLog "Encrypting" && quote & tName & quote & "- the app may pause briefly on a large file..."
-      put qsEncryptFile(pPath, tEncPath, tPass) into tErr
+      put qsEncryptFile(pPath, tEncPath, tKey) into tErr
       if tErr is not empty then
          qsLog "Could not encrypt" && quote & tName & quote & ":" && tErr
          exit qsShareFile
@@ -430,7 +444,7 @@ command qsShareFile pPath
       end if
       put tName into sXferName[toLower(tHash)]    -- show the REAL name locally
       put tEncPath into sTempEnc[toLower(tHash)]  -- clean up on close
-      put qsMakeCode(tHash, tName) into sShareCode
+      put qsMakeCode(tHash, tName, tSalt, tVerifier) into sShareCode
       set the text of field "qsCode" to sShareCode
       set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " ENCRYPTED - send the code AND tell your friend the passphrase separately.")
       qsLog "Encrypted" && quote & tName & quote & ". Send the code (Copy) AND the passphrase - your friend needs both."
@@ -460,7 +474,7 @@ end qsCopyCode
 -- the real filename, and needs the passphrase. We stash the passphrase + name
 -- against the hash so qsMaybeDecryptFinished can unlock the .enc when it lands.
 command qsGetFile
-   local tCode, tMag, tH, tHash, tName, tPass, tRest, tB64
+   local tCode, tMag, tH, tHash, tName, tPass, tRest, tB64, tB64Salt, tB64Verify, tSalt, tKey
    if sSession is 0 then
       qsLog "No session - reopen the stack."
       exit qsGetFile
@@ -472,9 +486,9 @@ command qsGetFile
    end if
    put qsTrim(field "qsRecvPass") into tPass
    if tCode begins with kCodePrefix then
-      -- locked share code: BTXQS1:<hash>:<base64 of the original filename>
+      -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>:<base64 verifier>
       if not sCanEncrypt then
-         qsLog "This code is locked, but this OXT build cannot decrypt (AES unavailable)."
+         qsLog "This code is locked, but cryptoXT (org.openxtalk.library.sodium) is not installed - cannot decrypt."
          exit qsGetFile
       end if
       if tPass is empty then
@@ -485,16 +499,36 @@ command qsGetFile
       set the itemDelimiter to ":"
       put item 1 of tRest into tHash
       put item 2 of tRest into tB64
+      put item 3 of tRest into tB64Salt
+      put item 4 of tRest into tB64Verify
       put toLower(tHash) into tHash
       if the number of chars of tHash is not 40 and the number of chars of tHash is not 64 then
          qsLog "That locked code looks damaged (bad hash)."
+         exit qsGetFile
+      end if
+      if tB64Salt is empty then
+         qsLog "That locked code is missing its salt (was it made by an older version?)."
          exit qsGetFile
       end if
       put textDecode(base64Decode(tB64), "UTF-8") into tName
       if tName is empty then
          put ("shared-file-" & tHash) into tName
       end if
-      put tPass into sPendingPass[tHash]
+      -- derive the same key the sender used (passphrase + the salt from the code)
+      put base64Decode(tB64Salt) into tSalt
+      put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      -- CHECK THE PASSPHRASE NOW, before downloading anything: if the verifier in
+      -- the code does not open with this key, the passphrase is wrong, so we ask
+      -- again and never pull the .enc to disk. (Older codes have no verifier; those
+      -- fall back to verify-on-finish.)
+      if tB64Verify is not empty and not qsKeyOpensVerifier(tKey, tB64Verify) then
+         qsLog "That passphrase does not match this file. Check it and click Download again."
+         answer "That passphrase does not match this locked file." & return & return & \
+            "Check the passphrase your friend gave you and try again." with "OK"
+         select the text of field "qsRecvPass"
+         exit qsGetFile
+      end if
+      put tKey into sPendingKey[tHash]
       put tName into sPendingName[tHash]
       put tName into sXferName[tHash]            -- show the real name while it downloads
       put "magnet:?xt=urn:btih:" & tHash & "&tr=" & qsTracker() into tMag
@@ -685,35 +719,51 @@ function qsTrim pText
    return tT
 end qsTrim
 
--- ---- optional end-to-end encryption (chunked AES, mirrors the channels demo) -
--- Does AES round-trip on this build? Probed once at start so the passphrase
--- fields can fail closed rather than silently sharing in the clear.
+-- ---- optional end-to-end encryption (cryptoXT / libsodium) -------------------
+-- Is cryptoXT installed and working? A real secretbox round-trip with a random
+-- key (fast - no Argon2id), wrapped in a try so a missing org.openxtalk.library.
+-- sodium is a clean "no". Probed once at start so the passphrase fields can fail
+-- closed rather than erroring.
 function qsCanEncrypt
-   local tProbe, tCipher
-   put textEncode("probe", "ASCII") into tProbe
-   encrypt tProbe using "aes-256-cbc" with password "probe-key"
-   if the result is not empty then
+   local tKey, tBox, tOut, tErr
+   try
+      put sxRandomBytes(32) into tKey
+      put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
+      put sxSecretBoxOpen(tBox, tKey) into tOut
+   catch tErr
       return false
-   end if
-   put it into tCipher
-   decrypt tCipher using "aes-256-cbc" with password "probe-key"
-   if the result is not empty then
-      return false
-   end if
-   return (it is tProbe)
+   end try
+   return (textDecode(tOut, "ASCII") is "probe")
 end qsCanEncrypt
 
--- Build the locked share code: a prefix, the .enc info-hash, and the original
--- filename (base64'd so it survives as plain ASCII inside the code). The colon is
--- a safe delimiter because neither a hex hash nor base64 ever contains one.
-function qsMakeCode pHash, pName
+-- A small helper: base64 with the line breaks stripped so a code stays one line.
+function qsB64 pData
    local tB64
-   put base64Encode(textEncode(pName, "UTF-8")) into tB64
-   -- base64Encode wraps long input; strip CR + LF so the code stays a single line
+   put base64Encode(pData) into tB64
    replace numToChar(13) with "" in tB64
    replace numToChar(10) with "" in tB64
-   return kCodePrefix & pHash & ":" & tB64
+   return tB64
+end qsB64
+
+-- Build the locked share code: a prefix, the .enc info-hash, the original filename,
+-- the Argon2id salt, and a passphrase verifier (all base64'd). The colon is a safe
+-- delimiter because neither a hex hash nor base64 ever contains one.
+function qsMakeCode pHash, pName, pSalt, pVerifier
+   return kCodePrefix & pHash & ":" & qsB64(textEncode(pName, "UTF-8")) & ":" & \
+      qsB64(pSalt) & ":" & qsB64(pVerifier)
 end qsMakeCode
+
+-- Does pKey open the passphrase verifier carried in a share code? Used to check
+-- the passphrase BEFORE downloading, so a wrong one never fetches a .enc.
+function qsKeyOpensVerifier pKey, pB64Verify
+   local tOut, tErr
+   try
+      put sxSecretBoxOpen(base64Decode(pB64Verify), pKey) into tOut
+   catch tErr
+      return false
+   end try
+   return (textDecode(tOut, "ASCII") is kQsVerify)
+end qsKeyOpensVerifier
 
 -- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
 function qsTempEncPath
@@ -725,132 +775,58 @@ function qsTempEncPath
    return tBase & "/btxshare-" & the milliseconds & "-" & random(999999) & ".enc"
 end qsTempEncPath
 
--- big-endian u32 <-> 4 bytes, so the chunk framing is identical on every machine
-function qsU32be pN
-   return numToByte((pN div 16777216) mod 256) & numToByte((pN div 65536) mod 256) & \
-      numToByte((pN div 256) mod 256) & numToByte(pN mod 256)
-end qsU32be
-
-function qsU32beDecode pBytes
-   return (byteToNum(byte 1 of pBytes) * 16777216) + (byteToNum(byte 2 of pBytes) * 65536) + \
-      (byteToNum(byte 3 of pBytes) * 256) + byteToNum(byte 4 of pBytes)
-end qsU32beDecode
-
--- Encrypt pSrc to pDst in fixed chunks so a big file never has to fit in memory:
--- an 8-byte magic, then repeated [u32be cipherLen][cipher]. Returns "" on success,
--- else an error string. Each chunk carries its own random salt via the engine.
-function qsEncryptFile pSrc, pDst, pPass
-   local tChunk, tCipher, tErr
+-- Encrypt/decrypt a file with the 32-byte key pKey via cryptoXT (libsodium
+-- secretstream, streamed entirely C-side so the bytes never enter a Data, with
+-- per-chunk authentication). Returns "" on success, else an error string.
+function qsEncryptFile pSrc, pDst, pKey
+   local tErr
    try
       if there is a file pDst then
          delete file pDst
       end if
-      open file pSrc for binary read
-      if the result is not empty then
-         return ("cannot open the file to read: " & the result)
-      end if
-      open file pDst for binary write
-      if the result is not empty then
-         close file pSrc
-         return ("cannot open the encrypted file to write: " & the result)
-      end if
-      write textEncode(kEncMagic, "ASCII") to file pDst
-      repeat
-         read from file pSrc for kEncChunk
-         put it into tChunk
-         if tChunk is empty then
-            exit repeat
-         end if
-         encrypt tChunk using "aes-256-cbc" with password pPass
-         if the result is not empty then
-            close file pSrc
-            close file pDst
-            return ("encrypt error: " & the result)
-         end if
-         put it into tCipher
-         write qsU32be(the number of bytes in tCipher) & tCipher to file pDst
-      end repeat
-      close file pSrc
-      close file pDst
-      return ""
+      sxEncryptFile pSrc, pDst, pKey
    catch tErr
       return tErr
    end try
+   return ""
 end qsEncryptFile
 
--- Decrypt pSrc (a .enc) to pDst. Returns "" on success, else an error string.
-function qsDecryptFile pSrc, pDst, pPass
-   local tHdr, tLenBytes, tLen, tCipher, tErr
+function qsDecryptFile pSrc, pDst, pKey
+   local tErr
    try
-      if there is a file pDst then
-         delete file pDst
-      end if
-      open file pSrc for binary read
-      if the result is not empty then
-         return ("cannot open the encrypted file to read: " & the result)
-      end if
-      read from file pSrc for 8
-      put it into tHdr
-      if textDecode(tHdr, "ASCII") is not kEncMagic then
-         close file pSrc
-         return "not a TorrentXT encrypted file"
-      end if
-      open file pDst for binary write
-      if the result is not empty then
-         close file pSrc
-         return ("cannot open the output file to write: " & the result)
-      end if
-      repeat
-         read from file pSrc for 4
-         put it into tLenBytes
-         if tLenBytes is empty then
-            exit repeat
-         end if
-         if the number of bytes in tLenBytes < 4 then
-            close file pSrc
-            close file pDst
-            return "the encrypted file is truncated"
-         end if
-         put qsU32beDecode(tLenBytes) into tLen
-         read from file pSrc for tLen
-         put it into tCipher
-         decrypt tCipher using "aes-256-cbc" with password pPass
-         if the result is not empty then
-            close file pSrc
-            close file pDst
-            return "wrong passphrase, or the file is corrupt"
-         end if
-         write it to file pDst
-      end repeat
-      close file pSrc
-      close file pDst
-      return ""
+      sxDecryptFile pSrc, pDst, pKey
    catch tErr
       return tErr
    end try
+   return ""
 end qsDecryptFile
 
 -- When a LOCKED download finishes, decrypt the .enc to its real name beside it.
 -- A no-op for a plain download (nothing stashed against its info-hash). The .enc
 -- is left in place so the receiver keeps seeding it to the swarm.
 command qsMaybeDecryptFinished pTorrent
-   local tS, tHash, tSave, tEncName, tOut, tErr
+   local tS, tHash, tSave, tEncName, tEncPath, tOut, tErr
    put btTorrentStatus(pTorrent) into tS
    put toLower(tS["infoHashV1"]) into tHash
-   if tHash is empty or sPendingPass[tHash] is empty then
+   if tHash is empty or sPendingKey[tHash] is empty then
       exit qsMaybeDecryptFinished
    end if
    put tS["savePath"] into tSave
    put tS["name"] into tEncName            -- the neutral .enc filename
+   put tSave & "/" & tEncName into tEncPath
    put tSave & "/" & sPendingName[tHash] into tOut
    qsLog "Unlocking" && quote & sPendingName[tHash] & quote & "- the app may pause briefly on a large file..."
-   put qsDecryptFile(tSave & "/" & tEncName, tOut, sPendingPass[tHash]) into tErr
+   put qsDecryptFile(tEncPath, tOut, sPendingKey[tHash]) into tErr
+   -- drop the torrent and DELETE the .enc so no encrypted blob is left in the
+   -- user's folder. btRemoveTorrent (deleteFiles = true) removes the .enc; the
+   -- decrypted real file is not part of the torrent, so it stays.
+   btRemoveTorrent sSession, pTorrent, true
    if tErr is not empty then
-      qsLog "Could not unlock" && quote & sPendingName[tHash] & quote & ":" && tErr
+      qsLog "Could not unlock" && quote & sPendingName[tHash] & quote & ":" && tErr & " (the encrypted copy was removed)."
    else
-      qsLog "Unlocked to" && quote & sPendingName[tHash] & quote & "in" && tSave & "."
+      qsLog "Unlocked to" && quote & sPendingName[tHash] & quote & "in" && tSave & ". (Encrypted copy cleaned up.)"
    end if
-   put empty into sPendingPass[tHash]
+   put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]
 end qsMaybeDecryptFinished
 
