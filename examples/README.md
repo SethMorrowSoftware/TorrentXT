@@ -1,6 +1,6 @@
 # TorrentXT Examples
 
-Four self-contained demo apps and one reusable helper, all written in pure xTalk on
+Five self-contained demo apps and one reusable helper, all written in pure xTalk on
 top of the **TorrentXT** extension. Each demo is a single stack script: you paste it
 into a stack, reopen the stack, and it builds its own UI and starts a BitTorrent
 session automatically. No helper stacks, no manual layout.
@@ -12,10 +12,12 @@ session automatically. No helper stacks, no manual layout.
 | `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. | Only for the optional passphrase lock |
 | `torrent-client.livecodescript` | A full multi-torrent client: add magnets / `.torrent` files / URLs, seed a folder, and manage many torrents with a live Files / Peers / Trackers / Log inspector. | No |
 | `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). | Only for private (passphrase) channels |
+| `torrent-rp1-chat.livecodescript` | A two-machine **messaging** demo: two peers meet on a shared "room" id and chat directly over the `rp1` peer-wire extension, with no tracker, no server, and no file transfer at all. | No |
 | `torrent-helpers.livecodescript` | A building block, NOT a demo: a poll dispatcher so your own app can drive TorrentXT with plain event handlers. See the last section. | No |
 
 Start with **quickshare** if you just want to see it work, then **client**, then
-**channels** for the full decentralized story.
+**channels** for the full decentralized story, and **rp1 chat** for serverless
+peer-to-peer messaging (a different paradigm: no files, just live messages).
 
 ## Before you start
 
@@ -79,10 +81,23 @@ encrypted, and only followers you give the passphrase to can read anything. Your
 identity, channels, and subscriptions persist automatically, and **Lock Identity**
 seals that saved state with a passphrase.
 
+### rp1 Chat (`torrent-rp1-chat.livecodescript`)
+A different paradigm from the file-transfer demos: **live messaging**, no files. It
+shows off the `rp1` peer-wire extension (the transport the Riptide project rides).
+On two machines, type the **same room name** and click **Join**. Each side joins a
+metadata-less "phantom swarm" at that room's id and announces on the DHT; the DHT
+introduces the two peers, they complete the `rp1` handshake, and then anything you
+type travels straight to the other machine over the peer wire, with **no tracker, no
+server, and no content**. Watch the log: you will see the peer connect, become
+"rp1-capable", and then your messages cross. Messages here are **plaintext on
+purpose** so you can see the transport working; Riptide layers end-to-end encryption
+(SodiumXT) on top of this exact channel. This demo needs a **live peer** to show
+anything, so it is a two-machine test by nature.
+
 ## Two-machine demos and the DHT
 
-Quickshare and Channels are peer to peer, so they are best tried on **two different
-computers** (ideally on different networks). A few things to expect:
+Quickshare, Channels, and rp1 Chat are peer to peer, so they are best tried on **two
+different computers** (ideally on different networks). A few things to expect:
 
 - **Give the DHT a few seconds** to find peers before the first transfer. A brand
   new session has to bootstrap into the swarm.

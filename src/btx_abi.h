@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 9
+#define BTX_ABI_VERSION 10
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -207,6 +207,15 @@ BTX_API int BTX_CALL btx_add_torrent_file_ex(int s, const void *data, int len,
                                              const char *savePath,
                                              const char *flagsDec,
                                              const char *maskDec);
+
+/* Add a torrent by BARE 40-hex info-hash with NO metadata (ABI v10) — the
+ * "phantom swarm": libtorrent joins the swarm, accepts peer connections, and
+ * completes the BitTorrent + BEP10 handshake without ever fetching an info dict.
+ * Combined with btx_dht_announce/get_peers on the same id and btx_rp1_* below,
+ * this is a metadata-free peer meeting point (Riptide rendezvous). Returns a
+ * torrent handle (0 on failure). */
+BTX_API int BTX_CALL btx_add_infohash(int s, const char *infoHashHex,
+                                      const char *savePath);
 
 /* Remove a torrent; deleteFiles != 0 also deletes downloaded files. */
 BTX_API int BTX_CALL btx_remove(int s, int t, int deleteFiles);
@@ -405,6 +414,49 @@ BTX_API int BTX_CALL btx_dht_put_signed(int s, const char *publicKeyHex,
                                         const char *salt, const char *seqDec,
                                         const void *value, int len,
                                         const char *signatureHex);
+
+/* ====================================================================== *
+ *  rp1 — a custom BEP10 peer-wire extension (ABI v10)
+ *
+ *  BEP10 lets peers negotiate named extensions in the wire handshake and then
+ *  exchange messages under them. rp1 registers the extension name "rp1" and
+ *  moves OPAQUE bytes under it — TorrentXT neither frames nor interprets the
+ *  payload (the caller owns any sub-typing). This is the transport a serverless
+ *  messaging layer (Riptide) rides: pair it with a phantom swarm
+ *  (btx_add_infohash) and DHT rendezvous (btx_dht_get_peers) and two peers can
+ *  meet on a bare id and talk with no tracker, no server, and no real content.
+ *
+ *  THREADING: rp1 is opt-in PER SESSION and, like everything else, never calls
+ *  script from libtorrent's thread. Inbound events (peer up/down, handshake,
+ *  message) are queued and drained by btx_rp1_poll on the caller's thread, in
+ *  the SAME record framing as btx_pop_alerts. Outbound sends are queued and go
+ *  out on libtorrent's next per-peer tick (a documented <=1s latency), which is
+ *  also what flushes them — no peer-connection method is ever touched off-thread.
+ * ====================================================================== */
+
+/* Turn on the rp1 extension for this session (installs the peer-wire plugin).
+ * Idempotent. Must be called before adding the swarms it should apply to; it
+ * then advertises rp1 on every torrent in the session. A session that never
+ * calls this never advertises rp1. Returns BTX_OK / negative. */
+BTX_API int BTX_CALL btx_rp1_enable(int s);
+
+/* Set the opaque blob published in our extended-handshake "rp1_tok" field (e.g.
+ * a signed recognition token). Copied; sent on handshakes made AFTER this call.
+ * Pass len 0 to clear. Returns BTX_OK / negative (needs rp1 enabled). */
+BTX_API int BTX_CALL btx_rp1_set_token(int s, const void *data, int len);
+
+/* Queue one rp1 message of `len` opaque bytes to peer `peerId` (from an rp1
+ * event). It is sent on libtorrent's next tick for that peer. Fails with
+ * BTX_ERR_INVALID_ARG if the peer is unknown, gone, or has not completed an
+ * rp1 handshake (so we do not know its extension id yet). Returns BTX_OK /
+ * negative. `len` is capped like any single peer-wire message. */
+BTX_API int BTX_CALL btx_rp1_send(int s, int peerId, const void *data, int len);
+
+/* Drain queued rp1 events into `out` in the EXACT btx_pop_alerts framing
+ * ([count:u16] then per-event [type:u16][bodyLen:u16][kvrecord]), so the same
+ * LCB walker parses both. Returns the number of events written (>=0), or
+ * -needed when the first pending event will not fit. Never drops an event. */
+BTX_API int BTX_CALL btx_rp1_poll(int s, void *out, int cap);
 
 /* ====================================================================== *
  *  Persistence (resume data) — async, libtorrent's model (plan §4.3)

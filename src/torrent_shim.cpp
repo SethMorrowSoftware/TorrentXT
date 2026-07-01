@@ -80,10 +80,14 @@
 #include <libtorrent/kademlia/item.hpp>       /* sign_mutable_item (BEP44 mutable) */
 #include <libtorrent/kademlia/types.hpp>      /* public_key / secret_key / signature */
 #include <libtorrent/entry.hpp>               /* lt::entry for DHT item values */
+#include <libtorrent/extensions.hpp>          /* rp1: the BEP10 plugin interface */
+#include <libtorrent/peer_connection_handle.hpp> /* rp1: send_buffer / pid / remote */
 
 /* ---- standard library ------------------------------------------------------ */
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -145,6 +149,312 @@ struct PendingAlert {
     bool hasDhtPeers = false;         std::string dhtPeers;  /* newline "ip:port" */
 };
 
+/* ====================================================================== *
+ *  rp1 — a custom BEP10 peer-wire extension (the Riptide transport)
+ *
+ *  A libtorrent plugin trio (session -> torrent -> peer). EVERY callback below
+ *  runs on libtorrent's NETWORK thread, so — rule 1 — none of them ever touch
+ *  script. Inbound events are pushed onto a queue that btx_rp1_poll drains on the
+ *  caller's thread; outbound messages are queued by btx_rp1_send and actually
+ *  sent from the per-peer tick() (which is also where libtorrent flushes the send
+ *  buffer — the documented "queue, send in tick()" pattern, so we never call a
+ *  peer-connection method off the network thread). One mutex guards all shared
+ *  state. Uses ONLY libtorrent's public plugin + peer_connection_handle API.
+ * ====================================================================== */
+
+/* rp1 moves opaque bytes; we cap one message so it always fits a single
+ * u16-length record field (the poll framing) with room to spare. Riptide chunks
+ * larger payloads; an inbound message over the cap is DROPPED, never truncated
+ * (silent truncation would corrupt a stream). */
+static const int kRp1MaxPayload = 60000;
+
+/* "ip:port", IPv6 bracketed. */
+static std::string endpoint_to_str(const lt::tcp::endpoint &ep) {
+    std::string ip = ep.address().to_string();
+    std::string s = ep.address().is_v6() ? ("[" + ip + "]") : ip;
+    s += ":" + std::to_string(ep.port());
+    return s;
+}
+
+/* The smallest positive extended-message id not already claimed by another
+ * extension in the handshake. Factored so the smoke test exercises the real
+ * selection the peer plugin uses. */
+static int rp1_pick_free_id(const std::set<int> &used) {
+    int id = 1;
+    while (used.count(id)) ++id;
+    return id;
+}
+
+/* One BEP10 extended message on the wire: [len:u32][20][extId][payload], with
+ * len = 2 + payload, all framing bytes network order. `extId` is the id the PEER
+ * advertised for rp1 (outbound messages travel under the peer's namespace). */
+static std::vector<char> build_rp1_message(uint8_t extId, const void *data,
+                                           size_t len) {
+    std::vector<char> b;
+    b.reserve(6 + len);
+    const uint32_t total = static_cast<uint32_t>(2 + len);
+    b.push_back(static_cast<char>((total >> 24) & 0xFF));
+    b.push_back(static_cast<char>((total >> 16) & 0xFF));
+    b.push_back(static_cast<char>((total >> 8) & 0xFF));
+    b.push_back(static_cast<char>(total & 0xFF));
+    b.push_back(static_cast<char>(20));       /* bt_peer_connection::msg_extended */
+    b.push_back(static_cast<char>(extId));
+    if (data && len) {
+        const char *p = static_cast<const char *>(data);
+        b.insert(b.end(), p, p + len);
+    }
+    return b;
+}
+
+/* Shared per-connection record, held by BOTH the peer_plugin and the session
+ * plugin's table, so a send queued from the caller thread survives until the
+ * peer's tick() drains it. The fields the caller thread reads/writes (peerRp1Id,
+ * supportsRp1, alive, outgoing) are ONLY ever touched under the session mutex. */
+struct Rp1Peer {
+    int id;
+    lt::peer_connection_handle handle;   /* a weak-ptr wrapper; copyable, network-thread only */
+    std::string swarmHex;                /* the torrent info-hash it joined on */
+    int localRp1Id = 0;                  /* OUR id for inbound rp1 (set in add_handshake) */
+    int peerRp1Id = 0;                   /* peer's id for OUTBOUND rp1 (0 = none/unsupported) */
+    bool supportsRp1 = false;
+    bool alive = true;
+    std::deque<std::vector<char>> outgoing;  /* framed messages awaiting tick() */
+
+    /* peer_connection_handle has no default ctor, so Rp1Peer needs one. */
+    Rp1Peer(int id_, lt::peer_connection_handle h, std::string sw)
+        : id(id_), handle(std::move(h)), swarmHex(std::move(sw)) {}
+};
+
+/* One queued inbound event, serialised by the drain in the alert framing. */
+struct Rp1Event {
+    uint16_t type = 0;
+    int peerId = 0;
+    std::string swarmHex;
+    bool hasPeerId = false;   std::string peerIdHex;
+    bool hasEndpoint = false; std::string endpoint;
+    bool hasSupports = false; int supports = 0;
+    bool hasToken = false;    std::vector<char> token;
+    bool hasPayload = false;  std::vector<char> payload;
+};
+
+static void write_rp1_entry(btx::RecordWriter &rw, const Rp1Event &ev) {
+    rw.put_u16(ev.type);
+    const size_t bodyAt = rw.pos();
+    rw.put_u16(0);
+    const size_t bodyStart = rw.pos();
+    {
+        btx::KVRecord r(rw);
+        r.put_int(btx::F_RP1_PEER, ev.peerId);
+        if (!ev.swarmHex.empty()) r.put_hex(btx::F_EVT_INFO_HASH_V1, ev.swarmHex);
+        if (ev.hasPeerId)   r.put_hex(btx::F_RP1_PEER_ID, ev.peerIdHex);
+        if (ev.hasEndpoint) r.put_str(btx::F_RP1_ENDPOINT, ev.endpoint);
+        if (ev.hasSupports) r.put_int(btx::F_RP1_SUPPORTS, ev.supports);
+        if (ev.hasToken)    r.put_bytes(btx::F_RP1_TOKEN, ev.token.data(), ev.token.size());
+        if (ev.hasPayload)  r.put_bytes(btx::F_RP1_PAYLOAD, ev.payload.data(), ev.payload.size());
+        r.finish();
+    }
+    rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
+}
+
+static size_t measure_rp1_entry(const Rp1Event &ev) {
+    btx::RecordWriter probe(nullptr, 0);
+    write_rp1_entry(probe, ev);
+    return probe.pos();
+}
+
+struct Rp1TorrentPlugin;  /* forward */
+struct Rp1PeerPlugin;     /* forward */
+
+/* The session-level plugin: owns all shared rp1 state and is the object the
+ * btx_rp1_* entry points reach through SessionState::rp1. */
+struct Rp1SessionPlugin : lt::plugin,
+                          std::enable_shared_from_this<Rp1SessionPlugin> {
+    std::mutex mx;
+    std::unordered_map<int, std::shared_ptr<Rp1Peer>> peers;
+    std::deque<Rp1Event> events;
+    int nextPeerId = 1;
+    std::vector<char> token;   /* our outbound "rp1_tok" handshake blob */
+
+    std::shared_ptr<lt::torrent_plugin> new_torrent(
+        lt::torrent_handle const &h, lt::client_data_t) override;
+
+    /* ---- network-thread side (called from the torrent / peer plugins) ---- */
+    std::shared_ptr<Rp1Peer> add_peer(lt::peer_connection_handle const &pc,
+                                      const std::string &swarmHex) {
+        std::lock_guard<std::mutex> lk(mx);
+        auto p = std::make_shared<Rp1Peer>(nextPeerId++, pc, swarmHex);
+        peers[p->id] = p;
+        Rp1Event ev;
+        ev.type = btx::A_RP1_PEER_CONNECTED; ev.peerId = p->id; ev.swarmHex = swarmHex;
+        ev.hasEndpoint = true; ev.endpoint = endpoint_to_str(pc.remote());
+        events.push_back(std::move(ev));
+        return p;
+    }
+    void drop_peer(int id, const std::string &swarmHex) {
+        std::lock_guard<std::mutex> lk(mx);
+        auto it = peers.find(id);
+        if (it != peers.end()) { it->second->alive = false; peers.erase(it); }
+        Rp1Event ev;
+        ev.type = btx::A_RP1_PEER_DISCONNECTED; ev.peerId = id; ev.swarmHex = swarmHex;
+        events.push_back(std::move(ev));
+    }
+    void push_event(Rp1Event ev) {
+        std::lock_guard<std::mutex> lk(mx);
+        events.push_back(std::move(ev));
+    }
+    std::vector<char> current_token() {
+        std::lock_guard<std::mutex> lk(mx);
+        return token;
+    }
+
+    /* ---- caller-thread side (the btx_rp1_* entry points) ---- */
+    int queue_send(int peerId, const void *data, int len) {
+        std::lock_guard<std::mutex> lk(mx);
+        auto it = peers.find(peerId);
+        if (it == peers.end() || !it->second->alive) return BTX_ERR_INVALID_ARG;
+        Rp1Peer &p = *it->second;
+        if (!p.supportsRp1 || p.peerRp1Id == 0) return BTX_ERR_INVALID_ARG;
+        p.outgoing.push_back(build_rp1_message(
+            static_cast<uint8_t>(p.peerRp1Id), data, static_cast<size_t>(len)));
+        return BTX_OK;
+    }
+    void set_token(const void *data, int len) {
+        std::lock_guard<std::mutex> lk(mx);
+        if (!data || len <= 0) { token.clear(); return; }
+        const char *p = static_cast<const char *>(data);
+        token.assign(p, p + len);
+    }
+    int drain(void *out, int cap) {
+        std::lock_guard<std::mutex> lk(mx);
+        const size_t capz = static_cast<size_t>(cap < 0 ? 0 : cap);
+        btx::RecordWriter w(out, cap);
+        const size_t countAt = w.pos();
+        w.put_u16(0);
+        uint16_t n = 0;
+        while (!events.empty()) {
+            const size_t need = measure_rp1_entry(events.front());
+            if (n == 0 && (2 + need) > capz) return -static_cast<int>(2 + need);
+            if (w.pos() + need > capz) break;   /* leave the rest for the next poll */
+            write_rp1_entry(w, events.front());
+            events.pop_front();
+            ++n;
+        }
+        w.patch_u16(countAt, n);
+        return static_cast<int>(n);
+    }
+};
+
+/* Per-peer plugin: registers rp1 in the handshake, learns the peer's rp1 id,
+ * surfaces inbound messages, and flushes queued outbound messages in tick(). */
+struct Rp1PeerPlugin : lt::peer_plugin {
+    std::shared_ptr<Rp1SessionPlugin> ses;
+    std::shared_ptr<Rp1Peer> peer;
+
+    Rp1PeerPlugin(std::shared_ptr<Rp1SessionPlugin> s, std::shared_ptr<Rp1Peer> p)
+        : ses(std::move(s)), peer(std::move(p)) {}
+
+    lt::string_view type() const override { return "rp1"; }
+
+    void add_handshake(lt::entry &h) override {
+        /* Advertise rp1 with an id not already used by another extension in this
+         * handshake (ut_pex/ut_metadata add theirs before us). */
+        lt::entry &m = h["m"];
+        std::set<int> used;
+        if (m.type() == lt::entry::dictionary_t) {
+            for (auto const &kv : m.dict())
+                if (kv.second.type() == lt::entry::int_t)
+                    used.insert(static_cast<int>(kv.second.integer()));
+        }
+        const int id = rp1_pick_free_id(used);
+        m["rp1"] = id;
+        peer->localRp1Id = id;
+        std::vector<char> tok = ses->current_token();
+        if (!tok.empty()) h["rp1_tok"] = std::string(tok.begin(), tok.end());
+    }
+
+    bool on_extension_handshake(lt::bdecode_node const &node) override {
+        Rp1Event ev;
+        ev.type = btx::A_RP1_HANDSHAKE; ev.peerId = peer->id; ev.swarmHex = peer->swarmHex;
+        ev.hasPeerId = true;
+        ev.peerIdHex = btx::to_hex(
+            reinterpret_cast<const uint8_t *>(peer->handle.pid().data()), 20);
+        ev.hasEndpoint = true; ev.endpoint = endpoint_to_str(peer->handle.remote());
+
+        bool supports = false;
+        lt::bdecode_node m = node.dict_find_dict("m");
+        if (m.type() == lt::bdecode_node::dict_t) {
+            std::int64_t rid = m.dict_find_int_value("rp1", -1);
+            if (rid >= 0) {
+                supports = true;
+                std::lock_guard<std::mutex> lk(ses->mx);
+                peer->peerRp1Id = static_cast<int>(rid);
+                peer->supportsRp1 = true;
+            }
+        }
+        ev.hasSupports = true; ev.supports = supports ? 1 : 0;
+
+        lt::string_view tok = node.dict_find_string_value("rp1_tok");
+        if (!tok.empty()) { ev.hasToken = true; ev.token.assign(tok.begin(), tok.end()); }
+        ses->push_event(std::move(ev));
+        return true;   /* keep the plugin even if the peer is not rp1-capable */
+    }
+
+    bool on_extended(int length, int msg, lt::span<char const> body) override {
+        if (msg != peer->localRp1Id) return false;   /* not ours */
+        /* Fragments call us with a growing prefix; deliver only the whole message.
+         * Oversized messages are dropped (never truncated). */
+        if (static_cast<int>(body.size()) == length
+            && length >= 0 && length <= kRp1MaxPayload) {
+            Rp1Event ev;
+            ev.type = btx::A_RP1_MESSAGE; ev.peerId = peer->id; ev.swarmHex = peer->swarmHex;
+            ev.hasPayload = true; ev.payload.assign(body.begin(), body.end());
+            ses->push_event(std::move(ev));
+        }
+        return true;   /* the id is ours: claim it whether or not we surfaced it */
+    }
+
+    void tick() override {
+        std::deque<std::vector<char>> out;
+        {
+            std::lock_guard<std::mutex> lk(ses->mx);
+            out.swap(peer->outgoing);
+        }
+        /* send_buffer only queues bytes; the second_tick that called us flushes
+         * them right after, so no explicit setup_send is needed (nor reachable). */
+        for (auto const &msg : out)
+            peer->handle.send_buffer(msg.data(), static_cast<int>(msg.size()));
+    }
+
+    void on_disconnect(lt::error_code const &) override {
+        ses->drop_peer(peer->id, peer->swarmHex);
+    }
+};
+
+/* Per-torrent plugin: hands every bittorrent peer connection an Rp1PeerPlugin. */
+struct Rp1TorrentPlugin : lt::torrent_plugin {
+    std::shared_ptr<Rp1SessionPlugin> ses;
+    std::string swarmHex;
+
+    Rp1TorrentPlugin(std::shared_ptr<Rp1SessionPlugin> s, lt::torrent_handle const &h)
+        : ses(std::move(s)) {
+        lt::sha1_hash v1 = h.info_hashes().v1;
+        swarmHex = btx::to_hex(reinterpret_cast<const uint8_t *>(v1.data()), 20);
+    }
+
+    std::shared_ptr<lt::peer_plugin> new_connection(
+        lt::peer_connection_handle const &pc) override {
+        if (pc.type() != lt::connection_type::bittorrent)
+            return std::shared_ptr<lt::peer_plugin>();
+        auto peer = ses->add_peer(pc, swarmHex);
+        return std::make_shared<Rp1PeerPlugin>(ses, peer);
+    }
+};
+
+std::shared_ptr<lt::torrent_plugin> Rp1SessionPlugin::new_torrent(
+    lt::torrent_handle const &h, lt::client_data_t) {
+    return std::make_shared<Rp1TorrentPlugin>(shared_from_this(), h);
+}
+
 /* The whole world a session owns. Boxed in a unique_ptr inside the session
  * handle table so it has a stable address and a deterministic destruction order
  * (the proxy must outlive nothing and the session must be torn down explicitly —
@@ -153,6 +463,11 @@ struct SessionState {
     /* lt::session is constructed in btx_session_new and lives until
      * btx_session_free aborts it; declared first so it is destroyed last. */
     std::unique_ptr<lt::session> ses;
+
+    /* The rp1 BEP10 plugin, installed on btx_rp1_enable (null until then). The
+     * session (via add_extension) and this pointer co-own it; the object outlives
+     * whichever releases first, so the network thread never sees it vanish. */
+    std::shared_ptr<Rp1SessionPlugin> rp1;
 
     /* Our torrent handles. We hand script a small positive int; the real
      * lt::torrent_handle (a weak ref) lives in the slot and we check is_valid()
@@ -823,6 +1138,29 @@ extern "C" BTX_API int BTX_CALL btx_add_magnet(int s, const char *uri,
         /* The SYNCHRONOUS add_torrent(params&&, ec) returns the handle now, so
          * btx_add_magnet can hand script a usable id immediately; metadata for a
          * magnet still arrives later as a metadataReceived alert. */
+        lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
+        if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
+        return register_torrent(st, h);
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_add_infohash(int s, const char *infoHashHex,
+                                                 const char *savePath) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return 0; }
+        char buf[20];
+        if (!hex_to_buf(infoHashHex, buf, 20)) {
+            set_error("info-hash must be 40 hex chars"); return 0;
+        }
+        /* Add a metadata-less swarm from just the v1 info-hash — the phantom swarm.
+         * libtorrent forms peer connections and completes the BitTorrent + BEP10
+         * handshake without ever fetching an info dict (which no peer serves here),
+         * which is exactly the meeting point rp1 rides on. */
+        lt::add_torrent_params atp;
+        atp.info_hashes = lt::info_hash_t(lt::sha1_hash(buf));
+        atp.save_path = (savePath && *savePath) ? savePath : ".";
+        lt::error_code ec;
         lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
         if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
         return register_torrent(st, h);
@@ -2320,6 +2658,59 @@ extern "C" BTX_API int BTX_CALL btx_dht_put_signed(int s, const char *publicKeyH
 }
 
 /* ====================================================================== *
+ *  rp1 — custom BEP10 extension entry points (ABI v10). The subsystem lives
+ *  near the top of the file (the plugin trio); these are the thin FFI wrappers.
+ * ====================================================================== */
+
+extern "C" BTX_API int BTX_CALL btx_rp1_enable(int s) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (st->rp1) return BTX_OK;   /* idempotent */
+        auto plugin = std::make_shared<Rp1SessionPlugin>();
+        st->ses->add_extension(plugin);   /* shared_ptr<Rp1SessionPlugin> -> plugin */
+        st->rp1 = plugin;
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_rp1_set_token(int s, const void *data, int len) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (!st->rp1) { set_error("rp1 not enabled"); return BTX_ERR_INVALID_ARG; }
+        if (len < 0 || len > kRp1MaxPayload) { set_error("token too large"); return BTX_ERR_INVALID_ARG; }
+        st->rp1->set_token(data, len);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_rp1_send(int s, int peerId, const void *data,
+                                             int len) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (!st->rp1) { set_error("rp1 not enabled"); return BTX_ERR_INVALID_ARG; }
+        if (!data || len < 0 || len > kRp1MaxPayload) {
+            set_error("payload must be 0..60000 bytes"); return BTX_ERR_INVALID_ARG;
+        }
+        int rc = st->rp1->queue_send(peerId, data, len);
+        if (rc != BTX_OK)
+            set_error("unknown peer, gone, or no rp1 handshake yet");
+        return rc;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_rp1_poll(int s, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) return 0;
+        if (!st->rp1) return 0;   /* rp1 not enabled -> no events */
+        return st->rp1->drain(out, cap);
+    });
+}
+
+/* ====================================================================== *
  *  Persistence (resume data) — async (plan §4.3)
  * ====================================================================== */
 
@@ -2497,6 +2888,28 @@ int dht_bep44_sign(const char *seedHex, const char *salt, const char *seqDec,
         if (outPublicKeyHex) std::memcpy(outPublicKeyHex, ph.c_str(), ph.size() + 1);
         if (outSignatureHex) std::memcpy(outSignatureHex, sh.c_str(), sh.size() + 1);
         return 1;
+    });
+}
+
+int rp1_frame(int extId, const void *data, int len, void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        std::vector<char> msg = build_rp1_message(
+            static_cast<uint8_t>(extId), data,
+            static_cast<size_t>(len < 0 ? 0 : len));
+        const size_t need = msg.size();
+        if (out && cap > 0 && need <= static_cast<size_t>(cap))
+            std::memcpy(out, msg.data(), need);
+        if (need > static_cast<size_t>(cap < 0 ? 0 : cap))
+            return -static_cast<int>(need);
+        return static_cast<int>(need);
+    });
+}
+
+int rp1_free_id(const int *used, int count) {
+    BTX_GUARD_ACTION({
+        std::set<int> s;
+        for (int i = 0; i < (count < 0 ? 0 : count); ++i) s.insert(used[i]);
+        return rp1_pick_free_id(s);
     });
 }
 

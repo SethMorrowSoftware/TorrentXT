@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 9
+constant kABIVersion is 10
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -139,6 +139,12 @@ constant kFieldDhtNumSuccess is 111
 constant kFieldDhtSecretKey is 112
 constant kFieldDhtSeed is 113
 constant kFieldDhtPeers is 114
+constant kFieldRp1Peer is 140
+constant kFieldRp1PeerId is 141
+constant kFieldRp1Endpoint is 142
+constant kFieldRp1Supports is 143
+constant kFieldRp1Token is 144
+constant kFieldRp1Payload is 145
 
 -- file entry fields (one record per file from btFileList)
 constant kFieldFilePath is 120
@@ -179,6 +185,10 @@ constant kAlertDhtImmutableItem is 22
 constant kAlertDhtMutableItem is 23
 constant kAlertDhtPut is 24
 constant kAlertDhtGetPeers is 25
+constant kAlertRp1PeerConnected is 26
+constant kAlertRp1Handshake is 27
+constant kAlertRp1Message is 28
+constant kAlertRp1PeerDisconnected is 29
 
 -- ===================================================================== --
 --  Module state: the reusable poll/status buffers
@@ -284,6 +294,12 @@ private foreign handler _btx_dht_get_mutable(in pS as CInt, in pPub as ZStringUT
 private foreign handler _btx_dht_get_peers(in pS as CInt, in pId as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_peers!cdecl"
 private foreign handler _btx_dht_bep44_signbuf(in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_bep44_signbuf!cdecl"
 private foreign handler _btx_dht_put_signed(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pSig as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_put_signed!cdecl"
+
+private foreign handler _btx_add_infohash(in pS as CInt, in pHash as ZStringUTF8, in pSavePath as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_add_infohash!cdecl"
+private foreign handler _btx_rp1_enable(in pS as CInt) returns CInt binds to "c:torrentxt>btx_rp1_enable!cdecl"
+private foreign handler _btx_rp1_set_token(in pS as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_rp1_set_token!cdecl"
+private foreign handler _btx_rp1_send(in pS as CInt, in pPeer as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_rp1_send!cdecl"
+private foreign handler _btx_rp1_poll(in pS as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_rp1_poll!cdecl"
 
 private foreign handler _btx_save_resume(in pT as CInt) returns CInt binds to "c:torrentxt>btx_save_resume!cdecl"
 private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pTrackers as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
@@ -570,6 +586,18 @@ private handler _fieldKey(in pId as Integer) returns String
       return "seed"
    else if pId is kFieldDhtPeers then
       return "peers"
+   else if pId is kFieldRp1Peer then
+      return "peer"
+   else if pId is kFieldRp1PeerId then
+      return "btPeerId"
+   else if pId is kFieldRp1Endpoint then
+      return "endpoint"
+   else if pId is kFieldRp1Supports then
+      return "supportsRp1"
+   else if pId is kFieldRp1Token then
+      return "token"
+   else if pId is kFieldRp1Payload then
+      return "payload"
    else if pId is kFieldFilePath then
       return "path"
    else if pId is kFieldFileSize then
@@ -646,6 +674,14 @@ private handler _alertName(in pCode as Integer) returns String
       return "dhtPut"
    else if pCode is kAlertDhtGetPeers then
       return "dhtGetPeers"
+   else if pCode is kAlertRp1PeerConnected then
+      return "rp1PeerConnected"
+   else if pCode is kAlertRp1Handshake then
+      return "rp1Handshake"
+   else if pCode is kAlertRp1Message then
+      return "rp1Message"
+   else if pCode is kAlertRp1PeerDisconnected then
+      return "rp1PeerDisconnected"
    else
       return "torrentEvent"
    end if
@@ -1774,6 +1810,107 @@ public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integ
       return the empty data
    end if
    return _bufToData(sStatusPtr, tCount)
+end handler
+
+-- ===================================================================== --
+--  Public API: rp1 custom BEP10 extension (Riptide transport)
+-- ===================================================================== --
+
+-- Add a metadata-less "phantom swarm" from a bare 40-hex info-hash. Returns a
+-- torrent handle (0 on failure). Pair with btDhtAnnounce / btDhtGetPeers on the
+-- same id and the btRp1* calls to meet peers with no server and no content.
+public handler btAddInfohash(in pSession as Integer, in pInfoHash as String, in pSavePath as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_add_infohash(pSession, pInfoHash, pSavePath) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Turn on the rp1 extension for this session (idempotent). Call it before adding
+-- the swarms it should apply to. Returns 0 / negative.
+public handler btRp1Enable(in pSession as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_rp1_enable(pSession) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Publish an opaque blob in our extended-handshake "rp1_tok" field (e.g. a signed
+-- recognition token); empty Data clears it. Sent on handshakes made after this
+-- call. Returns 0 / negative (needs rp1 enabled).
+public handler btRp1SetToken(in pSession as Integer, in pToken as Data) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pToken into tLen
+   unsafe
+      put MCDataGetBytePtr(pToken) into tPtr
+      put _btx_rp1_set_token(pSession, tPtr, tLen) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Queue one rp1 message of opaque bytes to a peer (from an rp1 event). It is sent
+-- on libtorrent's next tick for that peer. Fails (-3) if the peer is unknown,
+-- gone, or has not completed an rp1 handshake. Returns 0 / negative.
+public handler btRp1Send(in pSession as Integer, in pPeer as Integer, in pData as Data) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen <= 0 then
+      return -3
+   end if
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+      put _btx_rp1_send(pSession, pPeer, tPtr, tLen) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Drain queued rp1 events (peer up/down, handshake, message). Returns a List of
+-- event Arrays in the SAME shape as btPoll (each with a "name", "code", "peer",
+-- and event-specific keys). Reuses the shared drain buffer.
+public handler btRp1Poll(in pSession as Integer) returns List
+   variable tEvents as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tAlertCount as Integer
+   variable tType as Integer
+   variable tBodyLen as Integer
+   variable tEvent as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tEvents
+   _ensureDrain(kDrainCap)
+   unsafe
+      put _btx_rp1_poll(pSession, sDrainPtr, sDrainCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureDrain(-tCount)
+      unsafe
+         put _btx_rp1_poll(pSession, sDrainPtr, sDrainCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tEvents
+   end if
+   put _bufToData(sDrainPtr, sDrainCap) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tAlertCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tAlertCount
+      put _readU16(tBuf, tOffset) into tType
+      put _readU16(tBuf, tOffset + 2) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 4) into tEvent
+      put tType into tEvent["code"]
+      put _alertName(tType) into tEvent["name"]
+      push tEvent onto tEvents
+      add (4 + tBodyLen) to tOffset
+   end repeat
+   return tEvents
 end handler
 
 -- A library module must be closed with `end library` (matching the opening
