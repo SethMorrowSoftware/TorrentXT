@@ -626,6 +626,50 @@ static void test_dht_bep44() {
     CHECK(btx::test::live_session_count() == 0);
 }
 
+/* rp1 (the BEP10 extension) — the parts reachable without a live peer: the wire
+ * FRAMING and extended-id selection are byte-pinned here; the session lifecycle
+ * (enable/add/send/poll) is exercised for clean returns and memory safety. The
+ * actual peer exchange needs a two-instance OXT pass this environment can't run. */
+static void test_rp1() {
+    /* extended-message-id selection must dodge ut_pex/ut_metadata's ids. */
+    const int u12[] = {1, 2}, u23[] = {2, 3}, u13[] = {1, 3};
+    CHECK(btx::test::rp1_free_id(nullptr, 0) == 1);   /* empty -> 1 */
+    CHECK(btx::test::rp1_free_id(u12, 2) == 3);
+    CHECK(btx::test::rp1_free_id(u23, 2) == 1);
+    CHECK(btx::test::rp1_free_id(u13, 2) == 2);
+
+    /* message framing: [len:u32 = 2+payload][20][extId][payload]. */
+    unsigned char wire[16];
+    CHECK(btx::test::rp1_frame(7, "hi", 2, wire, sizeof wire) == 8);
+    const unsigned char want[8] = {0x00, 0x00, 0x00, 0x04, 20, 7, 'h', 'i'};
+    CHECK(std::memcmp(wire, want, 8) == 0);
+    CHECK(btx::test::rp1_frame(5, nullptr, 0, wire, sizeof wire) == 6);
+    const unsigned char want0[6] = {0x00, 0x00, 0x00, 0x02, 20, 5};
+    CHECK(std::memcmp(wire, want0, 6) == 0);
+    char tiny[1];
+    CHECK(btx::test::rp1_frame(7, "hi", 2, tiny, 1) == -8);   /* -needed */
+
+    /* session lifecycle: no live peers, so no events, but every path is clean. */
+    int s = btx_session_new();
+    CHECK(s > 0);
+    CHECK(btx_rp1_send(s, 1, "x", 1) == BTX_ERR_INVALID_ARG);  /* before enable */
+    CHECK(btx_rp1_poll(s, wire, sizeof wire) == 0);            /* not enabled -> 0 */
+    CHECK(btx_rp1_enable(s) == BTX_OK);
+    CHECK(btx_rp1_enable(s) == BTX_OK);                        /* idempotent */
+    int t = btx_add_infohash(s, "0123456789abcdef0123456789abcdef01234567", ".");
+    CHECK(t > 0);                                              /* phantom swarm */
+    CHECK(btx_rp1_set_token(s, "tok", 3) == BTX_OK);
+    CHECK(btx_rp1_set_token(s, nullptr, 0) == BTX_OK);         /* clear */
+    unsigned char drain[256];
+    CHECK(btx_rp1_poll(s, drain, sizeof drain) == 0);          /* no peers -> no events */
+    CHECK(btx_rp1_send(s, 4242, "x", 1) == BTX_ERR_INVALID_ARG); /* unknown peer */
+    std::vector<char> big(60001, 'z');
+    CHECK(btx_rp1_send(s, 1, big.data(),
+                       static_cast<int>(big.size())) == BTX_ERR_INVALID_ARG); /* oversize */
+    btx_session_free(s);
+    CHECK(btx::test::live_session_count() == 0);
+}
+
 int main() {
     test_session_lifecycle();
     test_bogus_handles_are_noops();
@@ -636,6 +680,7 @@ int main() {
     test_alert_drain_roundtrip();
     test_drain_oversized_makes_progress();
     test_dht_bep44();
+    test_rp1();
 
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

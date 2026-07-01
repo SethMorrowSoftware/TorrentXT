@@ -219,6 +219,15 @@ strings; combine the `kFlag*` constants). The classic use is **adding paused**
 `kFlagSequentialDownload` for immediate streaming. Returns the torrent handle.
 - **Usage:** function - `put btAddMagnetEx(sSession, tURI, tPath, kFlagPaused, kFlagPaused) into tH` (added paused), then set priorities, then `btResume tH`.
 
+### `btAddInfohash(in pSession as Integer, in pInfoHash as String, in pSavePath as String) returns Integer`
+Add a metadata-less **phantom swarm** from a bare 40-hex info-hash: libtorrent
+joins the swarm, accepts peer connections, and completes the BitTorrent + BEP10
+handshake **without ever fetching an info dict**. There is no content to download;
+it is a peer meeting point. Pair it with `btDhtAnnounce` / `btDhtGetPeers` on the
+same id and the `btRp1*` calls (see **rp1**) for serverless, contentless peer
+contact. Returns a torrent handle (`0` on failure).
+- **Usage:** function - `put btAddInfohash(sSession, tRendezvousHex, tPath) into tH`.
+
 ---
 
 ## Control
@@ -545,6 +554,48 @@ silently vanishing on the network. Confirms via a `dhtPut` event.
 
 ---
 
+## rp1 (custom BEP10 peer-wire extension)
+
+`rp1` is a custom **BEP10** extension that moves **opaque bytes** between peers on
+the peer wire — TorrentXT neither frames nor interprets the payload (the caller
+owns any sub-typing). With `btAddInfohash` (a phantom swarm) and `btDhtGetPeers`
+(rendezvous), two peers can meet on a bare id and talk with **no tracker, no
+server, and no content**. It is opt-in per session and off by default.
+
+Inbound events (peer up/down, handshake, message) are drained by `btRp1Poll` in
+the same shape as `btPoll`; outbound messages are queued by `btRp1Send` and sent
+on libtorrent's next per-peer tick (a **&le;1 s** latency, which is also what
+flushes them — no peer-connection method is ever touched off the network thread).
+
+### `btRp1Enable(in pSession as Integer) returns Integer`
+Turn the `rp1` extension on for this session (installs the peer-wire plugin).
+**Idempotent.** Call it *before* adding the swarms it should apply to; it then
+advertises `rp1` on every torrent in the session. A session that never calls this
+never advertises `rp1`. Returns `0` / negative.
+- **Usage:** command - `btRp1Enable sSession`.
+
+### `btRp1SetToken(in pSession as Integer, in pToken as Data) returns Integer`
+Publish an opaque blob in our extended-handshake `rp1_tok` field (e.g. a signed
+recognition token). Copied; sent on handshakes made *after* this call; empty
+`Data` clears it. The peer's own `rp1_tok` is surfaced as `token` in its
+`rp1Handshake` event. Returns `0` / negative (needs `rp1` enabled).
+- **Usage:** command - `btRp1SetToken sSession, tSignedToken`.
+
+### `btRp1Send(in pSession as Integer, in pPeer as Integer, in pData as Data) returns Integer`
+Queue one `rp1` message of opaque bytes to peer `pPeer` (the `peer` id from an
+`rp1` event). It is sent on libtorrent's next tick for that peer. Fails (`-3`) if
+the peer is unknown, gone, or has not completed an `rp1` handshake (so we do not
+yet know its extension id). Payloads are capped at 60000 bytes. Returns `0` /
+negative.
+- **Usage:** command - `btRp1Send sSession, tPeer, tCipherBytes`.
+
+### `btRp1Poll(in pSession as Integer) returns List`
+Drain queued `rp1` events. Returns a `List` of event `Array`s in the SAME shape as
+`btPoll` — each carries a `name`, a `code`, a `peer` id, the swarm `infoHashV1`,
+and event-specific keys (`btPeerId` / `endpoint` / `supportsRp1` / `token` on a
+handshake, `payload` on a message). Call it each poll tick alongside `btPoll`.
+- **Usage:** function - `put btRp1Poll(sSession) into tEvents`.
+
 ## Create (seeding side)
 
 ### `btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer, in pTrackers as String) returns Data`
@@ -718,13 +769,19 @@ From `_alertName` in `src/torrent.lcb` and the alert registry in
 | `dhtMutableItem` | 23 | `publicKey`, `value`, `seq`, `signature`, `salt`, `authoritative` | a `btDhtGetMutable` lookup returned a value |
 | `dhtPut` | 24 | `numSuccess`, plus `target` (immutable) or `publicKey`/`signature`/`seq`/`salt` (mutable) | a DHT put completed |
 | `dhtGetPeers` | 25 | `target`, `peers` (newline-separated `ip:port` list) | a `btDhtGetPeers` lookup returned peers |
+| `rp1PeerConnected` | 26 | `peer`, `infoHashV1` (swarm), `endpoint` | a peer attached to an `rp1`-enabled swarm |
+| `rp1Handshake` | 27 | `peer`, `infoHashV1`, `btPeerId`, `endpoint`, `supportsRp1`, `token` | the peer's extended handshake was seen |
+| `rp1Message` | 28 | `peer`, `infoHashV1`, `payload` | one `rp1` message arrived (drained by `btRp1Poll`) |
+| `rp1PeerDisconnected` | 29 | `peer`, `infoHashV1` | the peer connection closed |
 
-The full set of event-array key names available across all alerts (from
-`_fieldKey`, ids `60..73` plus the DHT item ids `104..114`): `torrent`,
-`message`, `errorCode`, `errorMessage`, `piece`, `state`, `prevState`, `tracker`,
-`numPeers`, `resumeData`, `infoHashV1`, `infoHashV2`, `torrentName`, `endpoint`,
-and for DHT items `target`, `value`, `publicKey`, `secretKey`, `seed`,
-`signature`, `seq`, `salt`, `authoritative`, `numSuccess`, `peers`. Which subset a given
+The `rp1*` events are returned by **`btRp1Poll`** (not `btPoll`), in the same
+record shape. The full set of event-array key names available across all alerts
+(from `_fieldKey`, ids `60..73`, the DHT item ids `104..114`, and the rp1 ids
+`140..145`): `torrent`, `message`, `errorCode`, `errorMessage`, `piece`, `state`,
+`prevState`, `tracker`, `numPeers`, `resumeData`, `infoHashV1`, `infoHashV2`,
+`torrentName`, `endpoint`, DHT items `target`, `value`, `publicKey`, `secretKey`,
+`seed`, `signature`, `seq`, `salt`, `authoritative`, `numSuccess`, `peers`, and
+rp1 items `peer`, `btPeerId`, `supportsRp1`, `token`, `payload`. Which subset a given
 alert populates is the shim's choice per alert; the column above reflects the
 intended mapping and is implemented in `torrent_shim.cpp`, the source of truth for
 which subset each alert populates.

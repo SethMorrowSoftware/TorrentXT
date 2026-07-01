@@ -94,6 +94,17 @@ BTX_API int dht_bep44_sign(const char *seedHex, const char *salt,
                            const char *seqDec, const void *value, int len,
                            char *outPublicKeyHex, char *outSignatureHex);
 
+/* Frame one rp1 message exactly as btx_rp1_send queues it onto the wire:
+ * [len:u32][20][extId][payload]. Writes into `out` (bytes-written / -needed), so
+ * the smoke test can pin the byte layout — the on-wire framing is otherwise only
+ * exercised against a live peer. Exported for the usual visibility reason. */
+BTX_API int rp1_frame(int extId, const void *data, int len, void *out, int cap);
+
+/* Run the real extended-message-id selection (smallest positive id not in
+ * `used`) the peer plugin uses in add_handshake, so a regression in id choice
+ * (which would collide rp1 with ut_pex/ut_metadata) is caught. */
+BTX_API int rp1_free_id(const int *used, int count);
+
 }  // namespace test
 }  // namespace btx
 

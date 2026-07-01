@@ -140,7 +140,17 @@ enum FieldId : uint8_t {
     F_TRACKER_TIER      = 131, /* int: tracker tier (0 == first tier) */
     F_TRACKER_VERIFIED  = 132, /* int 0/1: has answered at least once this session */
     F_TRACKER_SOURCE    = 133, /* int: announce_entry source bitmask */
-    F_URL_SEED          = 134  /* utf8: a web-seed (URL seed) address */
+    F_URL_SEED          = 134, /* utf8: a web-seed (URL seed) address */
+
+    /* ---- rp1 BEP10 extension events (140..159) --------------------------------
+     * The custom peer-wire extension surface (Riptide transport). A peer event
+     * also carries F_EVT_INFO_HASH_V1 (the swarm id it arrived on). */
+    F_RP1_PEER          = 140, /* int: OUR stable per-connection peer id (0 invalid) */
+    F_RP1_PEER_ID       = 141, /* hex: the 20-byte BitTorrent peer_id */
+    F_RP1_ENDPOINT      = 142, /* utf8: the peer's "ip:port" */
+    F_RP1_SUPPORTS      = 143, /* int 0/1: peer advertised the rp1 extension */
+    F_RP1_TOKEN         = 144, /* raw: peer's "rp1_tok" extended-handshake field */
+    F_RP1_PAYLOAD       = 145  /* raw: the opaque bytes of one rp1 message */
 };
 
 /* ------------------------------------------------------------- alert codes */
@@ -173,8 +183,14 @@ enum AlertType : uint16_t {
     A_DHT_IMMUTABLE_ITEM  = 22,  /* dht_get_item (immutable) result */
     A_DHT_MUTABLE_ITEM    = 23,  /* dht_get_item (mutable) result */
     A_DHT_PUT             = 24,  /* dht_put_item completed (immutable or mutable) */
-    A_DHT_GET_PEERS       = 25   /* dht_get_peers reply (BEP5 peer discovery on an
+    A_DHT_GET_PEERS       = 25,  /* dht_get_peers reply (BEP5 peer discovery on an
                                   * arbitrary 20-byte id — Riptide rendezvous) */
+
+    /* ---- rp1 BEP10 extension events (drained by btx_rp1_poll, same framing) --- */
+    A_RP1_PEER_CONNECTED    = 26, /* a peer attached to an rp1-enabled swarm */
+    A_RP1_HANDSHAKE         = 27, /* peer's extended handshake seen (peer_id, rp1?, token) */
+    A_RP1_MESSAGE           = 28, /* one rp1 message arrived (raw payload) */
+    A_RP1_PEER_DISCONNECTED = 29  /* the peer connection closed */
 };
 
 /* ====================================================================== *
