@@ -147,6 +147,15 @@ serve peers for `pInfoHash` (40-hex) on `pPort` (`0` == our listen port). Useful
 for announcing your own content's info-hash so others can find you swarm-side.
 - **Usage:** command - `btDhtAnnounce sSession, tHashHex, 0`.
 
+### `btDhtGetPeers(in pSession as Integer, in pId as String) returns Integer`
+Classic **BEP 5** DHT `get_peers` - the discover half of `btDhtAnnounce`: ask the
+DHT who else announced `pId` (40-hex). `pId` need not be a real torrent; it can be
+any rendezvous point you derived off-band (e.g. from a shared secret), which makes
+this the **presence / rendezvous** primitive. Returns `0` / negative; the peer list
+arrives as a `dhtGetPeers` event carrying `target` and `peers` (a newline-separated
+`ip:port` list; IPv6 is bracketed, `[addr]:port`).
+- **Usage:** command - `btDhtGetPeers sSession, tRendezvousHex`.
+
 ---
 
 ## Filtering & streaming
@@ -513,6 +522,27 @@ Look up a mutable item by its 64-hex `pPublicKey` (+ optional `pSalt`). Returns
 `seq`, `signature`, `authoritative`).
 - **Usage:** command - `btDhtGetMutable sSession, tPubKey, "myapp"`.
 
+### `btDhtBep44SignBuf(in pSalt as String, in pSeq as String, in pValue as Data) returns Data`
+Build the **exact BEP 44 canonical buffer** that must be signed for a mutable item:
+`[4:salt<len>:<salt>] 3:seqi<seq>e 1:v <value>` (the salt segment is omitted when
+`pSalt` is `""`). `pSeq` is the sequence number as a decimal string; `pValue` is the
+**already-bencoded** value `v`. Sign the returned bytes in your own crypto layer (an
+ed25519 detached signature) and pass the signature to `btDhtPutSigned`. This exists
+so a signer that must keep its key private - e.g. a **cryptoXT / SodiumXT** identity
+key via `sxSignDetached` - can produce a BEP 44 signature with no secret key ever
+crossing into this library. Empty `Data` on failure.
+- **Usage:** function - `put btDhtBep44SignBuf("rp-prekeys", "1", tValue) into tBuf`.
+
+### `btDhtPutSigned(in pSession as Integer, in pPublicKey as String, in pSalt as String, in pSeq as String, in pValue as Data, in pSignature as String) returns Integer`
+Store a mutable item whose signature was produced **outside** this library (the
+external-signing counterpart of `btDhtPutMutable`, whose secret key crosses the FFI).
+`pValue` is the already-bencoded `v`, stored verbatim so it matches what was signed;
+`pSeq` the decimal sequence number; `pSignature` the 128-hex ed25519 signature over
+`btDhtBep44SignBuf(pSalt, pSeq, pValue)`. The native layer **verifies the signature**
+against `pPublicKey` before storing, so a bad signature returns `-3` here instead of
+silently vanishing on the network. Confirms via a `dhtPut` event.
+- **Usage:** command - `btDhtPutSigned sSession, tPub, "rp-prekeys", "1", tValue, tSig`.
+
 ---
 
 ## Create (seeding side)
@@ -687,13 +717,14 @@ From `_alertName` in `src/torrent.lcb` and the alert registry in
 | `dhtImmutableItem` | 22 | `target`, `value` | a `btDhtGetImmutable` lookup returned a value |
 | `dhtMutableItem` | 23 | `publicKey`, `value`, `seq`, `signature`, `salt`, `authoritative` | a `btDhtGetMutable` lookup returned a value |
 | `dhtPut` | 24 | `numSuccess`, plus `target` (immutable) or `publicKey`/`signature`/`seq`/`salt` (mutable) | a DHT put completed |
+| `dhtGetPeers` | 25 | `target`, `peers` (newline-separated `ip:port` list) | a `btDhtGetPeers` lookup returned peers |
 
 The full set of event-array key names available across all alerts (from
-`_fieldKey`, ids `60..73` plus the BEP44 item ids `104..113`): `torrent`,
+`_fieldKey`, ids `60..73` plus the DHT item ids `104..114`): `torrent`,
 `message`, `errorCode`, `errorMessage`, `piece`, `state`, `prevState`, `tracker`,
 `numPeers`, `resumeData`, `infoHashV1`, `infoHashV2`, `torrentName`, `endpoint`,
 and for DHT items `target`, `value`, `publicKey`, `secretKey`, `seed`,
-`signature`, `seq`, `salt`, `authoritative`, `numSuccess`. Which subset a given
+`signature`, `seq`, `salt`, `authoritative`, `numSuccess`, `peers`. Which subset a given
 alert populates is the shim's choice per alert; the column above reflects the
 intended mapping and is implemented in `torrent_shim.cpp`, the source of truth for
 which subset each alert populates.

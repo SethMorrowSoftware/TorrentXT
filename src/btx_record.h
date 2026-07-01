@@ -126,6 +126,8 @@ enum FieldId : uint8_t {
     F_DHT_NUM_SUCCESS   = 111, /* int: nodes that accepted a put */
     F_DHT_SECRET_KEY    = 112, /* hex: 64-byte ed25519 secret key */
     F_DHT_SEED          = 113, /* hex: 32-byte ed25519 seed (persist to keep identity) */
+    F_DHT_PEERS         = 114, /* utf8: newline-separated "ip:port" list (BEP5
+                                * get_peers reply — the rendezvous discovery half) */
 
     /* ---- file entry (120..139): one record per file in btx_file_list ---- */
     F_FILE_PATH         = 120, /* utf8: file path within the torrent (relative) */
@@ -170,7 +172,9 @@ enum AlertType : uint16_t {
     A_SCRAPE_REPLY        = 21,
     A_DHT_IMMUTABLE_ITEM  = 22,  /* dht_get_item (immutable) result */
     A_DHT_MUTABLE_ITEM    = 23,  /* dht_get_item (mutable) result */
-    A_DHT_PUT             = 24   /* dht_put_item completed (immutable or mutable) */
+    A_DHT_PUT             = 24,  /* dht_put_item completed (immutable or mutable) */
+    A_DHT_GET_PEERS       = 25   /* dht_get_peers reply (BEP5 peer discovery on an
+                                  * arbitrary 20-byte id — Riptide rendezvous) */
 };
 
 /* ====================================================================== *

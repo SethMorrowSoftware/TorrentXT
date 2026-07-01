@@ -78,6 +78,22 @@ BTX_API int dht_mutable_sign_verifies(const char *publicKeyHex,
                                       const char *salt,
                                       const void *data, int len);
 
+/* Derive an ed25519 keypair from a 32-byte seed (64 hex), build the BEP44
+ * canonical buffer for (salt, seq, value) through the SAME bep44_signbuf() the
+ * external-signing put uses, sign it, and write the public-key hex (64 chars +
+ * NUL) and signature hex (128 chars + NUL) into the caller buffers. Returns 1 on
+ * success, 0 on a bad seed, negative on an internal throw. This is the bridge
+ * that lets the smoke test run a KNOWN-ANSWER conformance check: an external
+ * signer (SodiumXT, in production) must produce a signature that libtorrent's
+ * own ed25519 accepts as a BEP44 signature, so a fixed (seed, salt, seq, value)
+ * must yield a fixed (public key, signature). It also produces the exact inputs
+ * the test then feeds to btx_dht_put_signed to prove the verify-before-store
+ * guard accepts a good signature and rejects a tampered one. Exported (BTX_API)
+ * for the same visibility reason as the hooks above. */
+BTX_API int dht_bep44_sign(const char *seedHex, const char *salt,
+                           const char *seqDec, const void *value, int len,
+                           char *outPublicKeyHex, char *outSignatureHex);
+
 }  // namespace test
 }  // namespace btx
 

@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 8
+#define BTX_ABI_VERSION 9
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -150,6 +150,13 @@ BTX_API int BTX_CALL btx_find_torrent(int s, const char *infoHashHex);
 /* Classic BEP5 DHT peer announce (NOT BEP44): tell the DHT we have peers for
  * this 40-hex info-hash on `port` (0 == our listen port). Fire-and-forget. */
 BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex, int port);
+
+/* Classic BEP5 DHT get_peers (the discover half of announce): ask the DHT who
+ * else announced this 40-hex id. The id is any caller-chosen 160-bit value (a
+ * rendezvous point derived off-band), not necessarily a real torrent — this is
+ * the presence/rendezvous primitive. Fire-and-forget; the peer list arrives as
+ * an A_DHT_GET_PEERS alert carrying F_DHT_TARGET + F_DHT_PEERS. */
+BTX_API int BTX_CALL btx_dht_get_peers(int s, const char *idHex);
 
 /* ====================================================================== *
  *  Filtering & streaming (ABI v8)
@@ -364,6 +371,40 @@ BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKeyHex,
  * A_DHT_MUTABLE_ITEM (carrying value, seq, signature, authoritative). */
 BTX_API int BTX_CALL btx_dht_get_mutable(int s, const char *publicKeyHex,
                                          const char *salt);
+
+/* ---- BEP44 mutable put with an EXTERNAL signature (ABI v9) -----------------
+ * The put_mutable above signs INSIDE the shim with a secret key handed across
+ * the FFI. Some callers must keep the signing key in their own crypto layer and
+ * never expose it (e.g. a SodiumXT-held identity key). For them the flow splits
+ * in two: (1) build the exact BEP44 canonical buffer here, (2) sign it in the
+ * crypto layer (an ed25519 detached signature), (3) hand the finished 64-byte
+ * signature back for the store. No secret key ever crosses this ABI.
+ *
+ * btx_dht_bep44_signbuf writes the EXACT bytes BEP44 signs/verifies for
+ * (salt, seq, value) into `out` (bytes-written / -needed). The layout is
+ *     [4:salt<len>:<salt>]  3:seqi<seq>e  1:v <value>
+ * with the salt segment omitted entirely when `salt` is empty. `seqDec` is the
+ * sequence number as a decimal string (no 64-bit foreign int). `value` is the
+ * ALREADY-BENCODED BEP44 value v (verbatim — this is the one caller-facing
+ * difference from put_mutable, which bencodes a raw string for you): the signed
+ * bytes and the stored bytes must be identical, so the caller owns the encoding.
+ * Pure/synchronous — no session needed. */
+BTX_API int BTX_CALL btx_dht_bep44_signbuf(const char *salt, const char *seqDec,
+                                           const void *value, int len,
+                                           void *out, int cap);
+
+/* Store a mutable item whose signature was produced OUTSIDE the shim. `value`
+ * is the already-bencoded v (stored verbatim, byte-for-byte, so it matches what
+ * was signed); `seqDec` the decimal sequence number; `signatureHex` the 128-hex
+ * (64-byte) ed25519 signature over btx_dht_bep44_signbuf(salt, seqDec, value).
+ * The shim VERIFIES the signature against the public key before storing (a bad
+ * signature fails loud with BTX_ERR_INVALID_ARG rather than silently vanishing
+ * on the network), then stamps value+seq+sig on libtorrent's thread with no
+ * script callback. Confirms via an A_DHT_PUT alert. */
+BTX_API int BTX_CALL btx_dht_put_signed(int s, const char *publicKeyHex,
+                                        const char *salt, const char *seqDec,
+                                        const void *value, int len,
+                                        const char *signatureHex);
 
 /* ====================================================================== *
  *  Persistence (resume data) — async, libtorrent's model (plan §4.3)
