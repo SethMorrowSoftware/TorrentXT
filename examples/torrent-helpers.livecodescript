@@ -65,6 +65,19 @@ command btTorrentPollOnce
       -- also fire a catch-all so one handler can observe the whole stream
       dispatch "torrentEvent" to sPollTarget with tEvent
    end repeat
+   -- ALSO drain the rp1 extension's own event stream (peer up/down, handshake,
+   -- message). It is a SEPARATE queue from btPoll and returns empty when rp1 is
+   -- not enabled on the session, so this is a harmless no-op for normal apps and
+   -- gives rp1 apps the same dispatch-by-name flow (rp1PeerConnected, rp1Handshake,
+   -- rp1Message, rp1PeerDisconnected).
+   put btRp1Poll(sPollSession) into tEvents
+   repeat for each element tEvent in tEvents
+      put tEvent["name"] into tName
+      if tName is not empty then
+         dispatch tName to sPollTarget with tEvent
+      end if
+      dispatch "torrentEvent" to sPollTarget with tEvent
+   end repeat
    -- reschedule (libtorrent keeps buffering between drains)
    send "btTorrentPollOnce" to me in (sPollInterval) milliseconds
 end btTorrentPollOnce
