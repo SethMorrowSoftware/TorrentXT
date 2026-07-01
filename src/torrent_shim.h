@@ -105,6 +105,18 @@ BTX_API int rp1_frame(int extId, const void *data, int len, void *out, int cap);
  * (which would collide rp1 with ut_pex/ut_metadata) is caught. */
 BTX_API int rp1_free_id(const int *used, int count);
 
+/* PROVE the rp1 wire path end to end, in-process, with NO OXT and NO second
+ * machine: stand up two real libtorrent sessions on loopback, attach the actual
+ * rp1 plugin to each, add the SAME metadata-less phantom swarm to both, connect
+ * them directly, wait for the rp1 handshake to negotiate BOTH ways, send one
+ * message from A, and confirm it arrives at B byte-for-byte. This exercises what
+ * no unit test can: extended-handshake negotiation, the tick() flush, on_extended
+ * delivery, AND whether the phantom (no-metadata) connection actually holds long
+ * enough to talk. Returns 1 on a proven round trip; 0 on timeout/failure (with a
+ * reason in the last-error). Blocks up to ~pTimeoutMs (default a few seconds).
+ * Test-only; wrapped in the firewall like every hook. */
+BTX_API int rp1_loopback_selftest(int pTimeoutMs);
+
 }  // namespace test
 }  // namespace btx
 
