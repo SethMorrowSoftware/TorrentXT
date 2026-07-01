@@ -390,4 +390,32 @@ if(TORRENTXT_BUILD_TESTS)
         message(STATUS "TorrentXT: tests/torrent_smoke_test.cpp not present yet — only "
                        "record_handle_test is registered (Phase-0/skeleton).")
     endif()
+
+    # (c) rp1_integration_test — PROVES the rp1 peer-wire path end to end in ONE
+    #     process: two loopback libtorrent sessions with the real rp1 plugin
+    #     exchange a message over a metadata-less phantom swarm. This is the
+    #     on-wire behavior no unit test can reach (handshake negotiation, the
+    #     tick() flush, on_extended delivery, connection hold). It needs NO network
+    #     (an explicit loopback connect_peer wires the two peers together).
+    set(_rp1_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/rp1_integration_test.cpp")
+    if(EXISTS "${_rp1_src}" AND TARGET torrentxt)
+        add_executable(rp1_integration_test "${_rp1_src}")
+        target_include_directories(rp1_integration_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rp1_integration_test PRIVATE torrentxt torrentxt::libtorrent torrentxt_flags torrentxt_link)
+        get_target_property(_lt_incs3 torrentxt_libtorrent INTERFACE_INCLUDE_DIRECTORIES)
+        if(_lt_incs3)
+            target_include_directories(rp1_integration_test SYSTEM PRIVATE ${_lt_incs3})
+        endif()
+        if(UNIX AND NOT APPLE)
+            set_target_properties(rp1_integration_test PROPERTIES
+                BUILD_RPATH "$<TARGET_FILE_DIR:torrentxt>")
+        endif()
+        add_test(NAME rp1_integration_test COMMAND rp1_integration_test)
+        # Loopback exchange plus the ~1s per-peer tick: give it room. Also mute the
+        # ASan container-overflow false positive that a shim built WITH ASan hits
+        # against a libtorrent built WITHOUT it (a known mixed-instrumentation case).
+        set_tests_properties(rp1_integration_test PROPERTIES
+            TIMEOUT 120
+            ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=detect_container_overflow=0:halt_on_error=1")
+    endif()
 endif()
