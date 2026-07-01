@@ -142,6 +142,7 @@ struct PendingAlert {
     bool hasDhtSalt = false;          std::string dhtSalt;
     bool hasDhtAuthoritative = false; long long dhtAuthoritative = 0;
     bool hasDhtNumSuccess = false;    long long dhtNumSuccess = 0;
+    bool hasDhtPeers = false;         std::string dhtPeers;  /* newline "ip:port" */
 };
 
 /* The whole world a session owns. Boxed in a unique_ptr inside the session
@@ -693,6 +694,23 @@ extern "C" BTX_API int BTX_CALL btx_dht_announce(int s, const char *infoHashHex,
         /* classic BEP5 peer announce (distinct from the BEP44 KV calls): tell the
          * DHT we serve peers for this info-hash on `port` (0 == our listen port). */
         st->ses->dht_announce(lt::sha1_hash(buf), port);
+        return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_get_peers(int s, const char *idHex) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        char buf[20];
+        if (!hex_to_buf(idHex, buf, 20)) {
+            set_error("id must be 40 hex chars"); return BTX_ERR_INVALID_ARG;
+        }
+        /* Ask the DHT who announced this 160-bit id. The id need not be a real
+         * torrent — it is any rendezvous point the caller derived off-band — so
+         * this doubles as the presence/rendezvous discovery primitive. The peer
+         * list comes back later as an A_DHT_GET_PEERS alert. */
+        st->ses->dht_get_peers(lt::sha1_hash(buf));
         return BTX_OK;
     });
 }
@@ -1803,6 +1821,32 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
         }
         return true;
     }
+    if (auto *p = lt::alert_cast<lt::dht_get_peers_reply_alert>(a)) {
+        /* The discover half of announce: who else is at this rendezvous id. We
+         * flatten the endpoints into ONE newline-joined "ip:port" field (v6 gets
+         * bracketed) so the whole reply is a single FFI-friendly string the LCB
+         * side splits on newline — never one field per peer (§8). The u16 field
+         * cap is ~64 KiB; a single get_peers response is far smaller, but we stop
+         * at a whole-entry boundary if it ever approached the cap rather than let
+         * field_raw truncate mid-address. */
+        out.type = btx::A_DHT_GET_PEERS;
+        out.hasDhtTarget = true; out.dhtTarget = hash_hex(p->info_hash);
+        std::string joined;
+        for (auto const &ep : p->peers()) {
+            std::string ip = ep.address().to_string();
+            std::string one = ep.address().is_v6() ? ("[" + ip + "]") : ip;
+            one += ":" + std::to_string(ep.port());
+            if (!joined.empty()) {
+                if (joined.size() + 1 + one.size() > 60000) break;
+                joined += "\n";
+            } else if (one.size() > 60000) {
+                break;
+            }
+            joined += one;
+        }
+        out.hasDhtPeers = true; out.dhtPeers = std::move(joined);
+        return true;
+    }
 
     /* Unmapped alert: not surfaced. The broad alert_mask still lets a few
      * uninteresting categories through; we drop them HERE (not at the queue) so
@@ -1852,6 +1896,7 @@ void write_alert_entry(btx::RecordWriter &rw, const PendingAlert &pa) {
         if (pa.hasDhtSalt)          r.put_str(btx::F_DHT_SALT, pa.dhtSalt);
         if (pa.hasDhtAuthoritative) r.put_int(btx::F_DHT_AUTHORITATIVE, pa.dhtAuthoritative);
         if (pa.hasDhtNumSuccess)    r.put_int(btx::F_DHT_NUM_SUCCESS, pa.dhtNumSuccess);
+        if (pa.hasDhtPeers)         r.put_str(btx::F_DHT_PEERS, pa.dhtPeers);
         r.finish();
     }
     rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
@@ -2121,6 +2166,27 @@ extern "C" BTX_API int BTX_CALL btx_dht_get_immutable(int s, const char *targetH
     });
 }
 
+/* Build the EXACT byte string BEP44 signs and every node verifies for a mutable
+ * item: [4:salt<len>:<salt>] 3:seqi<seq>e 1:v <value>, with the salt segment
+ * omitted when empty. `value` is the ALREADY-BENCODED v, appended verbatim — the
+ * one source of truth for the canonical buffer, shared by the external-signing
+ * put, the signbuf getter, and the self-test so they can never drift. (This is
+ * the same layout libtorrent's own sign_mutable_item / verify_mutable_item use;
+ * we reproduce it because those live behind TORRENT_EXTRA_EXPORT.) */
+static std::vector<char> bep44_signbuf(const std::string &salt, std::int64_t seq,
+                                       const char *value, size_t vlen) {
+    std::vector<char> buf;
+    if (!salt.empty()) {
+        std::string head = "4:salt" + std::to_string(salt.size()) + ":";
+        buf.insert(buf.end(), head.begin(), head.end());
+        buf.insert(buf.end(), salt.begin(), salt.end());
+    }
+    std::string mid = "3:seqi" + std::to_string(seq) + "e1:v";
+    buf.insert(buf.end(), mid.begin(), mid.end());
+    if (value && vlen) buf.insert(buf.end(), value, value + vlen);
+    return buf;
+}
+
 /* Sign a mutable-item STRING value the BEP44 way, setting the entry `e` that
  * libtorrent will store. THE SIGNATURE MUST COVER THE BENCODED VALUE (a string
  * "hi" bencodes to "2:hi"), because that is exactly what every storing node and
@@ -2183,6 +2249,73 @@ extern "C" BTX_API int BTX_CALL btx_dht_get_mutable(int s, const char *publicKey
         if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) { set_error("public key must be 64 hex chars"); return BTX_ERR_INVALID_ARG; }
         st->ses->dht_get_item(pk.bytes, salt ? salt : "");  /* -> A_DHT_MUTABLE_ITEM */
         return BTX_OK;
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_bep44_signbuf(const char *salt,
+                                                      const char *seqDec,
+                                                      const void *value, int len,
+                                                      void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        if (len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return 0; }
+        std::string salt_s = salt ? salt : "";
+        std::int64_t seq = seqDec ? std::strtoll(seqDec, nullptr, 10) : 0;
+        std::vector<char> buf = bep44_signbuf(
+            salt_s, seq, static_cast<const char *>(value),
+            static_cast<size_t>(len));
+        const size_t need = buf.size();
+        if (out && cap > 0 && need <= static_cast<size_t>(cap))
+            std::memcpy(out, buf.data(), need);
+        if (need > static_cast<size_t>(cap < 0 ? 0 : cap))
+            return -static_cast<int>(need);
+        return static_cast<int>(need);
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_dht_put_signed(int s, const char *publicKeyHex,
+                                                   const char *salt,
+                                                   const char *seqDec,
+                                                   const void *value, int len,
+                                                   const char *signatureHex) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        if (!value || len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return BTX_ERR_INVALID_ARG; }
+        lt::dht::public_key pk;
+        lt::dht::signature sig;
+        if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) { set_error("public key must be 64 hex chars"); return BTX_ERR_INVALID_ARG; }
+        if (!hex_to_buf(signatureHex, sig.bytes.data(), 64)) { set_error("signature must be 128 hex chars"); return BTX_ERR_INVALID_ARG; }
+        std::string salt_s = salt ? salt : "";
+        std::int64_t seq = seqDec ? std::strtoll(seqDec, nullptr, 10) : 0;
+        const char *vp = static_cast<const char *>(value);
+        std::vector<char> val(vp, vp + len);
+
+        /* Fail loud, on THIS thread, before anything hits the network: if the
+         * supplied signature does not verify against the exact canonical buffer,
+         * the store would be silently rejected by every DHT node and the record
+         * would just never appear. Reconstruct the buffer through the one shared
+         * builder and check it with the same ed25519 primitive a remote verifier
+         * uses. (No script runs here — this is the caller's own thread.) */
+        std::vector<char> canon = bep44_signbuf(salt_s, seq, val.data(), val.size());
+        if (!lt::dht::ed25519_verify(sig, std::string(canon.begin(), canon.end()), pk)) {
+            set_error("signature does not verify for (public key, salt, seq, value)");
+            return BTX_ERR_INVALID_ARG;
+        }
+
+        /* The callback runs on libtorrent's network thread once it has found
+         * where to store the blob. It captures owning COPIES and stamps the
+         * caller's EXACT bytes: a preformatted entry emits `value` verbatim (so
+         * the stored v is byte-identical to what was signed), the external sig,
+         * and the caller's absolute sequence number. No script, no secret key,
+         * no re-encoding — honouring rule 1 and BEP44 both. */
+        st->ses->dht_put_item(pk.bytes,
+            [val, sig, seq](lt::entry &e, std::array<char, 64> &s2,
+                            std::int64_t &sq, std::string const &) {
+                e = lt::entry::preformatted_type(val.begin(), val.end());
+                s2 = sig.bytes;
+                sq = seq;
+            }, salt_s);
+        return BTX_OK;  /* confirmation -> A_DHT_PUT alert */
     });
 }
 
@@ -2331,18 +2464,39 @@ int dht_mutable_sign_verifies(const char *publicKeyHex, const char *secretKeyHex
          * ed25519 verify against the canonical string instead.) If the value was
          * signed bencoded (correct) this passes; if signed raw (the bug) it
          * fails — so this assertion is the regression guard for that silent bug. */
-        std::string canon;
-        if (!salt_s.empty()) {
-            canon += "4:salt";
-            canon += std::to_string(salt_s.size());
-            canon += ":";
-            canon += salt_s;
-        }
-        canon += "3:seqi";
-        canon += std::to_string(seq);
-        canon += "e1:v";
-        canon.append(signed_buf.begin(), signed_buf.end());
-        return lt::dht::ed25519_verify(sg, canon, pk) ? 1 : 0;
+        std::vector<char> canon =
+            bep44_signbuf(salt_s, seq, signed_buf.data(), signed_buf.size());
+        return lt::dht::ed25519_verify(
+            sg, std::string(canon.begin(), canon.end()), pk) ? 1 : 0;
+    });
+}
+
+int dht_bep44_sign(const char *seedHex, const char *salt, const char *seqDec,
+                   const void *value, int len, char *outPublicKeyHex,
+                   char *outSignatureHex) {
+    /* The external-signer's job done with libtorrent's OWN ed25519, so a fixed
+     * (seed, salt, seq, value) yields a fixed (public key, signature) the smoke
+     * test pins as a known answer — proving our bep44_signbuf layout and the
+     * ed25519 primitive agree, byte for byte, with any conformant BEP44 signer
+     * (SodiumXT in production). Wrapped in the firewall like every entry. */
+    BTX_GUARD_ACTION({
+        ed_seed seed;  /* aliased so the std::array<char,32> comma is macro-safe */
+        if (!hex_to_buf(seedHex, seed.data(), 32)) return 0;
+        lt::dht::public_key pk;
+        lt::dht::secret_key sk;
+        std::tie(pk, sk) = lt::dht::ed25519_create_keypair(seed);
+        std::string salt_s = salt ? salt : "";
+        std::int64_t seq = seqDec ? std::strtoll(seqDec, nullptr, 10) : 0;
+        const char *vp = static_cast<const char *>(value);
+        std::vector<char> canon =
+            bep44_signbuf(salt_s, seq, vp, static_cast<size_t>(len < 0 ? 0 : len));
+        lt::dht::signature sg =
+            lt::dht::ed25519_sign(std::string(canon.begin(), canon.end()), pk, sk);
+        std::string ph = hash_hex(pk.bytes);   /* 64 hex  */
+        std::string sh = hash_hex(sg.bytes);   /* 128 hex */
+        if (outPublicKeyHex) std::memcpy(outPublicKeyHex, ph.c_str(), ph.size() + 1);
+        if (outSignatureHex) std::memcpy(outSignatureHex, sh.c_str(), sh.size() + 1);
+        return 1;
     });
 }
 

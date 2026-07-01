@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 8
+constant kABIVersion is 9
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -138,6 +138,7 @@ constant kFieldDhtAuthoritative is 110
 constant kFieldDhtNumSuccess is 111
 constant kFieldDhtSecretKey is 112
 constant kFieldDhtSeed is 113
+constant kFieldDhtPeers is 114
 
 -- file entry fields (one record per file from btFileList)
 constant kFieldFilePath is 120
@@ -177,6 +178,7 @@ constant kAlertScrapeReply is 21
 constant kAlertDhtImmutableItem is 22
 constant kAlertDhtMutableItem is 23
 constant kAlertDhtPut is 24
+constant kAlertDhtGetPeers is 25
 
 -- ===================================================================== --
 --  Module state: the reusable poll/status buffers
@@ -279,6 +281,9 @@ private foreign handler _btx_dht_put_immutable(in pS as CInt, in pData as Pointe
 private foreign handler _btx_dht_get_immutable(in pS as CInt, in pTarget as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_immutable!cdecl"
 private foreign handler _btx_dht_put_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSec as ZStringUTF8, in pSalt as ZStringUTF8, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_dht_put_mutable!cdecl"
 private foreign handler _btx_dht_get_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_mutable!cdecl"
+private foreign handler _btx_dht_get_peers(in pS as CInt, in pId as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_peers!cdecl"
+private foreign handler _btx_dht_bep44_signbuf(in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_bep44_signbuf!cdecl"
+private foreign handler _btx_dht_put_signed(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pSig as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_put_signed!cdecl"
 
 private foreign handler _btx_save_resume(in pT as CInt) returns CInt binds to "c:torrentxt>btx_save_resume!cdecl"
 private foreign handler _btx_create_torrent(in pPath as ZStringUTF8, in pPieceSize as CInt, in pFlags as CInt, in pTrackers as ZStringUTF8, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_create_torrent!cdecl"
@@ -563,6 +568,8 @@ private handler _fieldKey(in pId as Integer) returns String
       return "secretKey"
    else if pId is kFieldDhtSeed then
       return "seed"
+   else if pId is kFieldDhtPeers then
+      return "peers"
    else if pId is kFieldFilePath then
       return "path"
    else if pId is kFieldFileSize then
@@ -637,6 +644,8 @@ private handler _alertName(in pCode as Integer) returns String
       return "dhtMutableItem"
    else if pCode is kAlertDhtPut then
       return "dhtPut"
+   else if pCode is kAlertDhtGetPeers then
+      return "dhtGetPeers"
    else
       return "torrentEvent"
    end if
@@ -848,6 +857,18 @@ public handler btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in 
    variable tR as Integer
    unsafe
       put _btx_dht_announce(pSession, pInfoHash, pPort) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Classic BEP5 DHT get_peers: ask who else announced this 40-hex id. The id can
+-- be any caller-derived rendezvous point, not a real torrent, so this is the
+-- presence/discovery primitive. The peer list arrives later as a dhtGetPeers
+-- event carrying "target" and "peers" (a newline-separated "ip:port" list).
+public handler btDhtGetPeers(in pSession as Integer, in pId as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_dht_get_peers(pSession, pId) into tR
    end unsafe
    return tR
 end handler
@@ -1673,6 +1694,58 @@ public handler btDhtGetMutable(in pSession as Integer, in pPublicKey as String, 
    variable tR as Integer
    unsafe
       put _btx_dht_get_mutable(pSession, pPublicKey, pSalt) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Build the EXACT bytes BEP44 signs for (pSalt, pSeq, pValue): the canonical
+-- buffer [4:salt<len>:<salt>] 3:seqi<seq>e 1:v <value>. pSeq is the sequence
+-- number as a decimal string; pValue is the ALREADY-BENCODED value v. Sign the
+-- returned Data in your own crypto layer (an ed25519 detached signature over
+-- these bytes) and hand the signature to btDhtPutSigned. This exists so a signer
+-- that must keep its key private (e.g. cryptoXT/SodiumXT) can produce a BEP44
+-- signature without any secret key ever crossing into this library. Empty Data
+-- on failure.
+public handler btDhtBep44SignBuf(in pSalt as String, in pSeq as String, in pValue as Data) returns Data
+   variable tCount as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pValue into tLen
+   _ensureStatus(kStatusCap)
+   unsafe
+      put MCDataGetBytePtr(pValue) into tPtr
+      put _btx_dht_bep44_signbuf(pSalt, pSeq, tPtr, tLen, sStatusPtr, sStatusCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureStatus(-tCount)
+      unsafe
+         put MCDataGetBytePtr(pValue) into tPtr
+         put _btx_dht_bep44_signbuf(pSalt, pSeq, tPtr, tLen, sStatusPtr, sStatusCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return the empty data
+   end if
+   return _bufToData(sStatusPtr, tCount)
+end handler
+
+-- Store a mutable item whose signature was produced OUTSIDE this library. pValue
+-- is the already-bencoded v (stored verbatim so it matches what was signed);
+-- pSeq the decimal sequence number; pSignature the 128-hex ed25519 signature over
+-- btDhtBep44SignBuf(pSalt, pSeq, pValue). The native layer VERIFIES the signature
+-- against pPublicKey before storing, so a bad signature returns -3 here instead
+-- of silently vanishing on the network. Confirms as a dhtPut event.
+public handler btDhtPutSigned(in pSession as Integer, in pPublicKey as String, in pSalt as String, in pSeq as String, in pValue as Data, in pSignature as String) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pValue into tLen
+   if tLen <= 0 then
+      return -3
+   end if
+   unsafe
+      put MCDataGetBytePtr(pValue) into tPtr
+      put _btx_dht_put_signed(pSession, pPublicKey, pSalt, pSeq, tPtr, tLen, pSignature) into tR
    end unsafe
    return tR
 end handler

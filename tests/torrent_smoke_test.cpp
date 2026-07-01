@@ -566,6 +566,62 @@ static void test_dht_bep44() {
     CHECK(btx_dht_put_mutable(s, pubHex.c_str(), secHex.c_str(), "",
           big.data(), static_cast<int>(big.size())) == BTX_ERR_INVALID_ARG);
 
+    /* ---- BEP44 EXTERNAL signing (ABI v9) --------------------------------------
+     * The signing key stays in the caller's own crypto layer and never crosses
+     * this ABI: the caller builds the canonical buffer with btx_dht_bep44_signbuf,
+     * signs it there, and hands back the finished signature. We pin the Riptide
+     * "rp-prekeys" CONFORMANCE VECTOR as a known answer — a fixed (seed, salt,
+     * seq, value) must yield a fixed (public key, signature) — which proves our
+     * bep44_signbuf byte layout and the ed25519 primitive agree with any
+     * conformant external signer (SodiumXT's sxSignDetached in production). */
+    const char *edSeed =
+        "cac73f09a0478224974a525036ebd73f9727ac8932162eb7fcfb2821ad7eecc7";
+    const char *vecPub =
+        "672e8e0b259627f15c772ec0d61f15cd786ce2bc7244549255f9d6cfaac300b2";
+    const char *vecSig =
+        "86c843ec4cc2495e025e949dd72658ef01556dbbfb1f5d9b474b5957dbcb26a2"
+        "3497efe40f594387cc4f037075669efa4c42cb57c007eb0bddaa24934f3f740b";
+    const char *vecValue = "2:hi";   /* the ALREADY-BENCODED BEP44 value v      */
+    const int vecValLen = 4;
+
+    char gotPub[65] = {0}, gotSig[129] = {0};
+    CHECK(btx::test::dht_bep44_sign(edSeed, "rp-prekeys", "1",
+                                    vecValue, vecValLen, gotPub, gotSig) == 1);
+    CHECK(std::string(gotPub) == vecPub);   /* seed -> public key (known answer) */
+    CHECK(std::string(gotSig) == vecSig);   /* sign -> BEP44 sig  (known answer) */
+
+    /* the canonical buffer getter emits EXACTLY the bytes BEP44 signs/verifies. */
+    const char *wantBuf = "4:salt10:rp-prekeys3:seqi1e1:v2:hi";
+    const int wantLen = static_cast<int>(std::strlen(wantBuf));
+    char sbuf[128];
+    int sblen = btx_dht_bep44_signbuf("rp-prekeys", "1", vecValue, vecValLen,
+                                      sbuf, sizeof sbuf);
+    CHECK(sblen == wantLen);
+    CHECK(std::string(sbuf, static_cast<size_t>(sblen > 0 ? sblen : 0)) == wantBuf);
+    /* -needed contract: a 1-byte buffer reports the exact size it needed. */
+    char tiny[1];
+    CHECK(btx_dht_bep44_signbuf("rp-prekeys", "1", vecValue, vecValLen, tiny, 1)
+          == -wantLen);
+
+    /* put_signed VERIFIES before it stores: the known-good vector signature is
+     * accepted; one flipped nibble is rejected loud (never a silent net drop). */
+    CHECK(btx_dht_put_signed(s, vecPub, "rp-prekeys", "1", vecValue, vecValLen,
+                             vecSig) == BTX_OK);
+    std::string badSig(vecSig);
+    badSig[0] = (badSig[0] == '8') ? '9' : '8';
+    CHECK(btx_dht_put_signed(s, vecPub, "rp-prekeys", "1", vecValue, vecValLen,
+                             badSig.c_str()) == BTX_ERR_INVALID_ARG);
+    /* wrong-length pubkey / signature -> clean arg error, never a crash. */
+    CHECK(btx_dht_put_signed(s, "short", "rp-prekeys", "1", vecValue, vecValLen,
+                             vecSig) == BTX_ERR_INVALID_ARG);
+    CHECK(btx_dht_put_signed(s, vecPub, "rp-prekeys", "1", vecValue, vecValLen,
+                             "short") == BTX_ERR_INVALID_ARG);
+
+    /* get_peers on an arbitrary 20-byte id wires up cleanly (the rendezvous /
+     * presence discovery half of announce); bad hex is a clean arg error. */
+    CHECK(btx_dht_get_peers(s, std::string(tgt, 40).c_str()) == BTX_OK);
+    CHECK(btx_dht_get_peers(s, "not-hex") == BTX_ERR_INVALID_ARG);
+
     btx_session_free(s);
     CHECK(btx::test::live_session_count() == 0);
 }
