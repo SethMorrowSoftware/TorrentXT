@@ -1176,27 +1176,26 @@ function qsMakeTorCode pOnion, pName, pSalt, pVerifier
       qsB64(pSalt) & ":" & qsB64(pVerifier)
 end qsMakeTorCode
 
--- Byte size of a file WITHOUT reading it into memory (via the folder listing).
+-- Byte size of a file WITHOUT loading it whole into memory. OpenXTalk does not
+-- support 'the detailedFiles', so we open the file and count in bounded 4 MiB
+-- chunks: O(file size) I/O but O(1) memory. Used for the header totalLen and the
+-- large-file warning (both small-file cases in practice). Empty if unreadable.
 function qsFileSize pPath
-   local tParent, tLeaf, tLine, tList, tSaveFolder
-   set the itemDelimiter to "/"
-   put the last item of pPath into tLeaf
-   put item 1 to -2 of pPath into tParent
-   if tParent is empty then
-      put "/" into tParent
+   local tSize
+   put 0 into tSize
+   open file pPath for binary read
+   if the result is not empty then
+      return empty
    end if
-   put the defaultFolder into tSaveFolder
-   set the defaultFolder to tParent
-   put the detailedFiles into tList
-   set the defaultFolder to tSaveFolder
-   set the lineDelimiter to return
-   repeat for each line tLine in tList
-      set the itemDelimiter to comma
-      if urlDecode(item 1 of tLine) is tLeaf then
-         return item 2 of tLine
+   repeat
+      read from file pPath for 4194304
+      if it is empty then
+         exit repeat
       end if
+      add the number of bytes in it to tSize
    end repeat
-   return empty
+   close file pPath
+   return tSize
 end qsFileSize
 
 -- A pseudo-random high loopback port for OnionXT to bind its internal listener to.
@@ -1657,7 +1656,7 @@ end qsOnionRecvStream
 -- length-prefixed frames into a temp file, draining+compacting the buffer each call
 -- so the payload never dwells whole in a Data.
 command qsOnionRecvData pStream, pData
-   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload, tNeed
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
    if sRxState[pStream] is empty or sRxState[pStream] is "done" then
       exit qsOnionRecvData   -- already finished/cleared; ignore any trailing bytes
    end if
@@ -1708,16 +1707,6 @@ command qsOnionRecvData pStream, pData
       put tTotal into sOnionXfers[pStream]["total"]
       put 0 into sRxGot[pStream]
       put qsTempEncPath() into sRxTmp[pStream]
-      -- refuse if the volume clearly lacks room (an encrypted receive needs ~2x for
-      -- the .enc temp plus the decrypt). VERIFY: which volume 'the diskSpace' reports.
-      put tTotal into tNeed
-      if sRxEnc[pStream] is not 0 then
-         put (tTotal * 2) into tNeed
-      end if
-      if (the diskSpace is a number) and (the diskSpace < tNeed) then
-         qsOnionRecvAbort pStream, "Not enough free disk space to receive this file."
-         exit qsOnionRecvData
-      end if
       open file sRxTmp[pStream] for binary write
       if the result is not empty then
          qsOnionRecvAbort pStream, "Could not open a temp file to receive into."
