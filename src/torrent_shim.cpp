@@ -84,12 +84,14 @@
 #include <libtorrent/peer_connection_handle.hpp> /* rp1: send_buffer / pid / remote */
 
 /* ---- standard library ------------------------------------------------------ */
+#include <chrono>       /* rp1 loopback self-test: bounded pump loop */
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>       /* rp1 loopback self-test: sleep between pumps */
 #include <unordered_map>
 #include <vector>
 
@@ -2910,6 +2912,100 @@ int rp1_free_id(const int *used, int count) {
         std::set<int> s;
         for (int i = 0; i < (count < 0 ? 0 : count); ++i) s.insert(used[i]);
         return rp1_pick_free_id(s);
+    });
+}
+
+int rp1_loopback_selftest(int pTimeoutMs) {
+    BTX_GUARD_ACTION({
+        using clock = std::chrono::steady_clock;
+        const int timeout = (pTimeoutMs > 0) ? pTimeoutMs : 8000;
+
+        /* Two real sessions on loopback, TCP only, no DHT/LSD/UPnP/NAT-PMP: we
+         * wire the peers together with an explicit connect_peer, so the test needs
+         * no network and is deterministic. Each carries the actual rp1 plugin. */
+        auto make = [](std::shared_ptr<Rp1SessionPlugin> &plug)
+            -> std::shared_ptr<lt::session> {
+            lt::settings_pack sp;
+            sp.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+            sp.set_bool(lt::settings_pack::enable_dht, false);
+            sp.set_bool(lt::settings_pack::enable_lsd, false);
+            sp.set_bool(lt::settings_pack::enable_upnp, false);
+            sp.set_bool(lt::settings_pack::enable_natpmp, false);
+            sp.set_bool(lt::settings_pack::enable_outgoing_utp, false);
+            sp.set_bool(lt::settings_pack::enable_incoming_utp, false);
+            auto ses = std::make_shared<lt::session>(lt::session_params(sp));
+            plug = std::make_shared<Rp1SessionPlugin>();
+            ses->add_extension(plug);
+            return ses;
+        };
+        std::shared_ptr<Rp1SessionPlugin> pa;
+        std::shared_ptr<Rp1SessionPlugin> pb;
+        std::shared_ptr<lt::session> sa = make(pa);
+        std::shared_ptr<lt::session> sb = make(pb);
+
+        /* The SAME metadata-less phantom swarm on both. */
+        char raw[20];
+        for (int i = 0; i < 20; ++i) raw[i] = static_cast<char>(i + 1);
+        lt::sha1_hash sh(raw);
+        lt::info_hash_t ih(sh);
+        auto add = [&](lt::session &s) -> lt::torrent_handle {
+            lt::add_torrent_params atp;
+            atp.info_hashes = ih;
+            atp.save_path = ".";
+            lt::error_code aec;
+            return s.add_torrent(std::move(atp), aec);
+        };
+        lt::torrent_handle ta = add(*sa);
+        (void)add(*sb);   /* B just needs to be in the swarm to accept A */
+
+        lt::error_code ec;
+        lt::address loop = lt::make_address("127.0.0.1", ec);
+
+        const auto deadline = clock::now() + std::chrono::milliseconds(timeout);
+        int aPeer = 0;
+        bool sent = false;
+        const std::string payload = "rp1-selftest-hello";
+
+        while (clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            /* Keep nudging A to connect to B until a peer forms. */
+            int portB = sb->listen_port();
+            if (portB != 0 && aPeer == 0 && ta.is_valid())
+                ta.connect_peer(lt::tcp::endpoint(
+                    loop, static_cast<unsigned short>(portB)));
+
+            /* Once A's peer has completed the rp1 handshake, we know its id. */
+            if (aPeer == 0) {
+                std::lock_guard<std::mutex> lk(pa->mx);
+                for (auto const &kv : pa->peers)
+                    if (kv.second->supportsRp1 && kv.second->peerRp1Id != 0) {
+                        aPeer = kv.first;
+                        break;
+                    }
+            }
+            if (aPeer != 0 && !sent) {
+                if (pa->queue_send(aPeer, payload.data(),
+                        static_cast<int>(payload.size())) == BTX_OK)
+                    sent = true;
+            }
+            /* Did B surface exactly what A sent? That is the whole proof. */
+            if (sent) {
+                std::lock_guard<std::mutex> lk(pb->mx);
+                for (auto const &ev : pb->events)
+                    if (ev.type == btx::A_RP1_MESSAGE && ev.hasPayload
+                        && std::string(ev.payload.begin(), ev.payload.end())
+                               == payload)
+                        return 1;   /* A -> B rp1 message delivered, byte-exact */
+            }
+        }
+        if (aPeer == 0)
+            set_error("rp1 selftest: peers never negotiated rp1 (connection not held?)");
+        else if (!sent)
+            set_error("rp1 selftest: could not queue the send");
+        else
+            set_error("rp1 selftest: message was not delivered before timeout");
+        return 0;
     });
 }
 

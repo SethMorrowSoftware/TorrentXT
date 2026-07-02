@@ -61,6 +61,8 @@ local sTxOffset         -- array: stream -> bytes sent so far (progress)
 local sTxTotal          -- array: stream -> total bytes to send
 local sTxDeadline       -- array: stream -> the milliseconds of the last send (idle watchdog)
 local sTxReq            -- array: stream -> inbound request bytes accumulated before we start
+local sTxMode           -- array: stream -> "btxo" (app protocol) or "http" (browser)
+local sTxRaw            -- array: stream -> "true" for an HTTP body (raw bytes, no framing)
 -- per receive-stream state (keyed by the stream handle)
 local sRxBuf            -- array: stream -> reassembly buffer (drained + compacted each call)
 local sRxState          -- array: stream -> "header" / "body" / "done"
@@ -1051,14 +1053,18 @@ command qsOnionServicePublished pInfo
    end if
    put qsMakeTorCode(tOnion, sActiveShare["name"], sActiveShare["salt"], sActiveShare["verify"]) into tCode
    put tCode into sShareCode
+   put tOnion into sActiveShare["onion"]
    set the text of field "qsCode" to tCode
    put "true" into sActiveShare["revealed"]
    if sActiveShare["enc"] is kFlagEnc then
       set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " ENCRYPTED over Tor - both IPs hidden. Send the code AND the passphrase; keep this window open. An interrupted transfer restarts from the beginning.")
+      qsLog "Private Tor address published. Click Copy and send the code to your friend."
    else
-      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. Keep this window open. An interrupted transfer restarts from the beginning.")
+      -- a plaintext share ALSO serves a browser: hand out the .onion URL for anyone
+      -- with Tor Browser (no app needed). Still IP-anonymous, still not encrypted.
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. App code is above; a browser (Tor Browser) can download it at  http://" & tOnion & "/")
+      qsLog "Tor address published. App users: use the code above. Anyone with Tor Browser can download at: http://" & tOnion & "/"
    end if
-   qsLog "Private Tor address published. Click Copy and send the code to your friend."
 end qsOnionServicePublished
 
 -- Repaint the live pill AND drive the toggle's disabled/hilite state. A mode the
@@ -1404,6 +1410,76 @@ command qsOnionPeer pStream, pService, pPeerAddr
    end if
    put "true" into sActiveShare["busy"]
    put pStream into sActiveShare["stream"]
+   -- do not seed a transfers row yet: only a real file transfer (the BTXO app
+   -- protocol, or an HTTP GET /download) gets a row, so a browser's index or
+   -- favicon hit leaves no noise in the Transfers list.
+   put "" into sTxReq[pStream]
+   put "" into sTxMode[pStream]
+   put "" into sTxRaw[pStream]
+   put the milliseconds into sTxDeadline[pStream]
+   oxSetStreamCallback pStream, "qsOnionServeStream"
+   send ("qsOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end qsOnionPeer
+
+-- Sender's per-stream handler. Auto-detects the caller from the first byte: the
+-- app sends the "BTXO" magic (framed protocol); a browser sends "GET "/"HEAD "
+-- (HTTP). Anything else is junk from a local process and is dropped.
+command qsOnionServeStream pStream, pEvent, pData
+   local tFirst, tCrlf2
+   if pEvent is "data" then
+      if sActiveShare["stream"] is not pStream then
+         exit qsOnionServeStream
+      end if
+      if sOnionXfers[pStream]["state"] is "active" then
+         exit qsOnionServeStream   -- a transfer is already running; ignore extra inbound
+      end if
+      put pData after sTxReq[pStream]
+      put the milliseconds into sTxDeadline[pStream]
+      if the number of bytes in sTxReq[pStream] < 1 then
+         exit qsOnionServeStream
+      end if
+      if sTxMode[pStream] is empty then
+         put byte 1 of sTxReq[pStream] into tFirst
+         if tFirst is "G" or tFirst is "H" then
+            put "http" into sTxMode[pStream]
+         else if tFirst is "B" then
+            if the number of bytes in sTxReq[pStream] < 4 then
+               exit qsOnionServeStream
+            end if
+            if (byte 1 to 4 of sTxReq[pStream]) is not kOnionMagic then
+               oxCloseStream pStream
+               qsOnionServeAbort pStream
+               exit qsOnionServeStream
+            end if
+            put "btxo" into sTxMode[pStream]
+         else
+            oxCloseStream pStream
+            qsOnionServeAbort pStream
+            exit qsOnionServeStream
+         end if
+      end if
+      if sTxMode[pStream] is "btxo" then
+         qsOnionBeginSend pStream
+      else
+         -- HTTP: serve once the whole request header block (CRLF CRLF) has arrived
+         put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tCrlf2
+         if sTxReq[pStream] contains tCrlf2 then
+            qsOnionServeHttp pStream
+         else if the number of bytes in sTxReq[pStream] > 16384 then
+            oxCloseStream pStream
+            qsOnionServeAbort pStream
+         end if
+      end if
+   else if pEvent is "closed" or pEvent is "error" then
+      if sOnionXfers[pStream]["state"] is "active" then
+         qsOnionServeAbort pStream   -- peer dropped mid-transfer
+      end if
+   end if
+end qsOnionServeStream
+
+-- Open the file, send the header, and arm the frame pump.
+command qsOnionBeginSend pStream
+   local tHeader
    put sActiveShare["name"] into sOnionXfers[pStream]["name"]
    put "sending" into sOnionXfers[pStream]["dir"]
    if sActiveShare["enc"] is kFlagEnc then
@@ -1413,42 +1489,6 @@ command qsOnionPeer pStream, pService, pPeerAddr
    end if
    put sActiveShare["total"] into sOnionXfers[pStream]["total"]
    put 0 into sOnionXfers[pStream]["got"]
-   put "connecting" into sOnionXfers[pStream]["state"]
-   put "" into sTxReq[pStream]
-   put the milliseconds into sTxDeadline[pStream]
-   oxSetStreamCallback pStream, "qsOnionServeStream"
-   send ("qsOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
-end qsOnionPeer
-
--- Sender's per-stream handler. Waits for the receiver's magic request, then pumps.
-command qsOnionServeStream pStream, pEvent, pData
-   if pEvent is "data" then
-      if sActiveShare["stream"] is not pStream then
-         exit qsOnionServeStream
-      end if
-      if sOnionXfers[pStream]["state"] is "active" then
-         exit qsOnionServeStream
-      end if
-      put pData after sTxReq[pStream]
-      put the milliseconds into sTxDeadline[pStream]
-      if the number of bytes in sTxReq[pStream] >= 4 then
-         if (byte 1 to 4 of sTxReq[pStream]) is kOnionMagic then
-            qsOnionBeginSend pStream
-         else
-            oxCloseStream pStream
-            qsOnionServeAbort pStream
-         end if
-      end if
-   else if pEvent is "closed" or pEvent is "error" then
-      if sOnionXfers[pStream]["state"] is not "done" then
-         qsOnionServeAbort pStream
-      end if
-   end if
-end qsOnionServeStream
-
--- Open the file, send the header, and arm the frame pump.
-command qsOnionBeginSend pStream
-   local tHeader
    put "active" into sOnionXfers[pStream]["state"]
    open file sActiveShare["path"] for binary read
    if the result is not empty then
@@ -1486,7 +1526,10 @@ command qsOnionSendPump pStream
    read from file sTxPath[pStream] for kOnionChunk
    put it into tSlice
    if tSlice is empty then
-      oxWrite pStream, binaryEncode("N", 0)
+      -- BTXO ends with a zero-length terminator; HTTP relies on Content-Length
+      if sTxRaw[pStream] is not "true" then
+         oxWrite pStream, binaryEncode("N", 0)
+      end if
       close file sTxPath[pStream]
       put "done" into sOnionXfers[pStream]["state"]
       qsLog "Sent " & quote & sActiveShare["name"] & quote & " over Tor."
@@ -1494,7 +1537,11 @@ command qsOnionSendPump pStream
       qsOnionServeCleanup pStream
       exit qsOnionSendPump
    end if
-   oxWrite pStream, (binaryEncode("N", the number of bytes in tSlice) & tSlice)
+   if sTxRaw[pStream] is "true" then
+      oxWrite pStream, tSlice
+   else
+      oxWrite pStream, (binaryEncode("N", the number of bytes in tSlice) & tSlice)
+   end if
    if the result is not empty then
       qsLog "Private send failed:" && the result
       qsOnionServeAbort pStream
@@ -1518,6 +1565,8 @@ command qsOnionServeCleanup pStream
    put empty into sTxTotal[pStream]
    put empty into sTxDeadline[pStream]
    put empty into sTxReq[pStream]
+   put empty into sTxMode[pStream]
+   put empty into sTxRaw[pStream]
    if sActiveShare["stream"] is pStream then
       put "false" into sActiveShare["busy"]
       put empty into sActiveShare["stream"]
@@ -1525,17 +1574,18 @@ command qsOnionServeCleanup pStream
 end qsOnionServeCleanup
 
 command qsOnionServeAbort pStream
-   put "error" into sOnionXfers[pStream]["state"]
+   if sOnionXfers[pStream] is not empty then
+      put "error" into sOnionXfers[pStream]["state"]
+   end if
    oxCloseStream pStream
    qsOnionServeCleanup pStream
 end qsOnionServeAbort
 
--- Idle watchdog for a send stream (armed at accept, re-armed each frame).
+-- Idle watchdog for a serve stream, armed at accept. Keyed off sActiveShare's
+-- current stream (which cleanup clears) so it works before a transfer row exists
+-- and no-ops once the stream is done/superseded.
 command qsOnionSendWatchdog pStream
-   if sOnionXfers[pStream] is empty then
-      exit qsOnionSendWatchdog
-   end if
-   if sOnionXfers[pStream]["state"] is "done" or sOnionXfers[pStream]["state"] is "error" then
+   if sActiveShare["stream"] is not pStream then
       exit qsOnionSendWatchdog
    end if
    if (the milliseconds - sTxDeadline[pStream]) > kOnionSendTimeout then
@@ -1545,6 +1595,107 @@ command qsOnionSendWatchdog pStream
    end if
    send ("qsOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
 end qsOnionSendWatchdog
+
+-- ---- serve a browser over HTTP (plaintext shares only) ----------------------
+-- A plaintext Tor share ALSO answers a plain browser: open http://<onion>/ in Tor
+-- Browser and download it, no app needed. IP-anonymous (Tor), but NOT encrypted
+-- and the sender is not verified - only plaintext shares are ever served this way
+-- (a browser cannot decrypt a cryptoXT .enc). Routes: "/" = an index page with a
+-- Download link; "/download" = the file bytes; anything else (favicon, ...) = 404.
+command qsOnionServeHttp pStream
+   local tReq, tMethod, tPath, tHead, tFn, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put textDecode(sTxReq[pStream], "UTF-8") into tReq
+   put word 1 of tReq into tMethod
+   put word 2 of tReq into tPath
+   if sActiveShare["enc"] is kFlagEnc then
+      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlEncrypted()
+      exit qsOnionServeHttp
+   end if
+   if tPath is "/download" then
+      put qsSafeLeaf(sActiveShare["name"]) into tFn
+      replace quote with "" in tFn
+      replace ";" with "" in tFn
+      put ("HTTP/1.1 200 OK" & tCrlf & "Content-Type: application/octet-stream" & tCrlf & \
+         "Content-Length: " & sActiveShare["total"] & tCrlf & \
+         "Content-Disposition: attachment; filename=" & quote & tFn & quote & tCrlf & \
+         "Connection: close" & tCrlf & tCrlf) into tHead
+      -- seed a real transfer row (only /download counts as a transfer)
+      put tFn into sOnionXfers[pStream]["name"]
+      put "sending" into sOnionXfers[pStream]["dir"]
+      put "" into sOnionXfers[pStream]["enc"]
+      put sActiveShare["total"] into sOnionXfers[pStream]["total"]
+      put 0 into sOnionXfers[pStream]["got"]
+      put "active" into sOnionXfers[pStream]["state"]
+      oxWrite pStream, textEncode(tHead, "UTF-8")
+      if the result is not empty then
+         qsOnionServeAbort pStream
+         exit qsOnionServeHttp
+      end if
+      if tMethod is "HEAD" then
+         put "done" into sOnionXfers[pStream]["state"]
+         oxCloseStream pStream
+         qsOnionServeCleanup pStream
+         exit qsOnionServeHttp
+      end if
+      open file sActiveShare["path"] for binary read
+      if the result is not empty then
+         qsOnionServeAbort pStream
+         exit qsOnionServeHttp
+      end if
+      put sActiveShare["path"] into sTxPath[pStream]
+      put "true" into sTxRaw[pStream]
+      put the milliseconds into sTxDeadline[pStream]
+      send ("qsOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+      exit qsOnionServeHttp
+   end if
+   if tPath is "/" then
+      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlIndex()
+      exit qsOnionServeHttp
+   end if
+   qsOnionHttpText pStream, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+end qsOnionServeHttp
+
+-- Send a small text/html HTTP response and close (used for the index, the
+-- encrypted notice, and 404s - never for the file body).
+command qsOnionHttpText pStream, pStatus, pType, pBody
+   local tData, tHead, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put textEncode(pBody, "UTF-8") into tData
+   put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
+      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
+   oxCloseStream pStream
+   qsOnionServeCleanup pStream
+end qsOnionHttpText
+
+-- The download landing page (single-quoted HTML attributes so the LiveCode string
+-- literals never contain a double quote). Shows the name, size, a Download button,
+-- and the honest "anonymous but not encrypted" notice.
+function qsHtmlIndex
+   local tName, tSize
+   put qsSafeLeaf(sActiveShare["name"]) into tName
+   replace "&" with "&amp;" in tName
+   replace "<" with "&lt;" in tName
+   replace ">" with "&gt;" in tName
+   put qsBytes(sActiveShare["total"]) into tSize
+   return ("<!doctype html><html><head><meta charset='utf-8'>" & \
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>" & \
+      "<title>Download</title></head>" & \
+      "<body style='font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em'>" & \
+      "<h2>" & tName & "</h2><p>" & tSize & " - shared privately over Tor.</p>" & \
+      "<p><a href='/download' download style='display:inline-block;padding:.6em 1.2em;" & \
+      "background:#2c5aa0;color:#fff;text-decoration:none;border-radius:6px'>Download</a></p>" & \
+      "<p style='color:#888;font-size:.9em'>This transfer is anonymous - both IP addresses are hidden by " & \
+      "Tor - but it is NOT encrypted, and the sender is not cryptographically verified.</p></body></html>")
+end qsHtmlIndex
+
+function qsHtmlEncrypted
+   return ("<!doctype html><html><head><meta charset='utf-8'><title>Encrypted</title></head>" & \
+      "<body style='font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em'>" & \
+      "<h2>This file is encrypted</h2><p>It cannot be downloaded in a browser. Ask the sender for the " & \
+      "app share code and the passphrase.</p></body></html>")
+end qsHtmlEncrypted
 
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
