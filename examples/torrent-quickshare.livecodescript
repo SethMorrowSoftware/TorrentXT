@@ -46,6 +46,33 @@ local sPendingName      -- array: info-hash -> original filename, for that downl
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
 local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned on close)
 
+-- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
+-- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
+-- created. All of this is inert unless sHasOnion. See the ox* wiring below.
+local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once)
+local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
+local sTorSend          -- "true" while the "Send privately over Tor" toggle is armed
+local sOnionTriedTB     -- "true" once we have retried the Tor Browser control port pair
+local sActiveShare      -- array: the one live anon share (service, path, name, enc, salt, verify, ...)
+local sOnionXfers       -- array: stream handle -> {name,dir,enc,total,got,state} for the transfers view
+-- per send-stream state (keyed by the stream handle)
+local sTxPath           -- array: stream -> path of the file we are streaming out
+local sTxOffset         -- array: stream -> bytes sent so far (progress)
+local sTxTotal          -- array: stream -> total bytes to send
+local sTxDeadline       -- array: stream -> the milliseconds of the last send (idle watchdog)
+local sTxReq            -- array: stream -> inbound request bytes accumulated before we start
+-- per receive-stream state (keyed by the stream handle)
+local sRxBuf            -- array: stream -> reassembly buffer (drained + compacted each call)
+local sRxState          -- array: stream -> "header" / "body" / "done"
+local sRxTmp            -- array: stream -> temp output path we are writing into
+local sRxName           -- array: stream -> real (sanitized) filename to save as
+local sRxEnc            -- array: stream -> nonzero if the payload is a cryptoXT .enc
+local sRxTotal          -- array: stream -> total payload bytes expected
+local sRxGot            -- array: stream -> payload bytes written so far
+local sRxKey            -- array: stream -> 32-byte file key (encrypted receive), else empty
+local sRxSave           -- array: stream -> save folder for this receive
+local sRxDeadline       -- array: stream -> the milliseconds of the last data (idle watchdog)
+
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
 -- the swarm only ever sees the .enc blob, the real filename and the Argon2id salt
@@ -57,10 +84,34 @@ constant kCodePrefix = "BTXQS1:" -- marks an encrypted share code (vs a bare has
 -- passphrase never pulls a useless .enc to disk).
 constant kQsVerify = "BTXQSVERIFY"
 
+-- ---- OnionXT (optional Tor anonymity) constants ------------------------------
+-- Model C: with the Tor toggle on, the file's bytes ride an OnionXT onion stream
+-- (both IPs hidden) and NO torrent is created. Requires the OnionXT extension +
+-- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
+-- ABI; verified statically here, needs an on-engine OXT pass with a running Tor
+-- daemon (the project convention). See docs/ONIONXT-INTEGRATION-PLAN.md.
+constant kTorCodePrefix = "BTXTOR1:"   -- marks an anonymous (Tor) share code
+constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync + go request
+constant kOnionVer = 1                 -- stream protocol version
+constant kOnionVPort = 80              -- the onion service's advertised virtual port
+constant kOnionChunk = 65536           -- 64 KiB: max payload bytes in one data frame
+constant kFlagEnc = 1                  -- header flags bit0: payload is a cryptoXT .enc
+constant kOnionPumpTick = 15           -- ms between send-pump frames (never a tight loop)
+constant kOnionSendTimeout = 30000     -- ms idle watchdog, sender
+constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slow)
+constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to upload
+constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
+constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
+constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
+constant kTorSocksPort = "9050"        -- system/standalone tor
+constant kTorControlPort = "9051"
+constant kTorSocksPortTB = "9150"      -- Tor Browser
+constant kTorControlPortTB = "9151"
+
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-06"
+constant kQsUiVersion = "qs-ui-2026-07"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -118,6 +169,9 @@ on mouseUp
       case "qsGet"
          qsGetFile
          break
+      case "qsTorToggle"
+         qsToggleTor
+         break
       default
          pass mouseUp
    end switch
@@ -142,8 +196,18 @@ command qsBuild
    set the backgroundColor of field "qsTitle" to "44,90,160"
    set the foregroundColor of field "qsTitle" to "255,255,255"
    set the textStyle of field "qsTitle" to "bold"
-   qsLabel "qsTagline", "Send a file straight to a friend with a short code. No server, no size limit, no upload first - peer-to-peer.", "24,48,596,70", 10
+   qsLabel "qsTagline", "Send a file straight to a friend with a short code. No server, no size limit, no upload first - peer-to-peer.", "24,48,424,70", 10
    set the foregroundColor of field "qsTagline" to "90,96,105"
+   -- live Tor status pill (repainted only by qsOnionPill), sitting in the title band
+   qsLabel "qsTorPill", "Tor: off", "430,8,612,32", 10
+   set the opaque of field "qsTorPill" to true
+   set the backgroundColor of field "qsTorPill" to "33,72,132"
+   set the foregroundColor of field "qsTorPill" to "220,228,240"
+   set the textAlign of field "qsTorPill" to "right"
+   -- the optional "Send privately over Tor" toggle (two-state; managed via sTorSend)
+   qsButton "qsTorToggle", "Send privately over Tor", "440,44,600,72"
+   set the style of button "qsTorToggle" to "checkbox"
+   set the autoHilite of button "qsTorToggle" to false
    -- SEND: an OPTIONAL passphrase (set it BEFORE dropping to encrypt), the drop
    -- area, then the resulting code.
    qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
@@ -192,6 +256,7 @@ command qsBuild
    qsList "qsLog", "24,586,596,652", true
    set the textSize of field "qsLog" to 9
    qsAddTips
+   qsOnionPill
    set the uUiVersion of this stack to kQsUiVersion
    unlock screen
 end qsBuild
@@ -279,6 +344,8 @@ command qsAddTips
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your Quick Share folder."
    set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
+   set the tooltip of button "qsTorToggle" to "Off = normal peer-to-peer. On = send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate."
+   set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work."
 end qsAddTips
 
 -- ---- session + loops ---------------------------------------------------------
@@ -298,6 +365,15 @@ command qsStart
    put "true" into sPolling
    -- probe cryptoXT once so the passphrase fields can fail closed when it is absent
    put qsCanEncrypt() into sCanEncrypt
+   -- probe OnionXT and bring up the Tor control link (non-blocking). The anon path
+   -- is completely inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
+   put qsHasOnion() into sHasOnion
+   put "false" into sTorSend
+   if sHasOnion then
+      qsOnionStart
+   else
+      qsOnionPill
+   end if
    if sCanEncrypt then
       qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
@@ -310,6 +386,7 @@ end qsStart
 command qsStop
    local tKey, tErr
    put "false" into sPolling
+   qsOnionStop
    if sSession is not empty and sSession is not 0 then
       btStopSession sSession
    end if
@@ -325,6 +402,7 @@ command qsStop
       end try
    end repeat
    put empty into sTempEnc
+   put empty into sOnionXfers
 end qsStop
 
 command qsPollOnce
@@ -381,6 +459,24 @@ command qsShareFile pPath
       put "/" into tParent
    end if
    put qsTrim(field "qsSendPass") into tPass
+   -- FIRST-PRIORITY anonymous branch: with the Tor toggle on, the bytes ride an
+   -- onion stream and NO torrent is created (mutual-exclusion invariant, section 3).
+   if sTorSend is "true" then
+      if not sHasOnion then
+         qsLog "Turn off 'Send privately over Tor', or install OnionXT + cryptoXT + a local Tor daemon."
+         exit qsShareFile
+      end if
+      if not qsOnionReadyNow() then
+         qsLog "Tor is still connecting - watch the pill, then drop the file again."
+         exit qsShareFile
+      end if
+      if there is a folder pPath then
+         qsLog "Anonymous send handles one file at a time - zip the folder first, then send the zip."
+         exit qsShareFile
+      end if
+      qsStartOnionShare pPath, tName, tPass
+      exit qsShareFile
+   end if
    if tPass is not empty and not sCanEncrypt then
       qsLog "cryptoXT (org.openxtalk.library.sodium) is not installed - sharing WITHOUT a passphrase. Install it to encrypt."
       put empty into tPass
@@ -485,6 +581,11 @@ command qsGetFile
       exit qsGetFile
    end if
    put qsTrim(field "qsRecvPass") into tPass
+   -- an anonymous (Tor) share code routes through the onion path, checked first
+   if tCode begins with kTorCodePrefix then
+      qsReceiveOnion tCode
+      exit qsGetFile
+   end if
    if tCode begins with kCodePrefix then
       -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>:<base64 verifier>
       if not sCanEncrypt then
@@ -564,7 +665,7 @@ end qsGetFile
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
-   local tIH, tDisp, tDir
+   local tIH, tDisp, tDir, tK, tE
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
    end if
@@ -593,6 +694,26 @@ command qsRefreshXfers
       put qsTrunc(tDisp, 26) & tab & tDir & tab & qsBar(tPct) & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
+   end repeat
+   -- append anonymous (Tor) transfers; they have NO torrent handle, so the torrent
+   -- loop above never sees them. Same "name TAB dir TAB bar" row format.
+   repeat for each key tK in sOnionXfers
+      put sOnionXfers[tK] into tE
+      put tE["dir"] & " via Tor" into tDir
+      if tE["enc"] is "true" then
+         put tDir && "(locked)" into tDir
+      end if
+      if tE["state"] is "connecting" or tE["total"] is 0 then
+         put qsTrunc(tE["name"], 26) & tab & tDir & tab & "connecting..." & return after tRows
+      else if tE["state"] is "done" then
+         put qsTrunc(tE["name"], 26) & tab & tDir & tab & "done" & return after tRows
+      else if tE["state"] is "error" then
+         put qsTrunc(tE["name"], 26) & tab & tDir & tab & "stopped" & return after tRows
+      else
+         put (the round of (tE["got"] / tE["total"] * 1000) / 10) into tPct
+         put qsTrunc(tE["name"], 26) & tab & tDir & tab & qsBar(tPct) & return after tRows
+      end if
+      add 1 to tLineNum
    end repeat
    if the last char of tRows is return then
       delete the last char of tRows
@@ -829,6 +950,856 @@ command qsMaybeDecryptFinished pTorrent
    put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]
 end qsMaybeDecryptFinished
+
+-- ==== OnionXT: optional Tor anonymity (Model C) ==============================
+-- The whole block below is inert unless sHasOnion. It NEVER touches libtorrent:
+-- an anonymous transfer creates no torrent and makes no DHT call (the mutual-
+-- exclusion invariant). Every ox* handler is OnionXT's published ABI; this is
+-- verified statically (tools/check-livecodescript.py) and NEEDS an on-engine OXT
+-- pass with a running Tor daemon before any runtime claim. See
+-- docs/ONIONXT-INTEGRATION-PLAN.md and its VERIFY register (section 12.3).
+
+-- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both
+-- must be present for any anonymous transfer (even a plaintext one). A guarded
+-- oxVersion() probe, mirroring qsCanEncrypt. VERIFY: oxVersion resolves only when
+-- the OnionXT extension is loaded.
+function qsHasOnion
+   local tV, tErr
+   if not sCanEncrypt then
+      return false
+   end if
+   try
+      put oxVersion() into tV
+   catch tErr
+      return false
+   end try
+   return (tV is not empty)
+end qsHasOnion
+
+-- Live, authoritative Tor readiness, re-read at the moment of use (never trust the
+-- cached sTorReady for a go/no-go). oxIsReady() is true only at 100% bootstrap.
+function qsOnionReadyNow
+   if not sHasOnion then
+      return false
+   end if
+   return oxIsReady()
+end qsOnionReadyNow
+
+-- Bring up the OnionXT control connection at the tail of qsStart (only when
+-- sHasOnion). Non-blocking: bootstrap takes tens of seconds and is surfaced by the
+-- status callback + the 1 s dash pill. Registers our callbacks and dispatch owner
+-- first, then connects on the stock tor control port (9051); the status callback
+-- retries the Tor Browser port pair (9151) once on an auth failure.
+command qsOnionStart
+   if not sHasOnion then
+      exit qsOnionStart
+   end if
+   put "false" into sOnionTriedTB
+   oxSetCallbackOwner the long id of me
+   oxSetStatusCallback "qsOnionStatus"
+   oxSetPeerCallback "qsOnionPeer"
+   oxSetControlPort kTorControlPort
+   oxSetSocksPort kTorSocksPort
+   oxConnectControl
+   if the result is not empty then
+      qsOnionTryTB
+   end if
+   qsOnionPill
+end qsOnionStart
+
+-- Retry the control connection on the Tor Browser port pair, exactly once.
+command qsOnionTryTB
+   if sOnionTriedTB is "true" then
+      exit qsOnionTryTB
+   end if
+   put "true" into sOnionTriedTB
+   oxSetControlPort kTorControlPortTB
+   oxSetSocksPort kTorSocksPortTB
+   oxConnectControl
+end qsOnionTryTB
+
+-- OnionXT status callback (dispatched with pKind, pInfo). Coalesced bootstrap and
+-- event updates on the main thread. Keep it short - it runs on the shared thread.
+command qsOnionStatus pKind, pInfo
+   if pKind is "control" then
+      if pInfo is "authenticated" then
+         qsLog "Tor control connected - bootstrapping (this can take a minute)..."
+      else if (pInfo is "authfailed" or pInfo is "error") then
+         qsOnionTryTB
+      end if
+   else if pKind is "serviceReady" then
+      qsOnionServicePublished pInfo
+   end if
+   put qsOnionReadyNow() into sTorReady
+   qsOnionPill
+end qsOnionStatus
+
+-- Our onion service descriptor uploaded: build and reveal the share code now (an
+-- address handed out earlier would just fail to resolve). One active share, so the
+-- serviceReady event is unambiguous. VERIFY: pInfo semantics for serviceReady.
+command qsOnionServicePublished pInfo
+   local tOnion, tCode
+   if sActiveShare["service"] is empty then
+      exit qsOnionServicePublished
+   end if
+   if sActiveShare["revealed"] is "true" then
+      exit qsOnionServicePublished
+   end if
+   put oxServiceAddress(sActiveShare["service"]) into tOnion
+   if tOnion is empty then
+      exit qsOnionServicePublished
+   end if
+   put qsMakeTorCode(tOnion, sActiveShare["name"], sActiveShare["salt"], sActiveShare["verify"]) into tCode
+   put tCode into sShareCode
+   set the text of field "qsCode" to tCode
+   put "true" into sActiveShare["revealed"]
+   if sActiveShare["enc"] is kFlagEnc then
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " ENCRYPTED over Tor - both IPs hidden. Send the code AND the passphrase; keep this window open. An interrupted transfer restarts from the beginning.")
+   else
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. Keep this window open. An interrupted transfer restarts from the beginning.")
+   end if
+   qsLog "Private Tor address published. Click Copy and send the code to your friend."
+end qsOnionServicePublished
+
+-- Repaint the live pill AND drive the toggle's disabled/hilite state. A mode the
+-- environment cannot honor never stays silently armed (sTorSend forced off).
+command qsOnionPill
+   local tState
+   if there is no field "qsTorPill" then
+      exit qsOnionPill
+   end if
+   if not sHasOnion then
+      if sCanEncrypt then
+         put "Tor: no extension" into tState
+      else
+         put "Tor: needs cryptoXT" into tState
+      end if
+      set the disabled of button "qsTorToggle" to true
+   else if not oxIsControlAuthenticated() then
+      put "Tor: no daemon (start Tor on 127.0.0.1:9051 or 9151)" into tState
+      set the disabled of button "qsTorToggle" to true
+   else if not oxIsReady() then
+      put ("Tor: connecting " & oxBootstrapProgress() & "%") into tState
+      set the disabled of button "qsTorToggle" to false
+   else
+      put "Tor: ready" into tState
+      set the disabled of button "qsTorToggle" to false
+   end if
+   if (the disabled of button "qsTorToggle") and (sTorSend is "true") then
+      put "false" into sTorSend
+      set the hilite of button "qsTorToggle" to false
+   end if
+   set the text of field "qsTorPill" to tState
+end qsOnionPill
+
+-- Flip the send-over-Tor toggle (managed two-state; autoHilite is off).
+command qsToggleTor
+   if the disabled of button "qsTorToggle" then
+      exit qsToggleTor
+   end if
+   if sTorSend is "true" then
+      put "false" into sTorSend
+      set the hilite of button "qsTorToggle" to false
+   else
+      put "true" into sTorSend
+      set the hilite of button "qsTorToggle" to true
+   end if
+end qsToggleTor
+
+-- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
+command qsOnionStop
+   local tK, tErr
+   if not sHasOnion then
+      exit qsOnionStop
+   end if
+   repeat for each key tK in sOnionXfers
+      try
+         oxCloseStream tK
+      catch tErr
+      end try
+   end repeat
+   if sActiveShare["service"] is not empty then
+      try
+         oxRemoveService sActiveShare["service"]
+      catch tErr
+      end try
+   end if
+   try
+      oxDisconnectControl
+   catch tErr
+   end try
+   repeat for each key tK in sRxTmp
+      try
+         if sRxTmp[tK] is not empty and there is a file sRxTmp[tK] then
+            delete file sRxTmp[tK]
+         end if
+      catch tErr
+      end try
+   end repeat
+end qsOnionStop
+
+-- Reduce an attacker-chosen name (share code OR stream header) to a safe filename
+-- LEAF: basename only, no drive/colon, no leading dots, no separators or controls
+-- surviving. Empty result becomes "shared-file". Applied before opening any temp
+-- and before the final move - closes path traversal / arbitrary write.
+function qsSafeLeaf pName
+   local tN, tCh, tOut
+   put pName into tN
+   replace "\" with "/" in tN
+   set the itemDelimiter to "/"
+   put the last item of tN into tN
+   if tN contains ":" then
+      set the itemDelimiter to ":"
+      put the last item of tN into tN
+   end if
+   repeat while tN begins with "."
+      delete char 1 of tN
+   end repeat
+   put "" into tOut
+   repeat for each char tCh in tN
+      if charToNum(tCh) >= 32 and tCh is not "/" and tCh is not "\" then
+         put tCh after tOut
+      end if
+   end repeat
+   put tOut into tN
+   if tN is empty or tN is ".." or tN is "." then
+      return "shared-file"
+   end if
+   return tN
+end qsSafeLeaf
+
+-- Build a BTXTOR1 anonymous share code: prefix, onion, then base64 name/salt/verify
+-- (empty salt/verify for a plaintext share). Colons are safe delimiters: neither a
+-- v3 .onion nor base64 ever contains ':'.
+function qsMakeTorCode pOnion, pName, pSalt, pVerifier
+   return kTorCodePrefix & pOnion & ":" & qsB64(textEncode(qsSafeLeaf(pName), "UTF-8")) & ":" & \
+      qsB64(pSalt) & ":" & qsB64(pVerifier)
+end qsMakeTorCode
+
+-- Byte size of a file WITHOUT reading it into memory (via the folder listing).
+function qsFileSize pPath
+   local tParent, tLeaf, tLine, tList, tSaveFolder
+   set the itemDelimiter to "/"
+   put the last item of pPath into tLeaf
+   put item 1 to -2 of pPath into tParent
+   if tParent is empty then
+      put "/" into tParent
+   end if
+   put the defaultFolder into tSaveFolder
+   set the defaultFolder to tParent
+   put the detailedFiles into tList
+   set the defaultFolder to tSaveFolder
+   set the lineDelimiter to return
+   repeat for each line tLine in tList
+      set the itemDelimiter to comma
+      if urlDecode(item 1 of tLine) is tLeaf then
+         return item 2 of tLine
+      end if
+   end repeat
+   return empty
+end qsFileSize
+
+-- A pseudo-random high loopback port for OnionXT to bind its internal listener to.
+-- A collision surfaces as an oxCreateService error string, and the caller reports it.
+function qsPickPort
+   return (20000 + random(40000))
+end qsPickPort
+
+-- Build the stream header: magic(4) ver(1) flags(1) nameLen(u16 BE) name(UTF-8)
+-- totalLen(u64 BE as hi:u32 then lo:u32). Binary discipline throughout.
+function qsOnionHeader pName, pEnc, pTotal
+   local tNameB, tFlags, tHi, tLo, tOut
+   put textEncode(qsSafeLeaf(pName), "UTF-8") into tNameB
+   put 0 into tFlags
+   if pEnc is kFlagEnc then
+      put kFlagEnc into tFlags
+   end if
+   put (pTotal div 4294967296) into tHi
+   put (pTotal mod 4294967296) into tLo
+   put kOnionMagic into tOut
+   put numToByte(kOnionVer) after tOut
+   put numToByte(tFlags) after tOut
+   put binaryEncode("n", the number of bytes in tNameB) after tOut
+   put tNameB after tOut
+   put binaryEncode("NN", tHi, tLo) after tOut
+   return tOut
+end qsOnionHeader
+
+-- Decode a big-endian unsigned u16 / u32 from raw bytes (matches the golden test).
+function qsBEu16 pBytes
+   return (byteToNum(byte 1 of pBytes) * 256 + byteToNum(byte 2 of pBytes))
+end qsBEu16
+
+function qsBEu32 pBytes
+   local tA, tB, tC, tD
+   put byteToNum(byte 1 of pBytes) into tA
+   put byteToNum(byte 2 of pBytes) into tB
+   put byteToNum(byte 3 of pBytes) into tC
+   put byteToNum(byte 4 of pBytes) into tD
+   return (((tA * 256 + tB) * 256 + tC) * 256 + tD)
+end qsBEu32
+
+-- SEND entry: turn a dropped file into a fresh, unlinkable onion service and (once
+-- the descriptor uploads) reveal a BTXTOR1 code. Reuses the existing cryptoXT path
+-- when a passphrase is set. NO torrent is created.
+command qsStartOnionShare pPath, pName, pPass
+   local tTotal, tSalt, tKey, tVerifier, tEncPath, tEncFlag, tStreamFile
+   local tSvc, tPort, tSafe, tErr
+   put qsFileSize(pPath) into tTotal
+   if tTotal is empty or tTotal < 0 then
+      qsLog "Could not read that file's size."
+      exit qsStartOnionShare
+   end if
+   if tTotal > kAnonSizeWarn then
+      answer ("This file is large for an anonymous Tor transfer and will be slow." & return & \
+         "For big media, share it on the public swarm instead (that reveals your IP).") with "Cancel" or "Send over Tor anyway"
+      if it is not "Send over Tor anyway" then
+         exit qsStartOnionShare
+      end if
+   end if
+   put qsSafeLeaf(pName) into tSafe
+   put "" into tSalt
+   put "" into tVerifier
+   put 0 into tEncFlag
+   put pPath into tStreamFile
+   if pPass is not empty and sCanEncrypt then
+      put sxRandomBytes(16) into tSalt
+      put sxPwHash(textEncode(pPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      put sxSecretBox(textEncode(kQsVerify, "ASCII"), tKey) into tVerifier
+      put qsTempEncPath() into tEncPath
+      put tEncPath into sTempEnc[tEncPath]
+      qsLog "Encrypting " & quote & tSafe & quote & " before the private transfer - the app may pause briefly on a large file..."
+      put qsEncryptFile(pPath, tEncPath, tKey) into tErr
+      if tErr is not empty then
+         qsLog "Could not encrypt " & quote & tSafe & quote & ":" && tErr
+         try
+            if there is a file tEncPath then
+               delete file tEncPath
+            end if
+         catch tErr
+         end try
+         exit qsStartOnionShare
+      end if
+      put tEncPath into tStreamFile
+      put kFlagEnc into tEncFlag
+   else if pPass is not empty then
+      qsLog "cryptoXT is not installed - sending over Tor WITHOUT encryption (your IP is still hidden, but the sender is not verified)."
+   end if
+   -- one active anon share at a time: tear down any previous service + temp
+   if sActiveShare["service"] is not empty then
+      try
+         oxRemoveService sActiveShare["service"]
+      catch tErr
+      end try
+      if sActiveShare["encTmp"] is not empty then
+         try
+            if there is a file sActiveShare["encTmp"] then
+               delete file sActiveShare["encTmp"]
+            end if
+         catch tErr
+         end try
+      end if
+   end if
+   put empty into sActiveShare
+   put qsPickPort() into tPort
+   oxCreateServiceFromSeed sxRandomBytes(32), kOnionVPort, tPort
+   put the result into tSvc
+   if tSvc is not an integer then
+      qsLog "Could not publish a Tor address:" && tSvc
+      if tEncFlag is kFlagEnc then
+         try
+            if there is a file tEncPath then
+               delete file tEncPath
+            end if
+         catch tErr
+         end try
+      end if
+      exit qsStartOnionShare
+   end if
+   put tStreamFile into sActiveShare["path"]
+   put tSafe into sActiveShare["name"]
+   put tEncFlag into sActiveShare["enc"]
+   put tSalt into sActiveShare["salt"]
+   put tVerifier into sActiveShare["verify"]
+   put tPort into sActiveShare["port"]
+   put tSvc into sActiveShare["service"]
+   put "false" into sActiveShare["revealed"]
+   put "false" into sActiveShare["busy"]
+   if tEncFlag is kFlagEnc then
+      put tEncPath into sActiveShare["encTmp"]
+      put qsFileSize(tEncPath) into sActiveShare["total"]
+   else
+      put tTotal into sActiveShare["total"]
+   end if
+   set the text of field "qsCode" to ""
+   set the text of field "qsSharing" to ("Publishing a private Tor address for " & quote & tSafe & quote & " - this can take up to a minute...")
+   qsLog "Publishing a private Tor service for " & quote & tSafe & quote & "..."
+   send "qsOnionPublishWatchdog" to me in kOnionPublishTimeout milliseconds
+end qsStartOnionShare
+
+-- If the descriptor never uploads in time, tear the half-built service down.
+command qsOnionPublishWatchdog
+   local tErr
+   if sActiveShare["service"] is empty then
+      exit qsOnionPublishWatchdog
+   end if
+   if sActiveShare["revealed"] is "true" then
+      exit qsOnionPublishWatchdog
+   end if
+   try
+      oxRemoveService sActiveShare["service"]
+   catch tErr
+   end try
+   if sActiveShare["encTmp"] is not empty then
+      try
+         if there is a file sActiveShare["encTmp"] then
+            delete file sActiveShare["encTmp"]
+         end if
+      catch tErr
+      end try
+   end if
+   put empty into sActiveShare
+   set the text of field "qsSharing" to ""
+   qsLog "Tor could not publish the private address in time. Make sure the pill says 'ready', then try again."
+end qsOnionPublishWatchdog
+
+-- A receiver dialed our service: OnionXT hands us a fresh inbound stream. Register
+-- its stream callback and wait for the 4-byte magic request before we push. One
+-- active receiver at a time for QuickShare (a sequential retry reuses the code).
+command qsOnionPeer pStream, pService, pPeerAddr
+   if sActiveShare["service"] is empty then
+      oxCloseStream pStream
+      exit qsOnionPeer
+   end if
+   if sActiveShare["busy"] is "true" then
+      oxCloseStream pStream
+      exit qsOnionPeer
+   end if
+   put "true" into sActiveShare["busy"]
+   put pStream into sActiveShare["stream"]
+   put sActiveShare["name"] into sOnionXfers[pStream]["name"]
+   put "sending" into sOnionXfers[pStream]["dir"]
+   if sActiveShare["enc"] is kFlagEnc then
+      put "true" into sOnionXfers[pStream]["enc"]
+   else
+      put "" into sOnionXfers[pStream]["enc"]
+   end if
+   put sActiveShare["total"] into sOnionXfers[pStream]["total"]
+   put 0 into sOnionXfers[pStream]["got"]
+   put "connecting" into sOnionXfers[pStream]["state"]
+   put "" into sTxReq[pStream]
+   put the milliseconds into sTxDeadline[pStream]
+   oxSetStreamCallback pStream, "qsOnionServeStream"
+   send ("qsOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end qsOnionPeer
+
+-- Sender's per-stream handler. Waits for the receiver's magic request, then pumps.
+command qsOnionServeStream pStream, pEvent, pData
+   if pEvent is "data" then
+      if sActiveShare["stream"] is not pStream then
+         exit qsOnionServeStream
+      end if
+      if sOnionXfers[pStream]["state"] is "active" then
+         exit qsOnionServeStream
+      end if
+      put pData after sTxReq[pStream]
+      put the milliseconds into sTxDeadline[pStream]
+      if the number of bytes in sTxReq[pStream] >= 4 then
+         if (byte 1 to 4 of sTxReq[pStream]) is kOnionMagic then
+            qsOnionBeginSend pStream
+         else
+            oxCloseStream pStream
+            qsOnionServeAbort pStream
+         end if
+      end if
+   else if pEvent is "closed" or pEvent is "error" then
+      if sOnionXfers[pStream]["state"] is not "done" then
+         qsOnionServeAbort pStream
+      end if
+   end if
+end qsOnionServeStream
+
+-- Open the file, send the header, and arm the frame pump.
+command qsOnionBeginSend pStream
+   local tHeader
+   put "active" into sOnionXfers[pStream]["state"]
+   open file sActiveShare["path"] for binary read
+   if the result is not empty then
+      qsLog "Could not open the file to send:" && the result
+      qsOnionServeAbort pStream
+      exit qsOnionBeginSend
+   end if
+   put sActiveShare["path"] into sTxPath[pStream]
+   put 0 into sTxOffset[pStream]
+   put sActiveShare["total"] into sTxTotal[pStream]
+   put the milliseconds into sTxDeadline[pStream]
+   put qsOnionHeader(sActiveShare["name"], sActiveShare["enc"], sActiveShare["total"]) into tHeader
+   oxWrite pStream, tHeader
+   if the result is not empty then
+      qsLog "Private send failed (header):" && the result
+      qsOnionServeAbort pStream
+      exit qsOnionBeginSend
+   end if
+   send ("qsOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+end qsOnionBeginSend
+
+-- One frame per tick (never a tight loop). Sequential reads advance the file.
+command qsOnionSendPump pStream
+   local tSlice
+   if sTxPath[pStream] is empty then
+      exit qsOnionSendPump
+   end if
+   read from file sTxPath[pStream] for kOnionChunk
+   put it into tSlice
+   if tSlice is empty then
+      oxWrite pStream, binaryEncode("N", 0)
+      close file sTxPath[pStream]
+      put "done" into sOnionXfers[pStream]["state"]
+      qsLog "Sent " & quote & sActiveShare["name"] & quote & " over Tor."
+      oxCloseStream pStream
+      qsOnionServeCleanup pStream
+      exit qsOnionSendPump
+   end if
+   oxWrite pStream, (binaryEncode("N", the number of bytes in tSlice) & tSlice)
+   if the result is not empty then
+      qsLog "Private send failed:" && the result
+      qsOnionServeAbort pStream
+      exit qsOnionSendPump
+   end if
+   add (the number of bytes in tSlice) to sTxOffset[pStream]
+   put sTxOffset[pStream] into sOnionXfers[pStream]["got"]
+   put the milliseconds into sTxDeadline[pStream]
+   send ("qsOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+end qsOnionSendPump
+
+-- Clear per-stream send state and free the share for the next sequential receiver.
+command qsOnionServeCleanup pStream
+   local tErr
+   try
+      close file sTxPath[pStream]
+   catch tErr
+   end try
+   put empty into sTxPath[pStream]
+   put empty into sTxOffset[pStream]
+   put empty into sTxTotal[pStream]
+   put empty into sTxDeadline[pStream]
+   put empty into sTxReq[pStream]
+   if sActiveShare["stream"] is pStream then
+      put "false" into sActiveShare["busy"]
+      put empty into sActiveShare["stream"]
+   end if
+end qsOnionServeCleanup
+
+command qsOnionServeAbort pStream
+   put "error" into sOnionXfers[pStream]["state"]
+   oxCloseStream pStream
+   qsOnionServeCleanup pStream
+end qsOnionServeAbort
+
+-- Idle watchdog for a send stream (armed at accept, re-armed each frame).
+command qsOnionSendWatchdog pStream
+   if sOnionXfers[pStream] is empty then
+      exit qsOnionSendWatchdog
+   end if
+   if sOnionXfers[pStream]["state"] is "done" or sOnionXfers[pStream]["state"] is "error" then
+      exit qsOnionSendWatchdog
+   end if
+   if (the milliseconds - sTxDeadline[pStream]) > kOnionSendTimeout then
+      qsLog "The private transfer stalled - closing it."
+      qsOnionServeAbort pStream
+      exit qsOnionSendWatchdog
+   end if
+   send ("qsOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end qsOnionSendWatchdog
+
+-- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
+-- then dial the onion and wire the receiver state machine.
+command qsReceiveOnion pCode
+   local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream
+   if not sHasOnion then
+      qsLog "This is a private Tor share, but OnionXT (or cryptoXT) is not installed - ask your friend to share it normally, or install OnionXT + cryptoXT + Tor."
+      exit qsReceiveOnion
+   end if
+   put char ((the number of chars of kTorCodePrefix) + 1) to -1 of pCode into tRest
+   set the itemDelimiter to ":"
+   put item 1 of tRest into tOnion
+   put item 2 of tRest into tB64
+   put item 3 of tRest into tB64Salt
+   put item 4 of tRest into tB64Verify
+   if not oxIsValidAddress(tOnion) then
+      qsLog "That Tor code has a malformed address."
+      exit qsReceiveOnion
+   end if
+   put qsSafeLeaf(textDecode(base64Decode(tB64), "UTF-8")) into tName
+   if tName is empty then
+      put "shared-file" into tName
+   end if
+   put qsTrim(field "qsRecvPass") into tPass
+   put "" into tKey
+   if tB64Verify is not empty then
+      if not sCanEncrypt then
+         qsLog "This code is locked, but cryptoXT is not installed - cannot decrypt."
+         exit qsReceiveOnion
+      end if
+      if tPass is empty then
+         qsLog "This code is LOCKED - type the passphrase your friend gave you, then click Download."
+         exit qsReceiveOnion
+      end if
+      if tB64Salt is empty then
+         qsLog "That locked code is missing its salt."
+         exit qsReceiveOnion
+      end if
+      put base64Decode(tB64Salt) into tSalt
+      put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      if not qsKeyOpensVerifier(tKey, tB64Verify) then
+         answer ("That passphrase does not match this locked file." & return & return & \
+            "Check the passphrase your friend gave you and try again.") with "OK"
+         select the text of field "qsRecvPass"
+         exit qsReceiveOnion
+      end if
+   else
+      answer ("This Tor code is not encrypted." & return & return & \
+         "Your IP address stays hidden, but the sender is NOT verified - anyone who intercepts the code could substitute a file. Ask your friend for a passphrase for a verified transfer.") with "Cancel" or "Download anyway"
+      if it is not "Download anyway" then
+         exit qsReceiveOnion
+      end if
+   end if
+   if not qsOnionReadyNow() then
+      qsLog "Tor is still connecting - watch the pill, then click Download again."
+      exit qsReceiveOnion
+   end if
+   oxDial tOnion, kOnionVPort
+   put the result into tStream
+   if tStream is not an integer then
+      qsLog "Could not open a Tor connection to that address:" && tStream
+      exit qsReceiveOnion
+   end if
+   put "header" into sRxState[tStream]
+   put "" into sRxBuf[tStream]
+   put tKey into sRxKey[tStream]
+   put tName into sRxName[tStream]
+   put qsSaveFolder() into sRxSave[tStream]
+   put 0 into sRxGot[tStream]
+   put the milliseconds into sRxDeadline[tStream]
+   put tName into sOnionXfers[tStream]["name"]
+   put "receiving" into sOnionXfers[tStream]["dir"]
+   if tB64Verify is not empty then
+      put "true" into sOnionXfers[tStream]["enc"]
+   else
+      put "" into sOnionXfers[tStream]["enc"]
+   end if
+   put 0 into sOnionXfers[tStream]["total"]
+   put 0 into sOnionXfers[tStream]["got"]
+   put "connecting" into sOnionXfers[tStream]["state"]
+   oxSetStreamCallback tStream, "qsOnionRecvStream"
+   send ("qsOnionRecvWatchdog " & tStream) to me in kOnionRecvTimeout milliseconds
+   put empty into field "qsRecvCode"
+   qsLog "Connecting privately over Tor to fetch " & quote & tName & quote & "..."
+end qsReceiveOnion
+
+-- Receiver's per-stream handler: send the request on open, feed data to the state
+-- machine, abort a partial transfer on close/error.
+command qsOnionRecvStream pStream, pEvent, pData
+   if pEvent is "open" then
+      oxWrite pStream, kOnionMagic
+      put the milliseconds into sRxDeadline[pStream]
+   else if pEvent is "data" then
+      qsOnionRecvData pStream, pData
+   else if pEvent is "closed" or pEvent is "error" then
+      if sRxState[pStream] is not "done" and sRxState[pStream] is not empty then
+         qsOnionRecvAbort pStream, "The sender went offline before the transfer finished. Try the code again."
+      end if
+   end if
+end qsOnionRecvStream
+
+-- The receive state machine (section 3.3): reassemble the header, then drain
+-- length-prefixed frames into a temp file, draining+compacting the buffer each call
+-- so the payload never dwells whole in a Data.
+command qsOnionRecvData pStream, pData
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
+   put pData after sRxBuf[pStream]
+   put the milliseconds into sRxDeadline[pStream]
+   if sRxState[pStream] is "header" then
+      if the number of bytes in sRxBuf[pStream] < 8 then
+         exit qsOnionRecvData
+      end if
+      if (byte 1 to 4 of sRxBuf[pStream]) is not kOnionMagic then
+         qsOnionRecvAbort pStream, "Unexpected data on the Tor stream (bad magic)."
+         exit qsOnionRecvData
+      end if
+      if byteToNum(byte 5 of sRxBuf[pStream]) is not kOnionVer then
+         qsOnionRecvAbort pStream, "Unsupported Tor stream version."
+         exit qsOnionRecvData
+      end if
+      put byteToNum(byte 6 of sRxBuf[pStream]) into tFlags
+      put qsBEu16(byte 7 to 8 of sRxBuf[pStream]) into tNameLen
+      if tNameLen > kOnionMaxName then
+         qsOnionRecvAbort pStream, "Tor stream header looks malformed (name too long)."
+         exit qsOnionRecvData
+      end if
+      if the number of bytes in sRxBuf[pStream] < (8 + tNameLen + 8) then
+         exit qsOnionRecvData
+      end if
+      put textDecode(byte 9 to (8 + tNameLen) of sRxBuf[pStream], "UTF-8") into tName
+      put qsBEu32(byte (9 + tNameLen) to (12 + tNameLen) of sRxBuf[pStream]) into tHi
+      put qsBEu32(byte (13 + tNameLen) to (16 + tNameLen) of sRxBuf[pStream]) into tLo
+      put (tHi * 4294967296 + tLo) into tTotal
+      if tTotal > kOnionMaxTotal then
+         qsOnionRecvAbort pStream, "Refusing an oversized Tor transfer."
+         exit qsOnionRecvData
+      end if
+      if sRxKey[pStream] is not empty and (tFlags bitAnd kFlagEnc) is 0 then
+         qsOnionRecvAbort pStream, "This share was supposed to be encrypted but arrived unencrypted - do not trust it."
+         exit qsOnionRecvData
+      end if
+      if (tFlags bitAnd kFlagEnc) is not 0 and sRxKey[pStream] is empty then
+         qsOnionRecvAbort pStream, "This file is encrypted but the code had no passphrase - ask your friend to re-share."
+         exit qsOnionRecvData
+      end if
+      put (tFlags bitAnd kFlagEnc) into sRxEnc[pStream]
+      if tName is not empty then
+         put qsSafeLeaf(tName) into sRxName[pStream]
+      end if
+      put tTotal into sRxTotal[pStream]
+      put tTotal into sOnionXfers[pStream]["total"]
+      put 0 into sRxGot[pStream]
+      put qsTempEncPath() into sRxTmp[pStream]
+      open file sRxTmp[pStream] for binary write
+      if the result is not empty then
+         qsOnionRecvAbort pStream, "Could not open a temp file to receive into."
+         exit qsOnionRecvData
+      end if
+      delete byte 1 to (16 + tNameLen) of sRxBuf[pStream]
+      put "body" into sRxState[pStream]
+      put "active" into sOnionXfers[pStream]["state"]
+   end if
+   repeat while sRxState[pStream] is "body"
+      if the number of bytes in sRxBuf[pStream] < 4 then
+         exit repeat
+      end if
+      put qsBEu32(byte 1 to 4 of sRxBuf[pStream]) into tLen
+      if tLen is 0 then
+         delete byte 1 to 4 of sRxBuf[pStream]
+         put "done" into sRxState[pStream]
+         exit repeat
+      end if
+      if tLen > kOnionChunk then
+         qsOnionRecvAbort pStream, "Tor stream frame too large - aborting."
+         exit qsOnionRecvData
+      end if
+      if the number of bytes in sRxBuf[pStream] < (4 + tLen) then
+         exit repeat
+      end if
+      put byte 5 to (4 + tLen) of sRxBuf[pStream] into tPayload
+      write tPayload to file sRxTmp[pStream]
+      add tLen to sRxGot[pStream]
+      put sRxGot[pStream] into sOnionXfers[pStream]["got"]
+      delete byte 1 to (4 + tLen) of sRxBuf[pStream]
+   end repeat
+   if sRxState[pStream] is "done" then
+      qsOnionRecvFinish pStream
+   end if
+end qsOnionRecvData
+
+-- Transfer complete: verify the byte count, decrypt or move into the save folder.
+command qsOnionRecvFinish pStream
+   local tSave, tOut, tErr, tErr2
+   close file sRxTmp[pStream]
+   if sRxGot[pStream] is not sRxTotal[pStream] then
+      qsOnionRecvAbort pStream, "The transfer ended early (incomplete) - nothing was saved."
+      exit qsOnionRecvFinish
+   end if
+   put sRxSave[pStream] into tSave
+   put tSave & "/" & qsSafeLeaf(sRxName[pStream]) into tOut
+   if sRxEnc[pStream] is not 0 then
+      put qsDecryptFile(sRxTmp[pStream], tOut, sRxKey[pStream]) into tErr
+      try
+         if there is a file sRxTmp[pStream] then
+            delete file sRxTmp[pStream]
+         end if
+      catch tErr2
+      end try
+      if tErr is not empty then
+         put "error" into sOnionXfers[pStream]["state"]
+         qsLog "Downloaded over Tor but could not unlock " & quote & sRxName[pStream] & quote & ":" && tErr
+         qsOnionRecvClear pStream
+         oxCloseStream pStream
+         exit qsOnionRecvFinish
+      end if
+   else
+      put qsMoveFile(sRxTmp[pStream], tOut) into tErr
+      if tErr is not empty then
+         put "error" into sOnionXfers[pStream]["state"]
+         qsLog "Downloaded over Tor but could not save the file:" && tErr
+         qsOnionRecvClear pStream
+         oxCloseStream pStream
+         exit qsOnionRecvFinish
+      end if
+   end if
+   put "done" into sOnionXfers[pStream]["state"]
+   qsLog "Received " & quote & sRxName[pStream] & quote & " over Tor into" && tSave & "."
+   qsOnionRecvClear pStream
+   oxCloseStream pStream
+end qsOnionRecvFinish
+
+command qsOnionRecvClear pStream
+   put empty into sRxBuf[pStream]
+   put empty into sRxState[pStream]
+   put empty into sRxTmp[pStream]
+   put empty into sRxName[pStream]
+   put empty into sRxEnc[pStream]
+   put empty into sRxTotal[pStream]
+   put empty into sRxGot[pStream]
+   put empty into sRxKey[pStream]
+   put empty into sRxSave[pStream]
+   put empty into sRxDeadline[pStream]
+end qsOnionRecvClear
+
+command qsOnionRecvAbort pStream, pMsg
+   local tErr
+   try
+      close file sRxTmp[pStream]
+   catch tErr
+   end try
+   if sRxTmp[pStream] is not empty then
+      try
+         if there is a file sRxTmp[pStream] then
+            delete file sRxTmp[pStream]
+         end if
+      catch tErr
+      end try
+   end if
+   put "error" into sOnionXfers[pStream]["state"]
+   qsLog pMsg
+   qsOnionRecvClear pStream
+   oxCloseStream pStream
+end qsOnionRecvAbort
+
+-- Idle watchdog for a receive stream (also catches a dead peer that sends nothing).
+command qsOnionRecvWatchdog pStream
+   if sRxState[pStream] is empty or sRxState[pStream] is "done" then
+      exit qsOnionRecvWatchdog
+   end if
+   if (the milliseconds - sRxDeadline[pStream]) > kOnionRecvTimeout then
+      qsOnionRecvAbort pStream, "The private (Tor) download stalled - closing it. Try the code again."
+      exit qsOnionRecvWatchdog
+   end if
+   send ("qsOnionRecvWatchdog " & pStream) to me in kOnionRecvTimeout milliseconds
+end qsOnionRecvWatchdog
+
+-- Move a finished plaintext temp to its real name (rename avoids a full read).
+function qsMoveFile pSrc, pDst
+   local tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      rename file pSrc to pDst
+   catch tErr
+      return tErr
+   end try
+   return ""
+end qsMoveFile
 
 command qsLog pMsg
    if there is no field "qsLog" then
