@@ -1239,6 +1239,24 @@ function qsBEu32 pBytes
    return (((tA * 256 + tB) * 256 + tC) * 256 + tD)
 end qsBEu32
 
+-- Best-effort backpressure gate for the send pump, via OnionXT's oxStreamState.
+-- We only STALL on a state we positively recognise as a write backlog, so a misread
+-- never makes throughput worse than an ungated pump; the send watchdog is the
+-- backstop against a permanently stalled stream. VERIFY (section 12.3): the exact
+-- state tokens OnionXT reports, and whether it exposes a truer writable signal.
+function qsStreamCanWrite pStream
+   local tSt
+   put oxStreamState(pStream) into tSt
+   if tSt is empty then
+      return true
+   end if
+   if tSt contains "full" or tSt contains "buffer" or tSt contains "congest" \
+      or tSt contains "backpressure" or tSt contains "connect" then
+      return false
+   end if
+   return true
+end qsStreamCanWrite
+
 -- SEND entry: turn a dropped file into a fresh, unlinkable onion service and (once
 -- the descriptor uploads) reveal a BTXTOR1 code. Reuses the existing cryptoXT path
 -- when a passphrase is set. NO torrent is created.
@@ -1287,6 +1305,11 @@ command qsStartOnionShare pPath, pName, pPass
    end if
    -- one active anon share at a time: tear down any previous service + temp
    if sActiveShare["service"] is not empty then
+      -- if a receiver is mid-transfer, abort it FIRST so the file handle is closed
+      -- before we delete the .enc it is reading (defined cleanup ordering)
+      if sActiveShare["stream"] is not empty then
+         qsOnionServeAbort sActiveShare["stream"]
+      end if
       try
          oxRemoveService sActiveShare["service"]
       catch tErr
@@ -1334,14 +1357,19 @@ command qsStartOnionShare pPath, pName, pPass
    set the text of field "qsCode" to ""
    set the text of field "qsSharing" to ("Publishing a private Tor address for " & quote & tSafe & quote & " - this can take up to a minute...")
    qsLog "Publishing a private Tor service for " & quote & tSafe & quote & "..."
-   send "qsOnionPublishWatchdog" to me in kOnionPublishTimeout milliseconds
+   -- arm the publish watchdog against THIS service handle, so a later share's
+   -- watchdog (a rapid second drop) never tears down this one by mistake
+   send ("qsOnionPublishWatchdog " & tSvc) to me in kOnionPublishTimeout milliseconds
 end qsStartOnionShare
 
 -- If the descriptor never uploads in time, tear the half-built service down.
-command qsOnionPublishWatchdog
+command qsOnionPublishWatchdog pService
    local tErr
    if sActiveShare["service"] is empty then
       exit qsOnionPublishWatchdog
+   end if
+   if sActiveShare["service"] is not pService then
+      exit qsOnionPublishWatchdog   -- superseded by a newer share; clean no-op
    end if
    if sActiveShare["revealed"] is "true" then
       exit qsOnionPublishWatchdog
@@ -1449,6 +1477,13 @@ command qsOnionSendPump pStream
    if sTxPath[pStream] is empty then
       exit qsOnionSendPump
    end if
+   -- backpressure: stall (re-arm without writing) until the stream can accept more,
+   -- so a slow circuit cannot balloon OnionXT's native write buffer. We do NOT
+   -- refresh the deadline here, so a permanently stalled stream trips the watchdog.
+   if not qsStreamCanWrite(pStream) then
+      send ("qsOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+      exit qsOnionSendPump
+   end if
    read from file sTxPath[pStream] for kOnionChunk
    put it into tSlice
    if tSlice is empty then
@@ -1515,7 +1550,7 @@ end qsOnionSendWatchdog
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
 command qsReceiveOnion pCode
-   local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream
+   local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream, tErr
    if not sHasOnion then
       qsLog "This is a private Tor share, but OnionXT (or cryptoXT) is not installed - ask your friend to share it normally, or install OnionXT + cryptoXT + Tor."
       exit qsReceiveOnion
@@ -1550,7 +1585,13 @@ command qsReceiveOnion pCode
          exit qsReceiveOnion
       end if
       put base64Decode(tB64Salt) into tSalt
-      put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      put "" into tKey
+      try
+         put sxPwHash(textEncode(tPass, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      catch tErr
+         qsLog "That locked code has a malformed salt."
+         exit qsReceiveOnion
+      end try
       if not qsKeyOpensVerifier(tKey, tB64Verify) then
          answer ("That passphrase does not match this locked file." & return & return & \
             "Check the passphrase your friend gave you and try again.") with "OK"
@@ -1616,7 +1657,10 @@ end qsOnionRecvStream
 -- length-prefixed frames into a temp file, draining+compacting the buffer each call
 -- so the payload never dwells whole in a Data.
 command qsOnionRecvData pStream, pData
-   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload, tNeed
+   if sRxState[pStream] is empty or sRxState[pStream] is "done" then
+      exit qsOnionRecvData   -- already finished/cleared; ignore any trailing bytes
+   end if
    put pData after sRxBuf[pStream]
    put the milliseconds into sRxDeadline[pStream]
    if sRxState[pStream] is "header" then
@@ -1664,6 +1708,16 @@ command qsOnionRecvData pStream, pData
       put tTotal into sOnionXfers[pStream]["total"]
       put 0 into sRxGot[pStream]
       put qsTempEncPath() into sRxTmp[pStream]
+      -- refuse if the volume clearly lacks room (an encrypted receive needs ~2x for
+      -- the .enc temp plus the decrypt). VERIFY: which volume 'the diskSpace' reports.
+      put tTotal into tNeed
+      if sRxEnc[pStream] is not 0 then
+         put (tTotal * 2) into tNeed
+      end if
+      if (the diskSpace is a number) and (the diskSpace < tNeed) then
+         qsOnionRecvAbort pStream, "Not enough free disk space to receive this file."
+         exit qsOnionRecvData
+      end if
       open file sRxTmp[pStream] for binary write
       if the result is not empty then
          qsOnionRecvAbort pStream, "Could not open a temp file to receive into."
@@ -1692,10 +1746,19 @@ command qsOnionRecvData pStream, pData
       end if
       put byte 5 to (4 + tLen) of sRxBuf[pStream] into tPayload
       write tPayload to file sRxTmp[pStream]
+      if the result is not empty then
+         qsOnionRecvAbort pStream, "Could not write the received data to disk:" && the result
+         exit qsOnionRecvData
+      end if
       add tLen to sRxGot[pStream]
       put sRxGot[pStream] into sOnionXfers[pStream]["got"]
       delete byte 1 to (4 + tLen) of sRxBuf[pStream]
    end repeat
+   -- belt and suspenders: finish on the byte count even if the terminator frame is
+   -- lost or a close event races it, so a fully-received file is never discarded.
+   if sRxState[pStream] is "body" and sRxGot[pStream] >= sRxTotal[pStream] then
+      put "done" into sRxState[pStream]
+   end if
    if sRxState[pStream] is "done" then
       qsOnionRecvFinish pStream
    end if
