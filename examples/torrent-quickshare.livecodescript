@@ -2482,8 +2482,12 @@ command qsStartClearweb pPath, pName
    else
       qsLog "Asked the router to open port " & tPort & " automatically - waiting for it to confirm (a portMapped or portMapError follows)."
    end if
-   qsCwShowLinks
-   set the text of field "qsSharing" to ("Sharing " & quote & sCwName & quote & " on the web - keep this window open. Anyone with the link can download it in a browser (no app needed); your IP is visible and it is not encrypted.")
+   -- Find our public IP so the internet link can show a real address. libtorrent only
+   -- reports it (the externalIp event) once it sees peer/tracker traffic, which a
+   -- torrent-less clearweb session never has - so we ask a lightweight HTTP echo. This
+   -- also returns the TRUE internet-facing IP, making carrier-NAT detection accurate.
+   qsCwFetchPublicIp
+   qsCwShowLinks       -- qsCwStatusText (inside) sets the Sharing line for the state
    qsLog "Web share started for " & quote & sCwName & quote & " on port " & tPort & ". On the same network the link works right away."
 end qsStartClearweb
 
@@ -2932,6 +2936,49 @@ function qsIsPrivateIp pIp
    end if
    return false
 end qsIsPrivateIp
+
+-- Fetch our public (internet-facing) IP from a lightweight HTTP echo, so the internet
+-- link can show a real address even when libtorrent never reports one. ASYNCHRONOUS
+-- (load URL ... with message) so a slow/unreachable echo never freezes the single UI
+-- thread; the reply lands in qsCwIpReply. Non-fatal - if it fails, the LAN link and
+-- the "forward the port / look up your IP" guidance still stand. VERIFY (on-engine):
+-- the load URL / with-message flow and that plain-HTTP URL access is available.
+command qsCwFetchPublicIp
+   local tErr
+   try
+      load URL "http://api.ipify.org/" with message "qsCwIpReply"
+   catch tErr
+   end try
+end qsCwFetchPublicIp
+
+command qsCwIpReply pUrl, pStatus
+   local tIp, tErr, tSavedID, tOk
+   if pStatus is not "cached" then
+      try
+         unload URL pUrl
+      catch tErr
+      end try
+      exit qsCwIpReply           -- "error"/other: leave the IP unset; guidance stands
+   end if
+   put qsTrim(URL pUrl) into tIp
+   try
+      unload URL pUrl
+   catch tErr
+   end try
+   if not sCwActive then
+      exit qsCwIpReply
+   end if
+   -- validate it really looks like an IPv4 (reject an HTML error page etc.)
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "."
+   put (the number of items of tIp is 4 and item 1 of tIp is a number and item 4 of tIp is a number) into tOk
+   set the itemDelimiter to tSavedID
+   if not tOk then
+      exit qsCwIpReply
+   end if
+   put tIp into sCwExtIp
+   qsCwShowLinks
+end qsCwIpReply
 
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
