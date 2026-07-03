@@ -89,6 +89,34 @@ local sFsTxPos          -- array: stream -> next byte offset to read (0-based; h
 local sFsTxRemaining    -- array: stream -> bytes still to send (respects a Range)
 local sFsTxName         -- array: stream -> the file's leaf name (for the log)
 local sFsTxDeadline     -- array: stream -> the milliseconds of the last activity (watchdog)
+-- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
+-- a file/folder to any browser at http://<ip>:<port>/<token>/... . TorrentXT's
+-- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
+-- discovers the public IP (the externalIp event), so no manual port forwarding is
+-- needed when the router cooperates; the LAN link always works. The <token> (a random
+-- capability string) means an open port is not an open directory to port-scanners.
+-- Uses LiveCode's own sockets (accept/read/write/close), mirroring OnionXT's proven
+-- on-engine idiom. NEEDS AN ON-ENGINE PASS - the socket + UPnP + local-IP layers are
+-- the most engine-dependent code here (flagged VERIFY at each site).
+local sWebShare         -- "true" while the "Share via web link" toggle is armed
+local sCwActive         -- "true" while a clearweb share is live
+local sCwKind           -- "file" or "folder"
+local sCwRoot           -- the shared folder (no trailing slash), for a folder share
+local sCwFilePath       -- the shared file's full path, for a file share
+local sCwFileName       -- the shared file's leaf name, for a file share
+local sCwName           -- display name (file leaf or folder leaf)
+local sCwToken          -- the random capability token that gates every request
+local sCwPort           -- the TCP port the listener + the port-map use
+local sCwMapId          -- the btMapPort mapping id (0 = none/no UPnP)
+local sCwExtIp          -- the discovered public IP (from the externalIp event), or empty
+local sCwLanIp          -- the best-effort LAN IP for the local link
+-- per-connection state, keyed by the LiveCode socket id
+local sCwReq            -- array: socket -> accumulated inbound HTTP request bytes
+local sCwServed         -- array: socket -> "true" once we have begun answering it
+local sCwTxPath         -- array: socket -> disk path of the file being streamed out
+local sCwTxPos          -- array: socket -> next byte offset to read (0-based; honours a Range)
+local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
+local sCwTxName         -- array: socket -> the file's leaf name (for the log)
 
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -120,6 +148,7 @@ constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to
 constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
 constant kFsMaxReq = 262144            -- folder server: refuse an HTTP request head > 256 KB
+constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -129,7 +158,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-09"
+constant kQsUiVersion = "qs-ui-2026-10"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -190,6 +219,9 @@ on mouseUp
       case "qsTorToggle"
          qsToggleTor
          break
+      case "qsWebShareToggle"
+         qsToggleWebShare
+         break
       case "qsWebCheck"
          qsToggleWeb
          break
@@ -220,7 +252,7 @@ command qsBuild
    set the backgroundColor of field "qsTitle" to "44,90,160"
    set the foregroundColor of field "qsTitle" to "255,255,255"
    set the textStyle of field "qsTitle" to "bold"
-   qsLabel "qsTagline", "Send a file straight to a friend with a short code. No server, no size limit, no upload first - peer-to-peer.", "24,48,424,70", 10
+   qsLabel "qsTagline", "Send with a code, privately over Tor, or via a direct web link.", "24,46,244,74", 9
    set the foregroundColor of field "qsTagline" to "90,96,105"
    -- live Tor status pill (repainted only by qsOnionPill), sitting in the title band
    qsLabel "qsTorPill", "Tor: off", "430,8,612,32", 10
@@ -228,10 +260,14 @@ command qsBuild
    set the backgroundColor of field "qsTorPill" to "33,72,132"
    set the foregroundColor of field "qsTorPill" to "220,228,240"
    set the textAlign of field "qsTorPill" to "right"
-   -- the optional "Send privately over Tor" toggle (two-state; managed via sTorSend)
-   qsButton "qsTorToggle", "Send privately over Tor", "440,44,600,72"
+   -- the two OPTIONAL transport toggles (mutually exclusive; each two-state, autoHilite
+   -- off, managed via sTorSend / sWebShare). Neither on = the classic BitTorrent code.
+   qsButton "qsTorToggle", "Send privately over Tor", "250,48,418,72"
    set the style of button "qsTorToggle" to "checkbox"
    set the autoHilite of button "qsTorToggle" to false
+   qsButton "qsWebShareToggle", "Share via web link", "424,48,600,72"
+   set the style of button "qsWebShareToggle" to "checkbox"
+   set the autoHilite of button "qsWebShareToggle" to false
    -- SEND: an OPTIONAL passphrase (set it BEFORE dropping to encrypt), the drop
    -- area, then the resulting code.
    qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
@@ -245,7 +281,7 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file here to share" & return & "(or click to choose a file; with Tor on, drag a FOLDER to serve it as a web page)")
+   set the text of field "qsDrop" to (return & "Drag a file or folder here to share" & return & "(or click to choose a file; a FOLDER + Tor or Web link becomes a browsable page)")
    -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
    -- plaintext file shared over Tor is served this way; the URL appears at the right.
    qsButton "qsWebCheck", "Serve as web download", "24,186,220,208"
@@ -380,6 +416,7 @@ command qsAddTips
    set the tooltip of button "qsGet" to "Download the file for that code into your Quick Share folder."
    set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
    set the tooltip of button "qsTorToggle" to "Off = normal peer-to-peer. On = send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER (instead of a file) to serve it as a browsable Tor web page - open the link in Tor Browser."
+   set the tooltip of button "qsWebShareToggle" to "On = serve the file or folder over the plain web: the recipient just opens a link in any browser, no app needed. TorrentXT opens your router port automatically (UPnP); the link has a secret token so only people you send it to can reach it. Fast, but your IP is visible and the download is not encrypted - use Tor for privacy."
    set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
    set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
    set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
@@ -408,6 +445,7 @@ command qsStart
    put qsHasOnion() into sHasOnion
    put "false" into sTorSend
    put "false" into sWebServe
+   put "false" into sWebShare
    if sHasOnion then
       qsOnionStart
    else
@@ -426,6 +464,7 @@ command qsStop
    local tKey, tErr
    put "false" into sPolling
    qsOnionStop
+   qsStopClearweb
    if sSession is not empty and sSession is not 0 then
       btStopSession sSession
    end if
@@ -498,6 +537,22 @@ command qsShareFile pPath
       put "/" into tParent
    end if
    put qsTrim(field "qsSendPass") into tPass
+   -- starting any NON-web share replaces a running clearweb server (so switching
+   -- transports does not leave its listener + port mapping orphaned)
+   if sCwActive is "true" and sWebShare is not "true" then
+      qsStopClearweb
+   end if
+   -- Direct web link (clearweb) branch: serve the file/folder over a plain LiveCode
+   -- socket HTTP server the recipient opens in any browser. No torrent, no Tor. A
+   -- dropped passphrase does not apply (a browser cannot decrypt); the unguessable
+   -- link token is the access control.
+   if sWebShare is "true" then
+      if tPass is not empty then
+         qsLog "A direct web link is served to a plain browser, which cannot decrypt - sharing UNENCRYPTED. Use Tor + a passphrase for a private, encrypted transfer."
+      end if
+      qsStartClearweb pPath, tName
+      exit qsShareFile
+   end if
    -- FIRST-PRIORITY anonymous branch: with the Tor toggle on, the bytes ride an
    -- onion stream and NO torrent is created (mutual-exclusion invariant, section 3).
    if sTorSend is "true" then
@@ -766,6 +821,10 @@ command qsRefreshXfers
       put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
       add 1 to tLineNum
    end if
+   if sCwActive is "true" then
+      put qsTrunc(sCwName, 26) & tab & "direct web" & tab & "serving (open the link)" & return after tRows
+      add 1 to tLineNum
+   end if
    if the last char of tRows is return then
       delete the last char of tRows
    end if
@@ -798,6 +857,27 @@ command qsHandleEvent pEvent
          qsMaybeDecryptFinished pEvent["torrent"]
          qsLog "Download complete. Saved in" && qsSaveFolder() & "."
          qsRefreshXfers
+         break
+      case "externalIp"
+         -- libtorrent discovered our public IP; if a web share is live AND the router
+         -- port was mapped, the internet link becomes usable (qsCwShowLinks gates it).
+         put pEvent["externalIp"] into sCwExtIp
+         if sCwActive is "true" then
+            qsCwShowLinks
+            if sCwMapId is not 0 then
+               qsLog "Your internet address is " & pEvent["externalIp"] & " - the internet link is ready above."
+            end if
+         end if
+         break
+      case "portMapped"
+         if sCwActive is "true" then
+            qsLog "Router opened port " & pEvent["externalPort"] & " via " & pEvent["transport"] & " - the internet link should work now."
+         end if
+         break
+      case "portMapError"
+         if sCwActive is "true" then
+            qsLog "The router would not open the port automatically. The local-network link still works; for the internet, forward port " & sCwPort & " to this computer, or use the Tor option."
+         end if
          break
       default
          break
@@ -1174,8 +1254,28 @@ command qsToggleTor
    else
       put "true" into sTorSend
       set the hilite of button "qsTorToggle" to true
+      -- Tor and the direct web link are mutually exclusive transports
+      put "false" into sWebShare
+      if there is a button "qsWebShareToggle" then
+         set the hilite of button "qsWebShareToggle" to false
+      end if
    end if
 end qsToggleTor
+
+-- Flip the "Share via web link" (clearweb) toggle. Mutually exclusive with Tor.
+command qsToggleWebShare
+   if sWebShare is "true" then
+      put "false" into sWebShare
+      set the hilite of button "qsWebShareToggle" to false
+   else
+      put "true" into sWebShare
+      set the hilite of button "qsWebShareToggle" to true
+      put "false" into sTorSend
+      if there is a button "qsTorToggle" then
+         set the hilite of button "qsTorToggle" to false
+      end if
+   end if
+end qsToggleWebShare
 
 -- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
 command qsOnionStop
@@ -2297,6 +2397,471 @@ function qsFsHtmlEscape pText
    replace "'" with "&#39;" in tOut
    return tOut
 end qsFsHtmlEscape
+
+-- ==== the CLEARWEB web server (a direct browser link, no Tor) =================
+-- Serves the shared file/folder over a plain LiveCode socket HTTP server, so the
+-- recipient just opens http://<ip>:<port>/<token>/... in ANY browser - no app, no
+-- Tor. TorrentXT's libtorrent opens the router port automatically (btMapPort /
+-- UPnP-NAT-PMP) and reports the public IP (the externalIp event); the LAN link always
+-- works. The <token> (random capability string) gates every request, so an open port
+-- is not an open directory to port-scanners. Reuses the qsFs* pure helpers
+-- (parse/route/listing/range/mime/escape); only the I/O differs - LiveCode sockets,
+-- mirroring OnionXT's proven on-engine accept/read/write/close idiom.
+--
+-- NEEDS AN ON-ENGINE PASS: the socket, UPnP, and local-IP calls are the most
+-- engine-dependent code in this demo. Each such site is flagged VERIFY.
+
+command qsStartClearweb pPath, pName
+   local tErr, tPort
+   if sSession is 0 or sSession is empty then
+      qsLog "No session - reopen the stack."
+      exit qsStartClearweb
+   end if
+   if sCwActive is "true" then
+      qsStopClearweb            -- one active clearweb share at a time
+   end if
+   replace "\" with "/" in pPath
+   if the last char of pPath is "/" then
+      delete the last char of pPath
+   end if
+   if there is a folder pPath then
+      put "folder" into sCwKind
+      put pPath into sCwRoot
+      put "" into sCwFilePath
+      put "" into sCwFileName
+   else if there is a file pPath then
+      put "file" into sCwKind
+      put "" into sCwRoot
+      put pPath into sCwFilePath
+      put qsFsLeaf(pPath) into sCwFileName
+   else
+      qsLog "Could not find that file or folder to share on the web."
+      exit qsStartClearweb
+   end if
+   put qsSafeLeaf(pName) into sCwName
+   put qsMakeToken() into sCwToken
+   put qsPickPort() into tPort
+   put tPort into sCwPort
+   -- VERIFY (on-engine): `accept connections on port N with message` starts a TCP
+   -- listener (bound to ALL interfaces, so LAN + WAN clients reach it); `the result`
+   -- is empty on success, else the bind error (usually the port is in use). Mirrors
+   -- OnionXT's oxStartService listener.
+   accept connections on port tPort with message "qsCwAccept"
+   if the result is not empty then
+      qsLog "Could not start the web server on port " & tPort & " (" & the result & "). Drop it again to try another port."
+      exit qsStartClearweb
+   end if
+   put "true" into sCwActive
+   put 0 into sCwMapId
+   put empty into sCwExtIp
+   put qsLanIp() into sCwLanIp
+   -- Ask the router to open the port automatically (UPnP / NAT-PMP via libtorrent).
+   -- Best-effort and NON-FATAL: this is only for the INTERNET link - the LAN link
+   -- works without it - so any failure (an older native library without the port-map
+   -- ABI, UPnP off, no mapper) must never break the share. Wrap it so a throw or a 0
+   -- both just mean "no automatic internet link". A portMapped / portMapError /
+   -- externalIp event arrives later through the poll loop and fills in the link.
+   put 0 into sCwMapId
+   try
+      put btMapPort(sSession, tPort, tPort, true) into sCwMapId
+   catch tErr
+      put 0 into sCwMapId
+   end try
+   if sCwMapId is 0 then
+      qsLog "No automatic internet link (router port-opening unavailable on this setup). The local-network link above works now; to share over the internet, forward port " & tPort & " to this computer, or use the Tor option."
+   end if
+   qsCwShowLinks
+   set the text of field "qsSharing" to ("Sharing " & quote & sCwName & quote & " on the web - keep this window open. Anyone with the link can download it in a browser (no app needed); your IP is visible and it is not encrypted.")
+   qsLog "Web share started for " & quote & sCwName & quote & " on port " & tPort & ". On the same network the link works right away."
+end qsStartClearweb
+
+command qsStopClearweb
+   local tK, tErr, tRc
+   if not sCwActive then
+      exit qsStopClearweb
+   end if
+   qsCwSafeClose sCwPort        -- VERIFY: closing the port-id socket stops accepting
+   repeat for each key tK in sCwReq
+      qsCwSafeClose tK
+      qsCwClean tK
+   end repeat
+   if sCwMapId is not 0 and sSession is not 0 and sSession is not empty then
+      try
+         put btUnmapPort(sSession, sCwMapId) into tRc
+      catch tErr
+      end try
+   end if
+   put "false" into sCwActive
+   put 0 into sCwMapId
+   put empty into sCwToken
+   put empty into sCwRoot
+   put empty into sCwFilePath
+   set the text of field "qsCode" to ""
+   set the text of field "qsWebLink" to ""
+   set the text of field "qsSharing" to ""
+   qsLog "Web share stopped."
+end qsStopClearweb
+
+-- A browser connected. Stream the request in (`read ... with message`, re-armed per
+-- delivery - OnionXT's proven pattern) and answer once the header block arrives.
+command qsCwAccept pSocketID
+   if not sCwActive then
+      qsCwSafeClose pSocketID
+      exit qsCwAccept
+   end if
+   put "" into sCwReq[pSocketID]
+   put "false" into sCwServed[pSocketID]
+   read from socket pSocketID with message "qsCwData"
+end qsCwAccept
+
+command qsCwData pSocketID, pData
+   local tCrlf2
+   if sCwServed[pSocketID] is empty then
+      exit qsCwData            -- not one of ours (or already cleaned up)
+   end if
+   if sCwServed[pSocketID] is "true" then
+      exit qsCwData            -- already answering; ignore trailing bytes
+   end if
+   put pData after sCwReq[pSocketID]
+   if the number of bytes in sCwReq[pSocketID] > kFsMaxReq then
+      put "true" into sCwServed[pSocketID]
+      qsCwSendText pSocketID, "413 Payload Too Large", "text/plain; charset=utf-8", "Request too large."
+      exit qsCwData
+   end if
+   put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tCrlf2
+   if sCwReq[pSocketID] contains tCrlf2 then
+      put "true" into sCwServed[pSocketID]
+      qsCwServe pSocketID
+   else
+      read from socket pSocketID with message "qsCwData"   -- more of the head to come
+   end if
+end qsCwData
+
+-- Parse, check the capability token (the first path segment), then route: for a file
+-- share only the one file is reachable; for a folder share, browse within the root.
+command qsCwServe pSocketID
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID
+   put qsFsParseReq(sCwReq[pSocketID]) into tHeaders
+   put tHeaders["__method"] into tMethod
+   if tMethod is not "GET" and tMethod is not "HEAD" then
+      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
+      exit qsCwServe
+   end if
+   put tHeaders["__path"] into tRaw
+   put urlDecode(tRaw) into tPath
+   replace "\" with "/" in tPath
+   if tPath contains ".." then
+      qsCwSendText pSocketID, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
+      exit qsCwServe
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   put item 2 of tPath into tTok            -- /<token>/... ; item 1 is "" (leading /)
+   if the number of items of tPath >= 3 then
+      put "/" & (item 3 to -1 of tPath) into tRest
+   else
+      put "/" into tRest
+   end if
+   set the itemDelimiter to tSavedID
+   if tTok is not sCwToken then
+      qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+      exit qsCwServe
+   end if
+   if sCwKind is "file" then
+      -- only the one shared file is reachable: "/<token>/" or "/<token>/<name>"
+      if tRest is "/" or tRest is ("/" & sCwFileName) then
+         qsCwServeFile pSocketID, sCwFilePath, sCwFileName, tHeaders
+      else
+         qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+      end if
+      exit qsCwServe
+   end if
+   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath)
+   put sCwRoot & tRest into tDisk
+   if there is a folder tDisk then
+      if the last char of tRest is not "/" then
+         qsCwSendRedirect pSocketID, (tRaw & "/")
+         exit qsCwServe
+      end if
+      put tDisk & "index.html" into tIndex
+      if there is a file tIndex then
+         qsCwServeFile pSocketID, tIndex, "index.html", tHeaders
+      else
+         qsCwSendText pSocketID, "200 OK", "text/html; charset=utf-8", qsFsListing(tDisk, tRest)
+      end if
+      exit qsCwServe
+   end if
+   if there is a file tDisk then
+      qsCwServeFile pSocketID, tDisk, tRest, tHeaders
+      exit qsCwServe
+   end if
+   qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+end qsCwServe
+
+-- Serve a file over the socket: size it, honour a Range, write the head, then pump the
+-- body. The file is opened/seeked/read/closed within each pump tick (concurrency-safe).
+command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders
+   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
+   put qsFileSize(pDisk) into tSize
+   if tSize is empty then
+      qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+      exit qsCwServeFile
+   end if
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put qsFsMime(pForMime) into tType
+   put qsFsParseRange(pHeaders["range"], tSize) into tRange
+   if tRange is "unsatisfiable" then
+      qsCwWriteClose pSocketID, textEncode(("HTTP/1.1 416 Range Not Satisfiable" & tCrlf & \
+         "Content-Range: bytes */" & tSize & tCrlf & "Content-Length: 0" & tCrlf & \
+         "Connection: close" & tCrlf & tCrlf), "UTF-8")
+      exit qsCwServeFile
+   end if
+   if tRange is empty then
+      put 0 into tStart
+      put (tSize - 1) into tEnd
+      put "200 OK" into tStatus
+   else
+      put the itemDelimiter into tSavedID
+      set the itemDelimiter to ","
+      put item 1 of tRange into tStart
+      put item 2 of tRange into tEnd
+      set the itemDelimiter to tSavedID
+      put "206 Partial Content" into tStatus
+   end if
+   put (tEnd - tStart + 1) into tLen
+   put ("HTTP/1.1 " & tStatus & tCrlf & "Content-Type: " & tType & tCrlf & \
+      "Accept-Ranges: bytes" & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
+   if tStatus begins with "206" then
+      put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
+   end if
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
+   write textEncode(tHead, "UTF-8") to socket pSocketID
+   if the result is not empty then
+      qsCwClose pSocketID
+      exit qsCwServeFile
+   end if
+   put qsFsLeaf(pForMime) into sCwTxName[pSocketID]
+   qsLog "Web: serving " & quote & sCwTxName[pSocketID] & quote & " (" & qsBytes(tLen) & ") - " & tStatus
+   if pHeaders["__method"] is "HEAD" then
+      qsCwClose pSocketID
+      exit qsCwServeFile
+   end if
+   put pDisk into sCwTxPath[pSocketID]
+   put tStart into sCwTxPos[pSocketID]
+   put tLen into sCwTxRemaining[pSocketID]
+   qsCwPump pSocketID
+end qsCwServeFile
+
+-- One slice per call, paced by the socket write-completion callback (qsCwWrote) for
+-- natural backpressure - no unbounded buffering of a big file. The file is
+-- opened/seeked/read/closed within this call (no yield), so concurrent downloads of
+-- the same file never share a cursor.
+command qsCwPump pSocketID
+   local tWant, tSlice, tErr
+   if sCwTxPath[pSocketID] is empty then
+      exit qsCwPump
+   end if
+   put kOnionChunk into tWant
+   if sCwTxRemaining[pSocketID] < tWant then
+      put sCwTxRemaining[pSocketID] into tWant
+   end if
+   if tWant <= 0 then
+      qsCwFinish pSocketID
+      exit qsCwPump
+   end if
+   open file sCwTxPath[pSocketID] for binary read
+   if the result is not empty then
+      qsCwClose pSocketID
+      exit qsCwPump
+   end if
+   -- VERIFY (on-engine): `seek to N in file` sets the read cursor N bytes from the
+   -- START (0-based), so the next read returns bytes [N..].
+   seek to sCwTxPos[pSocketID] in file sCwTxPath[pSocketID]
+   read from file sCwTxPath[pSocketID] for tWant
+   put it into tSlice
+   try
+      close file sCwTxPath[pSocketID]
+   catch tErr
+   end try
+   if tSlice is empty then
+      qsCwFinish pSocketID
+      exit qsCwPump
+   end if
+   add (the number of bytes in tSlice) to sCwTxPos[pSocketID]
+   subtract (the number of bytes in tSlice) from sCwTxRemaining[pSocketID]
+   -- VERIFY (on-engine): `write ... to socket ... with message` calls the handler when
+   -- the slice has been sent, giving backpressure. Mirrors OnionXT's write idiom.
+   write tSlice to socket pSocketID with message "qsCwWrote"
+   if the result is not empty then
+      qsCwClose pSocketID
+   end if
+end qsCwPump
+
+command qsCwWrote pSocketID
+   if sCwTxPath[pSocketID] is empty then
+      exit qsCwWrote           -- already finished/cleaned
+   end if
+   qsCwPump pSocketID
+end qsCwWrote
+
+command qsCwFinish pSocketID
+   qsLog "Web: sent " & quote & sCwTxName[pSocketID] & quote & "."
+   qsCwClose pSocketID
+end qsCwFinish
+
+-- Small text/redirect responses: write, then close only AFTER the write flushes (a
+-- raw socket may drop unsent bytes if closed immediately, so we close in the
+-- write-completion handler).
+command qsCwSendText pSocketID, pStatus, pType, pBody
+   local tData, tHead, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put textEncode(pBody, "UTF-8") into tData
+   put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
+      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
+end qsCwSendText
+
+command qsCwSendRedirect pSocketID, pLocation
+   local tHead, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put ("HTTP/1.1 301 Moved Permanently" & tCrlf & "Location: " & pLocation & tCrlf & \
+      "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+end qsCwSendRedirect
+
+command qsCwWriteClose pSocketID, pBytes
+   write pBytes to socket pSocketID with message "qsCwWroteClose"
+   if the result is not empty then
+      qsCwClose pSocketID
+   end if
+end qsCwWriteClose
+
+command qsCwWroteClose pSocketID
+   qsCwClose pSocketID
+end qsCwWroteClose
+
+command qsCwClose pSocketID
+   qsCwSafeClose pSocketID
+   qsCwClean pSocketID
+end qsCwClose
+
+-- Idempotent close (mirrors OnionXT's oxSafeCloseSocket): only close an id the engine
+-- still lists, so a stale id is a clean no-op.
+command qsCwSafeClose pSocketID
+   if pSocketID is empty then
+      exit qsCwSafeClose
+   end if
+   if pSocketID is among the lines of the openSockets then
+      close socket pSocketID
+   end if
+end qsCwSafeClose
+
+command qsCwClean pSocketID
+   delete variable sCwReq[pSocketID]
+   delete variable sCwServed[pSocketID]
+   delete variable sCwTxPath[pSocketID]
+   delete variable sCwTxPos[pSocketID]
+   delete variable sCwTxRemaining[pSocketID]
+   delete variable sCwTxName[pSocketID]
+end qsCwClean
+
+-- Stack-level socket messages. Act only on OUR clearweb sockets; pass anything else
+-- along so OnionXT's own sockets are unaffected.
+on socketClosed pSocketID
+   if sCwServed[pSocketID] is not empty then
+      qsCwClean pSocketID
+   else
+      pass socketClosed
+   end if
+end socketClosed
+
+on socketError pSocketID, pError
+   if sCwServed[pSocketID] is not empty then
+      qsCwClean pSocketID
+   else
+      pass socketError
+   end if
+end socketError
+
+on socketTimeout pSocketID
+   if sCwServed[pSocketID] is not empty then
+      qsCwClose pSocketID
+   else
+      pass socketTimeout
+   end if
+end socketTimeout
+
+-- A random capability token, hex (URL-safe). Uses cryptoXT's CSPRNG when present;
+-- else OXT's random() (weaker, but still an unguessable demo link).
+function qsMakeToken
+   local tRaw, tHex, tI, tByte
+   put "" into tRaw
+   if sCanEncrypt then
+      put sxRandomBytes(kCwTokenBytes) into tRaw
+   else
+      repeat kCwTokenBytes times
+         put numToByte(random(256) - 1) after tRaw
+      end repeat
+   end if
+   put "" into tHex
+   repeat with tI = 1 to the number of bytes in tRaw
+      put byteToNum(byte tI of tRaw) into tByte
+      put char ((tByte div 16) + 1) of "0123456789abcdef" after tHex
+      put char ((tByte mod 16) + 1) of "0123456789abcdef" after tHex
+   end repeat
+   return tHex
+end qsMakeToken
+
+-- Best-effort LAN IP for the local link. VERIFY (on-engine): platform-dependent;
+-- hostNameToAddress of the machine's own name usually returns its LAN IP(s); take the
+-- first non-loopback one. Empty -> the UI shows a "YOUR-IP" placeholder.
+function qsLanIp
+   local tIps, tIp, tErr
+   try
+      put hostNameToAddress(the hostName) into tIps
+      repeat for each line tIp in tIps
+         if tIp is not empty and not (tIp begins with "127.") then
+            return tIp
+         end if
+      end repeat
+   catch tErr
+   end try
+   return ""
+end qsLanIp
+
+-- Build + show the clearweb link(s): the internet link (if we have the public IP) as
+-- the primary, and the local-network link. Both are copyable (qsCopy / qsWebCopy).
+command qsCwShowLinks
+   local tPath, tLan, tWan
+   if not sCwActive then
+      exit qsCwShowLinks
+   end if
+   if sCwKind is "folder" then
+      put "/" & sCwToken & "/" into tPath
+   else
+      put "/" & sCwToken & "/" & qsFsPathEncode(sCwFileName) into tPath
+   end if
+   put "" into tLan
+   put "" into tWan
+   if sCwLanIp is not empty then
+      put ("http://" & sCwLanIp & ":" & sCwPort & tPath) into tLan
+   end if
+   -- only advertise the internet link when the router port is actually mapped, so we
+   -- never hand out an address that would just time out (public IP but a closed port)
+   if sCwExtIp is not empty and sCwMapId is not 0 then
+      put ("http://" & sCwExtIp & ":" & sCwPort & tPath) into tWan
+   end if
+   if tWan is not empty then
+      set the text of field "qsCode" to tWan
+      set the text of field "qsWebLink" to tLan
+   else if tLan is not empty then
+      set the text of field "qsCode" to tLan
+      set the text of field "qsWebLink" to tLan
+   else
+      set the text of field "qsCode" to ("http://YOUR-IP:" & sCwPort & tPath)
+      set the text of field "qsWebLink" to "(could not detect your IP - put this computer's address before the : )"
+   end if
+end qsCwShowLinks
 
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
