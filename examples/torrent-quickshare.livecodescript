@@ -1271,24 +1271,6 @@ function qsBEu32 pBytes
    return (((tA * 256 + tB) * 256 + tC) * 256 + tD)
 end qsBEu32
 
--- Best-effort backpressure gate for the send pump, via OnionXT's oxStreamState.
--- We only STALL on a state we positively recognise as a write backlog, so a misread
--- never makes throughput worse than an ungated pump; the send watchdog is the
--- backstop against a permanently stalled stream. VERIFY (section 12.3): the exact
--- state tokens OnionXT reports, and whether it exposes a truer writable signal.
-function qsStreamCanWrite pStream
-   local tSt
-   put oxStreamState(pStream) into tSt
-   if tSt is empty then
-      return true
-   end if
-   if tSt contains "full" or tSt contains "buffer" or tSt contains "congest" \
-      or tSt contains "backpressure" or tSt contains "connect" then
-      return false
-   end if
-   return true
-end qsStreamCanWrite
-
 -- SEND entry: turn a dropped file into a fresh, unlinkable onion service and (once
 -- the descriptor uploads) reveal a BTXTOR1 code. Reuses the existing cryptoXT path
 -- when a passphrase is set. NO torrent is created.
@@ -1545,13 +1527,12 @@ command qsOnionSendPump pStream
    if sTxPath[pStream] is empty then
       exit qsOnionSendPump
    end if
-   -- backpressure: stall (re-arm without writing) until the stream can accept more,
-   -- so a slow circuit cannot balloon OnionXT's native write buffer. We do NOT
-   -- refresh the deadline here, so a permanently stalled stream trips the watchdog.
-   if not qsStreamCanWrite(pStream) then
-      send ("qsOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
-      exit qsOnionSendPump
-   end if
+   -- NOTE: no writability gate here. An earlier oxStreamState-based backpressure
+   -- gate could misread a live stream (a "connected" state contains "connect") and
+   -- STALL forever, so the send watchdog then falsely closed the connection and the
+   -- file body never arrived (the browser saw "connection lost"). We pace with the
+   -- kOnionPumpTick timer + oxWrite's error return instead; a real backpressure gate
+   -- needs the on-engine oxStreamState VERIFY (what does an open stream report?).
    read from file sTxPath[pStream] for kOnionChunk
    put it into tSlice
    if tSlice is empty then
