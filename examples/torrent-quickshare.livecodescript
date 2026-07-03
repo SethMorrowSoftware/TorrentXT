@@ -89,6 +89,12 @@ local sFsTxPos          -- array: stream -> next byte offset to read (0-based; h
 local sFsTxRemaining    -- array: stream -> bytes still to send (respects a Range)
 local sFsTxName         -- array: stream -> the file's leaf name (for the log)
 local sFsTxDeadline     -- array: stream -> the milliseconds of the last activity (watchdog)
+-- Dynamic routes (the light xTalk backend). A hosted web app can call back into
+-- this stack: sHttpRoutes maps "METHOD /path" -> the name of an xTalk handler that
+-- answers the request (see qsHttpRoute / qsHttpReply below). Works over BOTH
+-- transports; on the direct web link a route sits under the token, e.g.
+-- http://<ip>:<port>/<token>/_qs/info.
+local sHttpRoutes       -- array: "METHOD /path" -> handler name in this script
 -- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
 -- a file/folder to any browser at http://<ip>:<port>/<token>/... . TorrentXT's
 -- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
@@ -148,7 +154,7 @@ constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slo
 constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to upload
 constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
-constant kFsMaxReq = 262144            -- folder server: refuse an HTTP request head > 256 KB
+constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (head + body) > 256 KB
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
@@ -452,6 +458,12 @@ command qsStart
    put "false" into sTorSend
    put "false" into sWebServe
    put "false" into sWebShare
+   -- the built-in demo route: a hosted app (or curl) can GET /_qs/info for live
+   -- share metadata as JSON - the pattern to copy for your own routes. Register
+   -- more with qsHttpRoute "POST", "/api/thing", "myHandler" (handler in this
+   -- script: on myHandler pConn, pRequest ... qsHttpReply pConn, 200, ...).
+   put empty into sHttpRoutes
+   qsHttpRoute "GET", "/_qs/info", "qsInfoRoute"
    if sHasOnion then
       qsOnionStart
    else
@@ -1950,10 +1962,10 @@ command qsFsPeer pStream
    send ("qsFsWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
 end qsFsPeer
 
--- Accumulate the request until the CRLFCRLF that ends the header block, then handle
--- it. GET/HEAD carry no body, so the header terminator IS completion.
+-- Accumulate the request until it is COMPLETE: the CRLFCRLF header terminator has
+-- arrived AND, if the head declares a Content-Length (a POST to a route), the whole
+-- body too. The kFsMaxReq cap bounds head + body together (abuse guard).
 command qsFsStream pStream, pEvent, pData
-   local tCrlf2
    if pEvent is "data" then
       if sFsServed[pStream] is "true" then
          exit qsFsStream
@@ -1965,8 +1977,7 @@ command qsFsStream pStream, pEvent, pData
          qsFsSendText pStream, "413 Payload Too Large", "text/plain; charset=utf-8", "Request too large."
          exit qsFsStream
       end if
-      put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tCrlf2
-      if sFsReq[pStream] contains tCrlf2 then
+      if qsHttpReqComplete(sFsReq[pStream]) then
          put "true" into sFsServed[pStream]
          qsFsHandle pStream
       end if
@@ -1977,16 +1988,63 @@ end qsFsStream
 
 command qsFsHandle pStream
    local tHeaders
-   put qsFsParseReq(sFsReq[pStream]) into tHeaders
+   put qsHttpParse(sFsReq[pStream]) into tHeaders
    qsFsServePath pStream, tHeaders
 end qsFsHandle
 
--- Parse the request into an array: __method / __path / __query, plus lowercased
--- header names -> values. GET/HEAD have no body, so decoding the whole request as
--- UTF-8 is safe. Save/restore the delimiters.
-function qsFsParseReq pData
+-- ==== the light HTTP backend (request framing, routes, replies) ==============
+-- Shared by BOTH transports (onion + clearweb). A request is parsed into an array
+-- (__method / __path / __query / __body + lowercased headers); a registered dynamic
+-- route (qsHttpRoute) is answered by an xTalk handler in this script via qsHttpReply.
+-- The connection is an opaque token "ox:<stream>" or "cw:<socket>" so a route handler
+-- and qsHttpReply stay transport-neutral.
+
+-- 1-based byte index of the first CR of the CRLFCRLF that ends the header block, or 0
+-- if the head is not fully received yet. Byte discipline (no char/line on binary),
+-- mirroring OnionXT's proven onion-httpd.
+function qsHttpHeaderEnd pData
+   local tN, tI, tB1, tB2, tB3, tB4
+   put the number of bytes in pData into tN
+   if tN < 4 then
+      return 0
+   end if
+   repeat with tI = 1 to tN - 3
+      put byteToNum(byte tI of pData) into tB1
+      if tB1 is 13 then
+         put byteToNum(byte (tI + 1) of pData) into tB2
+         put byteToNum(byte (tI + 2) of pData) into tB3
+         put byteToNum(byte (tI + 3) of pData) into tB4
+         if tB2 is 10 and tB3 is 13 and tB4 is 10 then
+            return tI
+         end if
+      end if
+   end repeat
+   return 0
+end qsHttpHeaderEnd
+
+-- Is the request fully received? The head must have arrived, and if it declares a
+-- Content-Length (a POST to a route) the whole body too. GET/HEAD have no body.
+function qsHttpReqComplete pData
+   local tHeadEnd, tHeaders, tContentLen, tBodyStart, tHave
+   put qsHttpHeaderEnd(pData) into tHeadEnd
+   if tHeadEnd is 0 then
+      return false
+   end if
+   put qsHttpParseHead(byte 1 to (tHeadEnd - 1) of pData) into tHeaders
+   put tHeaders["content-length"] into tContentLen
+   if tContentLen is empty or tContentLen is not an integer then
+      return true
+   end if
+   put tHeadEnd + 4 into tBodyStart
+   put (the number of bytes in pData) - tBodyStart + 1 into tHave
+   return (tHave >= tContentLen)
+end qsHttpReqComplete
+
+-- Parse the head block (request line + header lines, ASCII) into an array: __method /
+-- __path / __query, plus lowercased header names -> values. Save/restore delimiters.
+function qsHttpParseHead pHeadBytes
    local tText, tSaved, tSavedID, tReqLine, tResource, tI, tLine, tColon, tName, tValue, tOut
-   put textDecode(pData, "UTF-8") into tText
+   put textDecode(pHeadBytes, "UTF-8") into tText
    put the lineDelimiter into tSaved
    put the itemDelimiter into tSavedID
    set the lineDelimiter to (numToChar(13) & numToChar(10))
@@ -2013,13 +2071,149 @@ function qsFsParseReq pData
    set the lineDelimiter to tSaved
    set the itemDelimiter to tSavedID
    return tOut
-end qsFsParseReq
+end qsHttpParseHead
+
+-- Full parse: the head plus the raw body bytes, CAPPED to the declared Content-Length
+-- (so trailing/pipelined bytes never bleed into __body). __body is RAW bytes (a POST
+-- body may be binary), the head is text.
+function qsHttpParse pData
+   local tHeadEnd, tOut, tContentLen, tBodyStart, tBodyEnd
+   put qsHttpHeaderEnd(pData) into tHeadEnd
+   if tHeadEnd is 0 then
+      put qsHttpParseHead(pData) into tOut     -- defensive: no terminator seen
+      put "" into tOut["__body"]
+      return tOut
+   end if
+   put qsHttpParseHead(byte 1 to (tHeadEnd - 1) of pData) into tOut
+   put "" into tOut["__body"]
+   put tOut["content-length"] into tContentLen
+   if tContentLen is an integer and tContentLen > 0 then
+      put tHeadEnd + 4 into tBodyStart
+      if tBodyStart <= the number of bytes in pData then
+         put tBodyStart + tContentLen - 1 into tBodyEnd
+         if tBodyEnd > the number of bytes in pData then
+            put the number of bytes in pData into tBodyEnd
+         end if
+         put byte tBodyStart to tBodyEnd of pData into tOut["__body"]
+      end if
+   end if
+   return tOut
+end qsHttpParse
+
+-- Register a dynamic route: pHandler is a command in THIS script, called as
+-- pHandler pConn, pRequest (pRequest is the parsed array; reply with qsHttpReply).
+command qsHttpRoute pMethod, pPath, pHandler
+   put pHandler into sHttpRoutes[toUpper(pMethod) & space & pPath]
+end qsHttpRoute
+
+-- Call a route handler; a throw or a missing handler becomes a clean 500 (so a buggy
+-- route never crashes the poll loop or leaves the connection hung).
+command qsHttpDispatch pConn, pHandler, pRequest
+   local tErr
+   try
+      dispatch pHandler to me with pConn, pRequest
+      if the result is "unhandled" then
+         qsHttpReply pConn, 500, "text/plain; charset=utf-8", ("Route handler not found: " & pHandler)
+      end if
+   catch tErr
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", ("Route handler error: " & tErr)
+   end try
+end qsHttpDispatch
+
+-- Reply from a route handler, transport-neutral. pConn is "ox:<stream>" (onion) or
+-- "cw:<socket>" (clearweb); we route to the matching one-shot text sender, which sets
+-- Content-Length, closes, and cleans up.
+command qsHttpReply pConn, pCode, pType, pBody
+   local tKind, tId, tStatus
+   put char 1 to 3 of pConn into tKind
+   put char 4 to -1 of pConn into tId
+   put pCode & space & qsHttpReason(pCode) into tStatus
+   if tKind is "ox:" then
+      qsFsSendText tId, tStatus, pType, pBody
+   else
+      qsCwSendText tId, tStatus, pType, pBody
+   end if
+end qsHttpReply
+
+function qsHttpReason pCode
+   if pCode is 200 then
+      return "OK"
+   else if pCode is 201 then
+      return "Created"
+   else if pCode is 204 then
+      return "No Content"
+   else if pCode is 400 then
+      return "Bad Request"
+   else if pCode is 403 then
+      return "Forbidden"
+   else if pCode is 404 then
+      return "Not Found"
+   else if pCode is 405 then
+      return "Method Not Allowed"
+   else if pCode is 500 then
+      return "Internal Server Error"
+   end if
+   return "OK"
+end qsHttpReason
+
+-- Escape a string for a JSON value (backslash FIRST, then the rest).
+function qsJsonEscape pText
+   local tOut, tBack
+   put numToChar(92) into tBack           -- a single backslash
+   put pText into tOut
+   replace tBack with (tBack & tBack) in tOut
+   replace quote with (tBack & quote) in tOut
+   replace numToChar(13) with (tBack & "r") in tOut
+   replace numToChar(10) with (tBack & "n") in tOut
+   replace numToChar(9) with (tBack & "t") in tOut
+   return tOut
+end qsJsonEscape
+
+-- The built-in demo route (registered in qsStart): GET /_qs/info returns a little live
+-- share metadata as JSON. Copy this shape for your own routes.
+command qsInfoRoute pConn, pRequest
+   local tJson, tName, tMode, tQ
+   put "" into tName
+   put "none" into tMode
+   if sCwActive is "true" then
+      put sCwName into tName
+      put "clearweb" into tMode
+   else if sActiveShare["kind"] is "folder" then
+      put sActiveShare["name"] into tName
+      put "tor" into tMode
+   end if
+   put quote into tQ
+   put "{" & tQ & "app" & tQ & ":" & tQ & "TorrentXT Quick Share" & tQ & "," & \
+      tQ & "mode" & tQ & ":" & tQ & qsJsonEscape(tMode) & tQ & "," & \
+      tQ & "share" & tQ & ":" & tQ & qsJsonEscape(tName) & tQ & "," & \
+      tQ & "method" & tQ & ":" & tQ & qsJsonEscape(pRequest["__method"]) & tQ & "}" into tJson
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
+end qsInfoRoute
 
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
 -- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
 command qsFsServePath pStream, pHeaders
-   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa
+   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey
    put pHeaders["__method"] into tMethod
+   put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
+   put urlDecode(tRaw) into tPath            -- real chars for disk mapping
+   if tPath is empty then
+      put "/" into tPath
+   end if
+   -- traversal guard AFTER decoding, before any disk touch AND before route dispatch
+   replace "\" with "/" in tPath
+   if tPath contains ".." then
+      qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
+      exit qsFsServePath
+   end if
+   -- a registered dynamic route answers FIRST (any method, so a POST works); only
+   -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
+   put toUpper(tMethod) & space & tPath into tRouteKey
+   if sHttpRoutes[tRouteKey] is not empty then
+      put tPath into pHeaders["__path"]
+      qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
+      exit qsFsServePath
+   end if
    if tMethod is not "GET" and tMethod is not "HEAD" then
       qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
       exit qsFsServePath
@@ -2027,16 +2221,6 @@ command qsFsServePath pStream, pHeaders
    put sActiveShare["root"] into tRoot
    if tRoot is empty then
       qsFsSendText pStream, "503 Service Unavailable", "text/plain; charset=utf-8", "No folder is being shared."
-      exit qsFsServePath
-   end if
-   put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
-   put urlDecode(tRaw) into tPath            -- real chars for disk mapping
-   if tPath is empty then
-      put "/" into tPath
-   end if
-   replace "\" with "/" in tPath
-   if tPath contains ".." then
-      qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
       exit qsFsServePath
    end if
    put tRoot & tPath into tDisk
@@ -2589,7 +2773,6 @@ command qsCwAccept pSocketID
 end qsCwAccept
 
 command qsCwData pSocketID, pData
-   local tCrlf2
    if sCwServed[pSocketID] is empty then
       exit qsCwData            -- not one of ours (or already cleaned up)
    end if
@@ -2602,25 +2785,20 @@ command qsCwData pSocketID, pData
       qsCwSendText pSocketID, "413 Payload Too Large", "text/plain; charset=utf-8", "Request too large."
       exit qsCwData
    end if
-   put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tCrlf2
-   if sCwReq[pSocketID] contains tCrlf2 then
+   if qsHttpReqComplete(sCwReq[pSocketID]) then
       put "true" into sCwServed[pSocketID]
       qsCwServe pSocketID
    else
-      read from socket pSocketID with message "qsCwData"   -- more of the head to come
+      read from socket pSocketID with message "qsCwData"   -- more head/body to come
    end if
 end qsCwData
 
 -- Parse, check the capability token (the first path segment), then route: for a file
 -- share only the one file is reachable; for a folder share, browse within the root.
 command qsCwServe pSocketID
-   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa
-   put qsFsParseReq(sCwReq[pSocketID]) into tHeaders
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey
+   put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
-   if tMethod is not "GET" and tMethod is not "HEAD" then
-      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
-      exit qsCwServe
-   end if
    put tHeaders["__path"] into tRaw
    put urlDecode(tRaw) into tPath
    replace "\" with "/" in tPath
@@ -2639,6 +2817,18 @@ command qsCwServe pSocketID
    set the itemDelimiter to tSavedID
    if tTok is not sCwToken then
       qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+      exit qsCwServe
+   end if
+   -- a registered dynamic route (under the token) answers FIRST, any method. Give the
+   -- handler the app-relative path (token stripped) so a route is transport-neutral.
+   put toUpper(tMethod) & space & tRest into tRouteKey
+   if sHttpRoutes[tRouteKey] is not empty then
+      put tRest into tHeaders["__path"]
+      qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
+      exit qsCwServe
+   end if
+   if tMethod is not "GET" and tMethod is not "HEAD" then
+      qsCwSendText pSocketID, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
       exit qsCwServe
    end if
    if sCwKind is "file" then

@@ -112,6 +112,24 @@ while a genuinely missing asset still returns 404. Two things to know:
   it with **relative** asset paths (or a matching base) - absolute paths like `/app.js`
   resolve above the token and 404. Over Tor (served at the root) absolute paths are fine.
 
+**Give it a backend.** The server also does **dynamic routes**, so a hosted app can call
+back into your stack instead of being purely static. A built-in demo route answers
+`GET /_qs/info` with live share metadata as JSON - visit
+`http://<address>/_qs/info` (or, on the direct web link, `.../<token>/_qs/info`). Add your
+own in the stack script:
+
+```
+qsHttpRoute "POST", "/api/echo", "myEcho"      -- register (any method; POST bodies work)
+...
+command myEcho pConn, pRequest                  -- pRequest has __method/__path/__query/__body + headers
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", ("{" & quote & "you-sent" & quote & ":" & pRequest["__body"] & "}")
+end myEcho
+```
+
+Routes run on the one UI thread, so keep a handler **light** (return quickly); for real
+data a handler can read/write files or use the engine's SQLite. This is a small backend
+for a self-hosted appliance, not a high-traffic server.
+
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
 `.torrent` path, or a 40-hex info-hash into the Add box (or drag one onto the

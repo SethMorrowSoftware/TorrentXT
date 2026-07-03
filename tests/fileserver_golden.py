@@ -17,6 +17,9 @@ Mirrors these LiveCodeScript handlers:
   qsFsHtmlEscape  -> html_escape()
   qsCwServe       -> capability_route() (clearweb: the /<token>/ capability gate)
   qsSiteSpaTarget -> spa_is_route()     (SPA fallback: a route vs a missing asset)
+  qsHttpHeaderEnd -> http_header_end()  (byte index of the CRLFCRLF head terminator)
+  qsHttpReqComplete -> http_req_complete() (head + Content-Length body received?)
+  qsJsonEscape    -> json_escape()      (the /_qs/info route's JSON value escaping)
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
@@ -143,6 +146,52 @@ def html_escape(text):
 
 
 # ---- qsSiteSpaTarget: the SPA route-vs-asset heuristic ----------------------
+
+# ---- the light HTTP backend: request framing + JSON escaping ----------------
+
+def http_header_end(data):
+    """1-based byte index of the first CR of the CRLFCRLF that ends the header block,
+    or 0 if not fully received. Mirrors qsHttpHeaderEnd (a byte scan)."""
+    i = data.find(b"\r\n\r\n")
+    return 0 if i < 0 else i + 1
+
+
+def _content_length(head_bytes):
+    text = head_bytes.decode("utf-8", "replace")
+    for line in text.split("\r\n")[1:]:          # skip the request line
+        name, sep, val = line.partition(":")
+        if sep and name.strip().lower() == "content-length":
+            v = val.strip()
+            try:
+                return int(v) if "." not in v else None
+            except ValueError:
+                return None
+    return None
+
+
+def http_req_complete(data):
+    """Mirror qsHttpReqComplete: the head plus (if a Content-Length is declared) the
+    whole body must be present. A non-integer/absent Content-Length means no body."""
+    he = http_header_end(data)
+    if he == 0:
+        return False
+    cl = _content_length(data[:he - 1])          # byte 1..headEnd-1
+    if cl is None:
+        return True
+    body_start = he + 4                           # 1-based, just past CRLFCRLF
+    have = len(data) - body_start + 1
+    return have >= cl
+
+
+def json_escape(s):
+    """Mirror qsJsonEscape: backslash first, then quote, CR, LF, tab."""
+    out = s.replace("\\", "\\\\")
+    out = out.replace('"', '\\"')
+    out = out.replace("\r", "\\r")
+    out = out.replace("\n", "\\n")
+    out = out.replace("\t", "\\t")
+    return out
+
 
 def spa_is_route(rel_path):
     """Mirror qsSiteSpaTarget's route-vs-asset heuristic (the part independent of the
@@ -278,10 +327,31 @@ def main():
     ]:
         check("spa_is_route(%r)" % path, spa_is_route(path), want)
 
+    # -- HTTP request framing (head terminator + Content-Length body) --
+    get_full = b"GET /_qs/info HTTP/1.1\r\nHost: x\r\n\r\n"
+    check("header_end GET", http_header_end(get_full), get_full.find(b"\r\n\r\n") + 1)
+    check("complete GET (no body)", http_req_complete(get_full), True)
+    check("incomplete head", http_req_complete(b"GET / HTTP/1.1\r\nHost: x\r\n"), False)
+    post_hdr = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\n"
+    check("post no body yet", http_req_complete(post_hdr), False)
+    check("post partial body", http_req_complete(post_hdr + b"hel"), False)
+    check("post full body", http_req_complete(post_hdr + b"hello"), True)
+    check("post over-long body still complete", http_req_complete(post_hdr + b"helloEXTRA"), True)
+    check("post non-integer CL -> no body", http_req_complete(
+        b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), True)
+
+    # -- JSON value escaping (for the /_qs/info route) --
+    check("json plain", json_escape("hello"), "hello")
+    check("json quote", json_escape('a"b'), 'a\\"b')
+    check("json backslash", json_escape("c:\\path"), "c:\\\\path")
+    check("json crlf", json_escape("a\r\nb"), "a\\r\\nb")
+    check("json tab", json_escape("x\ty"), "x\\ty")
+    check("json backslash-before-quote order", json_escape('\\"'), '\\\\\\"')
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
-    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, capability gate, SPA fallback all match)")
+    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape all match)")
     return 0
 
 
