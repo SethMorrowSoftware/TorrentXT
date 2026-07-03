@@ -126,9 +126,11 @@ command myEcho pConn, pRequest                  -- pRequest has __method/__path/
 end myEcho
 ```
 
-Routes run on the one UI thread, so keep a handler **light** (return quickly); for real
-data a handler can read/write files or use the engine's SQLite. This is a small backend
-for a self-hosted appliance, not a high-traffic server.
+A handler **must call `qsHttpReply` exactly once** - that sends the response and closes
+the connection; a route that returns without replying leaves the request hanging until
+the browser gives up. Routes run on the one UI thread, so keep a handler **light**
+(return quickly); for real data a handler can read/write files or use the engine's
+SQLite. This is a small backend for a self-hosted appliance, not a high-traffic server.
 
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
