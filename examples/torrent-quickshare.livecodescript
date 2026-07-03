@@ -52,6 +52,7 @@ local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned o
 local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once)
 local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
 local sTorSend          -- "true" while the "Send privately over Tor" toggle is armed
+local sWebServe         -- "true" while the "Serve as web download" checkbox is on
 local sOnionTriedTB     -- "true" once we have retried the Tor Browser control port pair
 local sActiveShare      -- array: the one live anon share (service, path, name, enc, salt, verify, ...)
 local sOnionXfers       -- array: stream handle -> {name,dir,enc,total,got,state} for the transfers view
@@ -113,7 +114,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-07"
+constant kQsUiVersion = "qs-ui-2026-08"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -174,6 +175,12 @@ on mouseUp
       case "qsTorToggle"
          qsToggleTor
          break
+      case "qsWebCheck"
+         qsToggleWeb
+         break
+      case "qsWebCopy"
+         qsCopyWebLink
+         break
       default
          pass mouseUp
    end switch
@@ -214,7 +221,7 @@ command qsBuild
    -- area, then the resulting code.
    qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
    qsField "qsSendPass", "304,74,596,98", false
-   qsField "qsDrop", "24,104,596,206", true
+   qsField "qsDrop", "24,104,596,184", true
    set the opaque of field "qsDrop" to true
    set the backgroundColor of field "qsDrop" to "245,247,250"
    set the borderWidth of field "qsDrop" to 1
@@ -223,7 +230,18 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & return & "Drag a file here to share" & return & return & "(or click to choose a file)")
+   set the text of field "qsDrop" to (return & "Drag a file here to share" & return & "(or click to choose a file)")
+   -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
+   -- plaintext file shared over Tor is served this way; the URL appears at the right.
+   qsButton "qsWebCheck", "Serve as web download", "24,186,220,208"
+   set the style of button "qsWebCheck" to "checkbox"
+   set the autoHilite of button "qsWebCheck" to false
+   qsField "qsWebLink", "226,186,520,208", true
+   set the textFont of field "qsWebLink" to "Courier"
+   set the textSize of field "qsWebLink" to 9
+   set the opaque of field "qsWebLink" to true
+   set the backgroundColor of field "qsWebLink" to "255,250,225"
+   qsButton "qsWebCopy", "Copy", "526,186,596,208"
    qsLabel "qsSharing", "", "24,212,596,232", 10
    set the textStyle of field "qsSharing" to "bold"
    qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,238,596,256", 10
@@ -347,6 +365,9 @@ command qsAddTips
    set the tooltip of button "qsGet" to "Download the file for that code into your Quick Share folder."
    set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
    set the tooltip of button "qsTorToggle" to "Off = normal peer-to-peer. On = send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate."
+   set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
+   set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
+   set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
    set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work."
 end qsAddTips
 
@@ -371,6 +392,7 @@ command qsStart
    -- is completely inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
    put qsHasOnion() into sHasOnion
    put "false" into sTorSend
+   put "false" into sWebServe
    if sHasOnion then
       qsOnionStart
    else
@@ -1059,11 +1081,16 @@ command qsOnionServicePublished pInfo
    if sActiveShare["enc"] is kFlagEnc then
       set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " ENCRYPTED over Tor - both IPs hidden. Send the code AND the passphrase; keep this window open. An interrupted transfer restarts from the beginning.")
       qsLog "Private Tor address published. Click Copy and send the code to your friend."
+   else if sActiveShare["web"] is "true" then
+      -- plaintext + web download on: also hand out the browser URL (Tor Browser)
+      set the text of field "qsWebLink" to ("http://" & tOnion & "/")
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, sender not verified. App users: the code above. Browser: the Web link on the right.")
+      qsLog "Tor address published. App code is above; browser download link (Tor Browser): http://" & tOnion & "/"
    else
-      -- a plaintext share ALSO serves a browser: hand out the .onion URL for anyone
-      -- with Tor Browser (no app needed). Still IP-anonymous, still not encrypted.
-      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. App code is above; a browser (Tor Browser) can download it at  http://" & tOnion & "/")
-      qsLog "Tor address published. App users: use the code above. Anyone with Tor Browser can download at: http://" & tOnion & "/"
+      -- plaintext, app-only: a browser hitting the onion gets a 'web download off' page
+      set the text of field "qsWebLink" to ""
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. Send the code above; keep this window open. (Tick 'Serve as web download' to also allow a Tor Browser link.)")
+      qsLog "Private Tor address published. Click Copy and send the code to your friend."
    end if
 end qsOnionServicePublished
 
@@ -1351,6 +1378,7 @@ command qsStartOnionShare pPath, pName, pPass
    put tVerifier into sActiveShare["verify"]
    put tPort into sActiveShare["port"]
    put tSvc into sActiveShare["service"]
+   put sWebServe into sActiveShare["web"]
    put "false" into sActiveShare["revealed"]
    put "false" into sActiveShare["busy"]
    if tEncFlag is kFlagEnc then
@@ -1360,6 +1388,7 @@ command qsStartOnionShare pPath, pName, pPass
       put tTotal into sActiveShare["total"]
    end if
    set the text of field "qsCode" to ""
+   set the text of field "qsWebLink" to ""
    set the text of field "qsSharing" to ("Publishing a private Tor address for " & quote & tSafe & quote & " - this can take up to a minute...")
    qsLog "Publishing a private Tor service for " & quote & tSafe & quote & "..."
    -- arm the publish watchdog against THIS service handle, so a later share's
@@ -1610,6 +1639,10 @@ command qsOnionServeHttp pStream
    put word 2 of tReq into tPath
    if sActiveShare["enc"] is kFlagEnc then
       qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlEncrypted()
+      exit qsOnionServeHttp
+   end if
+   if sActiveShare["web"] is not "true" then
+      qsOnionHttpText pStream, "403 Forbidden", "text/html; charset=utf-8", qsHtmlDisabled()
       exit qsOnionServeHttp
    end if
    if tPath is "/download" then
@@ -2003,6 +2036,34 @@ function qsMoveFile pSrc, pDst
    end try
    return ""
 end qsMoveFile
+
+-- Flip the "Serve as web download" checkbox (managed two-state; autoHilite off).
+command qsToggleWeb
+   if sWebServe is "true" then
+      put "false" into sWebServe
+      set the hilite of button "qsWebCheck" to false
+   else
+      put "true" into sWebServe
+      set the hilite of button "qsWebCheck" to true
+   end if
+end qsToggleWeb
+
+command qsCopyWebLink
+   if field "qsWebLink" is empty then
+      qsLog "No web link yet - share a plaintext file over Tor with 'Serve as web download' ticked."
+      exit qsCopyWebLink
+   end if
+   set the clipboardData["text"] to field "qsWebLink"
+   qsLog "Web link copied. Anyone with Tor Browser can open it to download."
+end qsCopyWebLink
+
+-- Shown to a browser when the sender did NOT tick 'Serve as web download'.
+function qsHtmlDisabled
+   return ("<!doctype html><html><head><meta charset='utf-8'><title>Not available</title></head>" & \
+      "<body style='font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em'>" & \
+      "<h2>Web download is off</h2><p>The sender shared this file for the app only. Ask them for the " & \
+      "share code, or to tick 'Serve as web download'.</p></body></html>")
+end qsHtmlDisabled
 
 command qsLog pMsg
    if there is no field "qsLog" then
