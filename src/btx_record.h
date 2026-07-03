@@ -108,6 +108,9 @@ enum FieldId : uint8_t {
     F_EVT_INFO_HASH_V2  = 71,  /* hex */
     F_EVT_NAME          = 72,  /* utf8 */
     F_EVT_ENDPOINT      = 73,  /* utf8 */
+    F_EVT_EXTERNAL_IP        = 74,  /* utf8: this machine's external IP (external_ip_alert) */
+    F_EVT_MAP_EXTERNAL_PORT  = 75,  /* int: external port a UPnP/NAT-PMP mapping opened */
+    F_EVT_MAP_TRANSPORT      = 76,  /* utf8: mapper that opened it ("upnp" / "natpmp") */
 
     /* ---- DHT state (100..119) ---- */
     F_DHT_NODES         = 100, /* int */
@@ -190,7 +193,15 @@ enum AlertType : uint16_t {
     A_RP1_PEER_CONNECTED    = 26, /* a peer attached to an rp1-enabled swarm */
     A_RP1_HANDSHAKE         = 27, /* peer's extended handshake seen (peer_id, rp1?, token) */
     A_RP1_MESSAGE           = 28, /* one rp1 message arrived (raw payload) */
-    A_RP1_PEER_DISCONNECTED = 29  /* the peer connection closed */
+    A_RP1_PEER_DISCONNECTED = 29, /* the peer connection closed */
+
+    /* ---- connectivity: UPnP / NAT-PMP port mapping + external IP (30..39) ------
+     * Reuse libtorrent's router-mapping machinery so a clear-web HTTP server can
+     * be reached without manual port forwarding. NOT anonymous (the IP is public);
+     * the actual external port a router assigns arrives on A_PORT_MAPPED. */
+    A_PORT_MAPPED           = 30, /* portmap_alert: a router port mapping succeeded */
+    A_PORT_MAP_ERROR        = 31, /* portmap_error_alert: a mapping attempt failed */
+    A_EXTERNAL_IP           = 32  /* external_ip_alert: learned this machine's external IP */
 };
 
 /* ====================================================================== *

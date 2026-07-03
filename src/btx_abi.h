@@ -47,7 +47,7 @@ extern "C" {
  * signature, a new record fieldId or alert code, or a framing change. The LCB
  * layer hard-codes the matching number in checkABI() and refuses to run on
  * skew. Start at 1. */
-#define BTX_ABI_VERSION 10
+#define BTX_ABI_VERSION 11
 
 /* ----------------------------------------------------------- export linkage */
 
@@ -334,6 +334,27 @@ BTX_API int BTX_CALL btx_url_seeds(int t, void *out, int cap);
  * and emitted on the next call — the drain NEVER drops a record (ShowControl's
  * MIDI rule). 0 means "no alerts pending". */
 BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap);
+
+/* ====================================================================== *
+ *  Connectivity: UPnP / NAT-PMP port mapping
+ *
+ *  Reuse libtorrent's router-mapping machinery so a plain (clear-web) local
+ *  server can be reached without the user configuring port forwarding. This is
+ *  NOT anonymous — the machine's external IP is public. Request a mapping; the
+ *  ACTUAL external port the router assigned (it may differ from the requested
+ *  one) and which mapper won ("upnp"/"natpmp") arrive asynchronously as an
+ *  A_PORT_MAPPED alert (fields F_EVT_MAP_EXTERNAL_PORT / F_EVT_MAP_TRANSPORT),
+ *  a failure as A_PORT_MAP_ERROR, and the external IP as A_EXTERNAL_IP.
+ * ====================================================================== */
+
+/* Ask UPnP AND NAT-PMP to open `externalPort` and forward it to `localPort` on
+ * this machine. isTcp != 0 = TCP (use for an HTTP server), else UDP. Returns a
+ * mapping id (> 0) to pass to btx_delete_port_mapping, or 0 on a bad handle /
+ * bad port / no active port-mapper. */
+BTX_API int BTX_CALL btx_add_port_mapping(int s, int externalPort,
+                                          int localPort, int isTcp);
+/* Withdraw a mapping from btx_add_port_mapping (idempotent; a stale id no-ops). */
+BTX_API int BTX_CALL btx_delete_port_mapping(int s, int mappingId);
 
 /* ====================================================================== *
  *  DHT
