@@ -10,11 +10,12 @@ folder server that are verifiable off-engine: the HTTP byte-range parser, the
 path-traversal decision, the MIME mapping, and the HTML escaper. If this and the
 .livecodescript ever disagree, one of them is wrong.
 
-Mirrors these LiveCodeScript handlers (the qsFs* folder web server):
-  qsFsParseRange  -> parse_range()     (RFC 7233 single-range; 416 on out-of-range)
-  qsFsServePath   -> traversal_ok()    (".." refused after urlDecode + \\ -> /)
+Mirrors these LiveCodeScript handlers:
+  qsFsParseRange  -> parse_range()      (RFC 7233 single-range; 416 on out-of-range)
+  qsFsServePath   -> traversal_ok()     (".." refused after urlDecode + \\ -> /)
   qsFsMime        -> mime()
   qsFsHtmlEscape  -> html_escape()
+  qsCwServe       -> capability_route() (clearweb: the /<token>/ capability gate)
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
@@ -133,6 +134,24 @@ def html_escape(text):
     return out
 
 
+# ---- qsCwServe: the clearweb /<token>/ capability gate ----------------------
+# The first path segment must equal the share's random token, else 404 (an open
+# port must not be an open directory). The rest of the path is folder-relative.
+
+def capability_route(decoded_path, token):
+    """Returns 'forbidden' (.. present), or (matches, rest) where matches is
+    whether the token segment equals `token` and rest is the folder-relative path
+    (leading '/'). Mirrors qsCwServe: replace \\ -> /, refuse '..', then split on
+    '/' with item 2 the token and item 3..-1 the rest."""
+    p = decoded_path.replace("\\", "/")
+    if ".." in p:
+        return "forbidden"
+    items = p.split("/")                 # "/tok/a/b" -> ["", "tok", "a", "b"]
+    tok = items[1] if len(items) >= 2 else ""
+    rest = "/" + "/".join(items[2:]) if len(items) >= 3 else "/"
+    return (tok == token, rest)
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
@@ -198,10 +217,25 @@ def main():
     check("html_escape amp-first", html_escape("a & <b>"), "a &amp; &lt;b&gt;")
     check("html_escape quote", html_escape('say "hi"'), "say &quot;hi&quot;")
 
+    # -- clearweb capability gate (the /<token>/ prefix) --
+    tok = "abc123"
+    for path, want in [
+        ("/abc123/", (True, "/")),                 # folder root
+        ("/abc123", (True, "/")),                  # no trailing slash -> root
+        ("/abc123/sub/", (True, "/sub/")),         # a subfolder
+        ("/abc123/a/b.txt", (True, "/a/b.txt")),   # a nested file
+        ("/abc123/photo.jpg", (True, "/photo.jpg")),
+        ("/wrongtoken/", (False, "/")),            # bad token -> 404
+        ("/", (False, "/")),                       # bare root, no token -> 404
+        ("", (False, "/")),                        # empty -> 404
+        ("/abc123/../etc", "forbidden"),           # traversal refused first
+    ]:
+        check("capability_route(%r)" % path, capability_route(path, tok), want)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
-    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape all match)")
+    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, capability gate all match)")
     return 0
 
 

@@ -9,7 +9,7 @@ session automatically. No helper stacks, no manual layout.
 
 | File | What it is | Needs cryptoXT? |
 |------|------------|-----------------|
-| `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. Optionally send anonymously over Tor - or drag a **folder** with Tor on to serve it as a browsable `.onion` web page. | Only for the optional passphrase lock |
+| `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. Optionally send anonymously over Tor, serve a **folder** as a browsable `.onion` page, or hand out a **direct web link** any browser can open (with automatic router port-opening). | Only for the optional passphrase lock |
 | `torrent-client.livecodescript` | A full multi-torrent client: add magnets / `.torrent` files / URLs, seed a folder, and manage many torrents with a live Files / Peers / Trackers / Log inspector. | No |
 | `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). | Only for private (passphrase) channels |
 | `torrent-rp1-chat.livecodescript` | A two-machine **messaging** demo: two peers meet on a shared "room" id and chat directly over the `rp1` peer-wire extension, with no tracker, no server, and no file transfer at all. | No |
@@ -82,6 +82,18 @@ memory) and downloads support **HTTP Range**, so a Tor-interrupted transfer resu
 instead of restarting and audio/video seeks in the browser. A folder page is cleartext
 over the onion (a browser cannot decrypt), so there is no passphrase for this mode;
 for an encrypted, verified transfer, share a single file with a passphrase.
+
+**Share via a direct web link (no Tor).** Tick **Share via web link** and drop a file
+or folder: Quick Share runs a small web server and hands you a link like
+`http://<your-ip>:<port>/<token>/`. The recipient opens it in **any** browser - no app,
+no Tor. TorrentXT asks your router to open the port automatically (UPnP/NAT-PMP, the
+same machinery a torrent client uses), so on most home networks there is nothing to
+configure; on the same LAN it works instantly. The link carries a random **token**, so
+an open port is not an open directory - only people you send the link to can reach it.
+This path is fast but not private: your IP is visible and the download is not encrypted
+(use Tor for anonymity). If the router refuses UPnP (or you are behind carrier-grade
+NAT), the local-network link still works and Quick Share tells you which port to forward
+or to fall back to Tor.
 
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
