@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """fileserver_golden.py - pure-Python reference for the security- and
-correctness-critical logic of the Onion File Server demo
-(examples/torrent-onion-fileserver.livecodescript).
+correctness-critical logic of Quick Share's FOLDER web server (the browsable
+directory page served over the onion when a folder is shared with Tor on), in
+examples/torrent-quickshare.livecodescript.
 
 OXT cannot compile/run .livecodescript headlessly, so - exactly like
 onion_frame_golden.py and record_golden_test.py - this PINS the parts of the
-folder-serving demo that are verifiable off-engine: the HTTP byte-range parser,
-the path-traversal decision, the MIME mapping, and the HTML escaper. If this and
-the .livecodescript ever disagree, one of them is wrong.
+folder server that are verifiable off-engine: the HTTP byte-range parser, the
+path-traversal decision, the MIME mapping, and the HTML escaper. If this and the
+.livecodescript ever disagree, one of them is wrong.
 
-Mirrors these LiveCodeScript handlers:
-  fsParseRange   -> parse_range()      (RFC 7233 single-range; 416 on out-of-range)
-  fsServePath    -> traversal_ok()     (".." refused after urlDecode + \\ -> /)
-  fsMime         -> mime()
-  fsHtmlEscape   -> html_escape()
+Mirrors these LiveCodeScript handlers (the qsFs* folder web server):
+  qsFsParseRange  -> parse_range()     (RFC 7233 single-range; 416 on out-of-range)
+  qsFsServePath   -> traversal_ok()    (".." refused after urlDecode + \\ -> /)
+  qsFsMime        -> mime()
+  qsFsHtmlEscape  -> html_escape()
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """

@@ -75,6 +75,20 @@ local sRxGot            -- array: stream -> payload bytes written so far
 local sRxKey            -- array: stream -> 32-byte file key (encrypted receive), else empty
 local sRxSave           -- array: stream -> save folder for this receive
 local sRxDeadline       -- array: stream -> the milliseconds of the last data (idle watchdog)
+-- Folder web-server state (Model C, but for a whole FOLDER). When a FOLDER is
+-- dropped with Tor on, we do not create a torrent and do not use the single-file
+-- BTXO transfer; instead we serve the folder as a browsable web page over the onion
+-- (an auto directory listing + streamed, Range-capable file downloads), so a visitor
+-- just opens http://<onion>/ in Tor Browser. A folder web server needs CONCURRENT
+-- connections (page, icons, downloads), so this path keeps per-stream state and does
+-- NOT use the single-file busy gate. Keyed by the OnionXT stream handle.
+local sFsReq            -- array: stream -> accumulated inbound HTTP request bytes
+local sFsServed         -- array: stream -> "true" once we have begun answering it
+local sFsTxPath         -- array: stream -> disk path of the file being streamed out
+local sFsTxPos          -- array: stream -> next byte offset to read (0-based; honours a Range)
+local sFsTxRemaining    -- array: stream -> bytes still to send (respects a Range)
+local sFsTxName         -- array: stream -> the file's leaf name (for the log)
+local sFsTxDeadline     -- array: stream -> the milliseconds of the last activity (watchdog)
 
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -105,6 +119,7 @@ constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slo
 constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to upload
 constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
+constant kFsMaxReq = 262144            -- folder server: refuse an HTTP request head > 256 KB
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -114,7 +129,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-08"
+constant kQsUiVersion = "qs-ui-2026-09"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -230,7 +245,7 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file here to share" & return & "(or click to choose a file)")
+   set the text of field "qsDrop" to (return & "Drag a file here to share" & return & "(or click to choose a file; with Tor on, drag a FOLDER to serve it as a web page)")
    -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
    -- plaintext file shared over Tor is served this way; the URL appears at the right.
    qsButton "qsWebCheck", "Serve as web download", "24,186,220,208"
@@ -364,7 +379,7 @@ command qsAddTips
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your Quick Share folder."
    set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
-   set the tooltip of button "qsTorToggle" to "Off = normal peer-to-peer. On = send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate."
+   set the tooltip of button "qsTorToggle" to "Off = normal peer-to-peer. On = send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER (instead of a file) to serve it as a browsable Tor web page - open the link in Tor Browser."
    set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
    set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
    set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
@@ -495,7 +510,13 @@ command qsShareFile pPath
          exit qsShareFile
       end if
       if there is a folder pPath then
-         qsLog "Anonymous send handles one file at a time - zip the folder first, then send the zip."
+         -- a FOLDER over Tor is served as a browsable web page (no encryption: a
+         -- browser cannot decrypt, so this is cleartext over the onion). A dropped
+         -- passphrase does not apply to a folder share.
+         if tPass is not empty then
+            qsLog "A folder is shared as a browsable Tor web page, which a browser cannot decrypt - sharing it UNENCRYPTED (both IPs still hidden). Drop a single file to encrypt."
+         end if
+         qsStartOnionFolder pPath, tName
          exit qsShareFile
       end if
       qsStartOnionShare pPath, tName, tPass
@@ -739,6 +760,12 @@ command qsRefreshXfers
       end if
       add 1 to tLineNum
    end repeat
+   -- a folder web share has no torrent and no per-file transfer rows; show one status
+   -- line so the Transfers panel is not misleadingly empty while it is serving.
+   if sActiveShare["kind"] is "folder" and sActiveShare["revealed"] is "true" then
+      put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
+      add 1 to tLineNum
+   end if
    if the last char of tRows is return then
       delete the last char of tRows
    end if
@@ -1073,6 +1100,17 @@ command qsOnionServicePublished pInfo
    if tOnion is empty then
       exit qsOnionServicePublished
    end if
+   if sActiveShare["kind"] is "folder" then
+      -- a folder is browser-only: the "code" AND the web link are both the onion URL
+      put tOnion into sActiveShare["onion"]
+      put "true" into sActiveShare["revealed"]
+      put ("http://" & tOnion & "/") into sShareCode
+      set the text of field "qsCode" to ("http://" & tOnion & "/")
+      set the text of field "qsWebLink" to ("http://" & tOnion & "/")
+      set the text of field "qsSharing" to ("Serving the folder " & quote & sActiveShare["name"] & quote & " over Tor - both IPs hidden. Open the link in Tor Browser to browse and download; keep this window open.")
+      qsLog "Tor web page published. Open  http://" & tOnion & "/  in Tor Browser to browse the folder. Copy the link to send it."
+      exit qsOnionServicePublished
+   end if
    put qsMakeTorCode(tOnion, sActiveShare["name"], sActiveShare["salt"], sActiveShare["verify"]) into tCode
    put tCode into sShareCode
    put tOnion into sActiveShare["onion"]
@@ -1146,6 +1184,13 @@ command qsOnionStop
       exit qsOnionStop
    end if
    repeat for each key tK in sOnionXfers
+      try
+         oxCloseStream tK
+      catch tErr
+      end try
+   end repeat
+   -- close any live folder-server connections too (they are not in sOnionXfers)
+   repeat for each key tK in sFsReq
       try
          oxCloseStream tK
       catch tErr
@@ -1353,6 +1398,7 @@ command qsStartOnionShare pPath, pName, pPass
       end if
       exit qsStartOnionShare
    end if
+   put "file" into sActiveShare["kind"]
    put tStreamFile into sActiveShare["path"]
    put tSafe into sActiveShare["name"]
    put tEncFlag into sActiveShare["enc"]
@@ -1377,6 +1423,61 @@ command qsStartOnionShare pPath, pName, pPass
    -- watchdog (a rapid second drop) never tears down this one by mistake
    send ("qsOnionPublishWatchdog " & tSvc) to me in kOnionPublishTimeout milliseconds
 end qsStartOnionShare
+
+-- SEND entry for a FOLDER: publish an onion and serve the folder as a browsable web
+-- page (auto directory listing + streamed, Range-capable downloads). NO torrent, NO
+-- encryption (a browser cannot decrypt), NO single-file BTXO transfer - a visitor
+-- just opens the printed http://<onion>/ in Tor Browser. One active share at a time.
+command qsStartOnionFolder pPath, pName
+   local tSvc, tPort, tSafe, tRoot, tErr
+   put qsSafeLeaf(pName) into tSafe
+   put pPath into tRoot
+   replace "\" with "/" in tRoot
+   if the last char of tRoot is "/" then
+      delete the last char of tRoot
+   end if
+   -- one active anon share at a time: tear down any previous service + temp. Removing
+   -- the service also closes any live folder-server streams (their closed event
+   -- cleans the per-stream state).
+   if sActiveShare["service"] is not empty then
+      if sActiveShare["stream"] is not empty then
+         qsOnionServeAbort sActiveShare["stream"]
+      end if
+      try
+         oxRemoveService sActiveShare["service"]
+      catch tErr
+      end try
+      if sActiveShare["encTmp"] is not empty then
+         try
+            if there is a file sActiveShare["encTmp"] then
+               delete file sActiveShare["encTmp"]
+            end if
+         catch tErr
+         end try
+      end if
+   end if
+   put empty into sActiveShare
+   put qsPickPort() into tPort
+   oxCreateServiceFromSeed sxRandomBytes(32), kOnionVPort, tPort
+   put the result into tSvc
+   if tSvc is not an integer then
+      qsLog "Could not publish a Tor address:" && tSvc
+      exit qsStartOnionFolder
+   end if
+   put "folder" into sActiveShare["kind"]
+   put tRoot into sActiveShare["root"]
+   put tSafe into sActiveShare["name"]
+   put 0 into sActiveShare["enc"]
+   put tPort into sActiveShare["port"]
+   put tSvc into sActiveShare["service"]
+   put "true" into sActiveShare["web"]
+   put "false" into sActiveShare["revealed"]
+   set the text of field "qsCode" to ""
+   set the text of field "qsWebLink" to ""
+   set the text of field "qsSharing" to ("Publishing a private Tor address for the folder " & quote & tSafe & quote & " - this can take up to a minute...")
+   qsLog "Publishing a private Tor web page for the folder " & quote & tSafe & quote & "..."
+   send ("qsOnionPublishWatchdog " & tSvc) to me in kOnionPublishTimeout milliseconds
+end qsStartOnionFolder
 
 -- If the descriptor never uploads in time, tear the half-built service down.
 command qsOnionPublishWatchdog pService
@@ -1413,6 +1514,13 @@ end qsOnionPublishWatchdog
 command qsOnionPeer pStream, pService, pPeerAddr
    if sActiveShare["service"] is empty then
       oxCloseStream pStream
+      exit qsOnionPeer
+   end if
+   -- a FOLDER share is a concurrent browsable web server: each connection is its own
+   -- per-stream state (no single-file busy gate), so a page + its icons + downloads
+   -- are all served at once.
+   if sActiveShare["kind"] is "folder" then
+      qsFsPeer pStream
       exit qsOnionPeer
    end if
    if sActiveShare["busy"] is "true" then
@@ -1710,6 +1818,485 @@ function qsHtmlEncrypted
       "<h2>This file is encrypted</h2><p>It cannot be downloaded in a browser. Ask the sender for the " & \
       "app share code and the passphrase.</p></body></html>")
 end qsHtmlEncrypted
+
+-- ==== the FOLDER web server (Model C, a browsable page over the onion) ========
+-- When the active share is a FOLDER, serve sActiveShare["root"] as a browsable web
+-- page over the onion: an auto directory listing, index.html precedence, a
+-- trailing-slash redirect, MIME by extension, and STREAMED, Range-capable downloads
+-- (resumable + seekable). Concurrency-safe: every browser connection is its own
+-- per-stream state, and the pump opens/seeks/reads/closes the file within a single
+-- tick (no yield between), so two browsers can pull the SAME file without sharing a
+-- cursor (LiveCode keys a file handle by path and no-ops a second open). Read-only
+-- (GET/HEAD); ".." is refused after URL-decoding; file names are HTML-escaped. This
+-- is the standalone Onion File Server folded into Quick Share. Verified STATICALLY +
+-- by tests/fileserver_golden.py; the one unproven primitive is `seek to N in file`
+-- in qsFsPump (flagged VERIFY), used for every download so any base error is a loud,
+-- first-test-obvious failure, not silent corruption.
+
+command qsFsPeer pStream
+   put "" into sFsReq[pStream]
+   put "false" into sFsServed[pStream]
+   put the milliseconds into sFsTxDeadline[pStream]
+   oxSetStreamCallback pStream, "qsFsStream"
+   send ("qsFsWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end qsFsPeer
+
+-- Accumulate the request until the CRLFCRLF that ends the header block, then handle
+-- it. GET/HEAD carry no body, so the header terminator IS completion.
+command qsFsStream pStream, pEvent, pData
+   local tCrlf2
+   if pEvent is "data" then
+      if sFsServed[pStream] is "true" then
+         exit qsFsStream
+      end if
+      put pData after sFsReq[pStream]
+      put the milliseconds into sFsTxDeadline[pStream]
+      if the number of bytes in sFsReq[pStream] > kFsMaxReq then
+         put "true" into sFsServed[pStream]
+         qsFsSendText pStream, "413 Payload Too Large", "text/plain; charset=utf-8", "Request too large."
+         exit qsFsStream
+      end if
+      put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tCrlf2
+      if sFsReq[pStream] contains tCrlf2 then
+         put "true" into sFsServed[pStream]
+         qsFsHandle pStream
+      end if
+   else if pEvent is "closed" or pEvent is "error" then
+      qsFsCleanup pStream
+   end if
+end qsFsStream
+
+command qsFsHandle pStream
+   local tHeaders
+   put qsFsParseReq(sFsReq[pStream]) into tHeaders
+   qsFsServePath pStream, tHeaders
+end qsFsHandle
+
+-- Parse the request into an array: __method / __path / __query, plus lowercased
+-- header names -> values. GET/HEAD have no body, so decoding the whole request as
+-- UTF-8 is safe. Save/restore the delimiters.
+function qsFsParseReq pData
+   local tText, tSaved, tSavedID, tReqLine, tResource, tI, tLine, tColon, tName, tValue, tOut
+   put textDecode(pData, "UTF-8") into tText
+   put the lineDelimiter into tSaved
+   put the itemDelimiter into tSavedID
+   set the lineDelimiter to (numToChar(13) & numToChar(10))
+   put line 1 of tText into tReqLine
+   put toUpper(word 1 of tReqLine) into tOut["__method"]
+   put word 2 of tReqLine into tResource
+   set the itemDelimiter to "?"
+   put item 1 of tResource into tOut["__path"]
+   if the number of items of tResource > 1 then
+      put item 2 to -1 of tResource into tOut["__query"]
+   end if
+   repeat with tI = 2 to the number of lines of tText
+      put line tI of tText into tLine
+      if tLine is empty then
+         next repeat
+      end if
+      put offset(":", tLine) into tColon
+      if tColon > 1 then
+         put toLower(qsTrim(char 1 to (tColon - 1) of tLine)) into tName
+         put qsTrim(char (tColon + 1) to -1 of tLine) into tValue
+         put tValue into tOut[tName]
+      end if
+   end repeat
+   set the lineDelimiter to tSaved
+   set the itemDelimiter to tSavedID
+   return tOut
+end qsFsParseReq
+
+-- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
+-- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
+command qsFsServePath pStream, pHeaders
+   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot
+   put pHeaders["__method"] into tMethod
+   if tMethod is not "GET" and tMethod is not "HEAD" then
+      qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
+      exit qsFsServePath
+   end if
+   put sActiveShare["root"] into tRoot
+   if tRoot is empty then
+      qsFsSendText pStream, "503 Service Unavailable", "text/plain; charset=utf-8", "No folder is being shared."
+      exit qsFsServePath
+   end if
+   put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
+   put urlDecode(tRaw) into tPath            -- real chars for disk mapping
+   if tPath is empty then
+      put "/" into tPath
+   end if
+   replace "\" with "/" in tPath
+   if tPath contains ".." then
+      qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
+      exit qsFsServePath
+   end if
+   put tRoot & tPath into tDisk
+   if there is a folder tDisk then
+      if the last char of tPath is not "/" then
+         qsFsSendRedirect pStream, (tRaw & "/")
+         exit qsFsServePath
+      end if
+      put tDisk & "index.html" into tIndex    -- tDisk ends with "/" here
+      if there is a file tIndex then
+         qsFsServeFile pStream, tIndex, "index.html", pHeaders
+      else
+         qsFsSendText pStream, "200 OK", "text/html; charset=utf-8", qsFsListing(tDisk, tPath)
+      end if
+      exit qsFsServePath
+   end if
+   if there is a file tDisk then
+      qsFsServeFile pStream, tDisk, tPath, pHeaders
+      exit qsFsServePath
+   end if
+   qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
+end qsFsServePath
+
+-- Serve a file: size it, honour a Range, write the HTTP head, then arm the pump. The
+-- file is NEVER read whole into memory.
+command qsFsServeFile pStream, pDisk, pForMime, pHeaders
+   local tSize, tRange, tStart, tEnd, tLen, tStatus, tHead, tCrlf, tType, tSavedID
+   put qsFileSize(pDisk) into tSize
+   if tSize is empty then
+      qsFsSendText pStream, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+      exit qsFsServeFile
+   end if
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put qsFsMime(pForMime) into tType
+   put qsFsParseRange(pHeaders["range"], tSize) into tRange
+   if tRange is "unsatisfiable" then
+      put ("HTTP/1.1 416 Range Not Satisfiable" & tCrlf & "Content-Range: bytes */" & tSize & tCrlf & \
+         "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+      oxWrite pStream, textEncode(tHead, "UTF-8")
+      oxCloseStream pStream
+      qsFsCleanup pStream
+      exit qsFsServeFile
+   end if
+   if tRange is empty then
+      put 0 into tStart
+      put (tSize - 1) into tEnd
+      put "200 OK" into tStatus
+   else
+      put the itemDelimiter into tSavedID
+      set the itemDelimiter to ","
+      put item 1 of tRange into tStart
+      put item 2 of tRange into tEnd
+      set the itemDelimiter to tSavedID
+      put "206 Partial Content" into tStatus
+   end if
+   put (tEnd - tStart + 1) into tLen
+   put ("HTTP/1.1 " & tStatus & tCrlf & "Content-Type: " & tType & tCrlf & \
+      "Accept-Ranges: bytes" & tCrlf & "Content-Length: " & tLen & tCrlf) into tHead
+   if tStatus begins with "206" then
+      put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
+   end if
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
+   oxWrite pStream, textEncode(tHead, "UTF-8")
+   if the result is not empty then
+      qsFsAbort pStream
+      exit qsFsServeFile
+   end if
+   put qsFsLeaf(pForMime) into sFsTxName[pStream]
+   qsLog "Serving " & quote & sFsTxName[pStream] & quote & " (" & qsBytes(tLen) & ") over Tor - " & tStatus
+   if pHeaders["__method"] is "HEAD" then
+      oxCloseStream pStream
+      qsFsCleanup pStream
+      exit qsFsServeFile
+   end if
+   put pDisk into sFsTxPath[pStream]
+   put tStart into sFsTxPos[pStream]
+   put tLen into sFsTxRemaining[pStream]
+   put the milliseconds into sFsTxDeadline[pStream]
+   send ("qsFsPump " & pStream) to me in kOnionPumpTick milliseconds
+end qsFsServeFile
+
+-- One slice per tick. The file is opened/seeked/read/closed within this single tick
+-- (no yield between), so concurrent downloads of the same file never share a cursor.
+-- No writability gate (the false-stall lesson): pace on the timer + oxWrite's error.
+command qsFsPump pStream
+   local tWant, tSlice, tErr
+   if sFsTxPath[pStream] is empty then
+      exit qsFsPump
+   end if
+   put kOnionChunk into tWant
+   if sFsTxRemaining[pStream] < tWant then
+      put sFsTxRemaining[pStream] into tWant
+   end if
+   if tWant <= 0 then
+      qsFsFinish pStream
+      exit qsFsPump
+   end if
+   open file sFsTxPath[pStream] for binary read
+   if the result is not empty then
+      qsFsAbort pStream
+      exit qsFsPump
+   end if
+   -- VERIFY (on-engine): `seek to N in file` sets the read cursor N bytes from the
+   -- START (0-based), so the next read returns bytes [N..].
+   seek to sFsTxPos[pStream] in file sFsTxPath[pStream]
+   read from file sFsTxPath[pStream] for tWant
+   put it into tSlice
+   try
+      close file sFsTxPath[pStream]
+   catch tErr
+   end try
+   if tSlice is empty then
+      qsFsFinish pStream
+      exit qsFsPump
+   end if
+   oxWrite pStream, tSlice
+   if the result is not empty then
+      qsFsAbort pStream
+      exit qsFsPump
+   end if
+   add (the number of bytes in tSlice) to sFsTxPos[pStream]
+   subtract (the number of bytes in tSlice) from sFsTxRemaining[pStream]
+   put the milliseconds into sFsTxDeadline[pStream]
+   send ("qsFsPump " & pStream) to me in kOnionPumpTick milliseconds
+end qsFsPump
+
+command qsFsFinish pStream
+   qsLog "Served " & quote & sFsTxName[pStream] & quote & " over Tor."
+   oxCloseStream pStream
+   qsFsCleanup pStream
+end qsFsFinish
+
+command qsFsSendText pStream, pStatus, pType, pBody
+   local tData, tHead, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put textEncode(pBody, "UTF-8") into tData
+   put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
+      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
+   oxCloseStream pStream
+   qsFsCleanup pStream
+end qsFsSendText
+
+command qsFsSendRedirect pStream, pLocation
+   local tHead, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put ("HTTP/1.1 301 Moved Permanently" & tCrlf & "Location: " & pLocation & tCrlf & \
+      "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   oxWrite pStream, textEncode(tHead, "UTF-8")
+   oxCloseStream pStream
+   qsFsCleanup pStream
+end qsFsSendRedirect
+
+command qsFsCleanup pStream
+   delete variable sFsReq[pStream]
+   delete variable sFsServed[pStream]
+   delete variable sFsTxPath[pStream]
+   delete variable sFsTxPos[pStream]
+   delete variable sFsTxRemaining[pStream]
+   delete variable sFsTxName[pStream]
+   delete variable sFsTxDeadline[pStream]
+end qsFsCleanup
+
+command qsFsAbort pStream
+   oxCloseStream pStream
+   qsFsCleanup pStream
+end qsFsAbort
+
+-- Idle watchdog per connection. No-ops once the connection is done/cleaned.
+command qsFsWatchdog pStream
+   if sFsReq[pStream] is empty and sFsTxPath[pStream] is empty then
+      exit qsFsWatchdog
+   end if
+   if (the milliseconds - sFsTxDeadline[pStream]) > kOnionSendTimeout then
+      qsFsAbort pStream
+      exit qsFsWatchdog
+   end if
+   send ("qsFsWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end qsFsWatchdog
+
+-- Build the directory-listing page. Uses `the files` / `the folders` (portable;
+-- `the detailedFiles` is a compile-time "bad factor" on some OXT engines). Names are
+-- HTML-escaped and path-encoded; links are relative so a subfolder browses in.
+-- Per-file sizes are omitted (OXT has no cheap size call - sizing every file would
+-- read each one just to draw a page); the size is in each file's Content-Length.
+function qsFsListing pDiskFolder, pUrlPath
+   local tSaved, tFiles, tFolders, tName, tOut, tCount
+   put the defaultFolder into tSaved
+   set the defaultFolder to pDiskFolder
+   put the files into tFiles
+   put the folders into tFolders
+   set the defaultFolder to tSaved
+   put qsFsPageTop("Index of " & qsFsHtmlEscape(pUrlPath)) into tOut
+   put "<h1>Index of " & qsFsHtmlEscape(pUrlPath) & "</h1><ul class='fl'>" after tOut
+   if pUrlPath is not "/" then
+      put "<li class='up'><a href='../'>.. (up a level)</a></li>" after tOut
+   end if
+   put 0 into tCount
+   repeat for each line tName in tFolders
+      if tName is "." or tName is ".." then
+         next repeat
+      end if
+      put "<li class='dir'><a href='" & qsFsPathEncode(tName) & "/'>" & qsFsHtmlEscape(tName) & "/</a></li>" after tOut
+      add 1 to tCount
+   end repeat
+   repeat for each line tName in tFiles
+      if tName is empty then
+         next repeat
+      end if
+      put "<li class='file'><a href='" & qsFsPathEncode(tName) & "'>" & qsFsHtmlEscape(tName) & "</a></li>" after tOut
+      add 1 to tCount
+   end repeat
+   put "</ul><p class='muted'>" & tCount & " item(s) - shared anonymously over Tor. Downloads resume if interrupted.</p>" after tOut
+   put qsFsPageBottom() after tOut
+   return tOut
+end qsFsListing
+
+function qsFsNotFound pPath
+   return qsFsPageTop("Not found") & "<h1>Not found</h1><p class='muted'>There is nothing at " & \
+      qsFsHtmlEscape(pPath) & " in this share.</p><p><a href='/'>Back to the top</a></p>" & qsFsPageBottom()
+end qsFsNotFound
+
+-- Shared page chrome. Single-quoted HTML attributes so the string literals never
+-- contain a double quote. Light + dark, mobile-friendly, no external assets.
+function qsFsPageTop pTitle
+   return ("<!doctype html><html><head><meta charset='utf-8'>" & \
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>" & \
+      "<title>" & pTitle & "</title><style>" & \
+      "body{font-family:system-ui,-apple-system,sans-serif;max-width:46em;margin:2.4em auto;padding:0 1.1em;color:#1c2430;background:#fff}" & \
+      "h1{font-size:1.25em;border-bottom:1px solid #e5e8ee;padding-bottom:.4em}" & \
+      "ul.fl{list-style:none;padding:0;margin:1em 0}ul.fl li{padding:.34em .2em;border-bottom:1px solid #f0f2f6}" & \
+      "ul.fl li.dir a{font-weight:600}a{color:#2c5aa0;text-decoration:none}a:hover{text-decoration:underline}" & \
+      ".muted{color:#8a909a;font-size:.9em}" & \
+      "@media(prefers-color-scheme:dark){body{background:#12151a;color:#dfe4ea}h1{border-color:#2a2f38}" & \
+      "ul.fl li{border-color:#20242c}a{color:#7ea6e0}.muted{color:#828a96}}" & \
+      "</style></head><body>")
+end qsFsPageTop
+
+function qsFsPageBottom
+   return "</body></html>"
+end qsFsPageBottom
+
+-- The leaf (basename) of a path, for the log.
+function qsFsLeaf pPath
+   local tOut, tSavedID
+   put pPath into tOut
+   replace "\" with "/" in tOut
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   put the last item of tOut into tOut
+   set the itemDelimiter to tSavedID
+   return tOut
+end qsFsLeaf
+
+-- Parse a single HTTP byte-range against a known total. Returns "start,end"
+-- (inclusive, 0-based), "" (no/ignored range -> whole file), or "unsatisfiable"
+-- (valid but out of bounds -> 416). Matches tests/fileserver_golden.py.
+function qsFsParseRange pRange, pTotal
+   local tSpec, tStart, tEnd, tSavedID
+   if pRange is empty then
+      return ""
+   end if
+   if pRange does not begin with "bytes=" then
+      return ""
+   end if
+   put char 7 to -1 of pRange into tSpec       -- after "bytes="
+   if tSpec contains "," then
+      return ""                                 -- multi-range: serve the whole file
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "-"
+   put item 1 of tSpec into tStart
+   put item 2 of tSpec into tEnd
+   set the itemDelimiter to tSavedID
+   if tStart is empty then
+      if tEnd is empty or tEnd is not an integer then
+         return "unsatisfiable"
+      end if
+      put (pTotal - tEnd) into tStart
+      if tStart < 0 then
+         put 0 into tStart
+      end if
+      put (pTotal - 1) into tEnd
+   else
+      if tStart is not an integer then
+         return "unsatisfiable"
+      end if
+      if tEnd is empty then
+         put (pTotal - 1) into tEnd
+      else if tEnd is not an integer then
+         return "unsatisfiable"
+      end if
+   end if
+   if tStart > tEnd or tStart < 0 or tStart >= pTotal then
+      return "unsatisfiable"
+   end if
+   if tEnd >= pTotal then
+      put (pTotal - 1) into tEnd
+   end if
+   return tStart & "," & tEnd
+end qsFsParseRange
+
+-- Map a file extension to a MIME type. Unknown -> octet-stream (the browser
+-- downloads it); known media/text/image types render inline.
+function qsFsMime pPath
+   local tSavedID, tExtn
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "."
+   put toLower(the last item of pPath) into tExtn
+   set the itemDelimiter to tSavedID
+   if tExtn is "html" or tExtn is "htm" then
+      return "text/html; charset=utf-8"
+   else if tExtn is "css" then
+      return "text/css; charset=utf-8"
+   else if tExtn is "js" then
+      return "application/javascript; charset=utf-8"
+   else if tExtn is "json" then
+      return "application/json; charset=utf-8"
+   else if tExtn is "txt" or tExtn is "md" or tExtn is "log" then
+      return "text/plain; charset=utf-8"
+   else if tExtn is "png" then
+      return "image/png"
+   else if tExtn is "jpg" or tExtn is "jpeg" then
+      return "image/jpeg"
+   else if tExtn is "gif" then
+      return "image/gif"
+   else if tExtn is "webp" then
+      return "image/webp"
+   else if tExtn is "svg" then
+      return "image/svg+xml"
+   else if tExtn is "ico" then
+      return "image/x-icon"
+   else if tExtn is "pdf" then
+      return "application/pdf"
+   else if tExtn is "mp4" or tExtn is "m4v" then
+      return "video/mp4"
+   else if tExtn is "webm" then
+      return "video/webm"
+   else if tExtn is "mp3" then
+      return "audio/mpeg"
+   else if tExtn is "ogg" or tExtn is "oga" then
+      return "audio/ogg"
+   else if tExtn is "wav" then
+      return "audio/wav"
+   else if tExtn is "zip" then
+      return "application/zip"
+   end if
+   return "application/octet-stream"
+end qsFsMime
+
+-- Encode a name for a URL PATH segment ("+" -> "%20" so a space is a path space).
+function qsFsPathEncode pName
+   local tEnc
+   put urlEncode(pName) into tEnc
+   replace "+" with "%20" in tEnc
+   return tEnc
+end qsFsPathEncode
+
+-- Escape a value for HTML so a crafted file name cannot inject markup ("&" first).
+function qsFsHtmlEscape pText
+   local tOut
+   put pText into tOut
+   replace "&" with "&amp;" in tOut
+   replace "<" with "&lt;" in tOut
+   replace ">" with "&gt;" in tOut
+   replace quote with "&quot;" in tOut
+   replace "'" with "&#39;" in tOut
+   return tOut
+end qsFsHtmlEscape
 
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
