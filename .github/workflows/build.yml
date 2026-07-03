@@ -64,8 +64,16 @@ jobs:
           python-version: "3.x"
       - name: check-livecodescript
         run: python3 tools/check-livecodescript.py
-      - name: record golden test
-        run: python3 tests/record_golden_test.py
+      - name: golden tests (every tests/*_golden*.py)
+        run: |
+          # Run ALL pure-Python golden references, not a hardcoded one, so a newly
+          # added golden (record, bep44, onion frame, file server, ...) is enforced
+          # automatically instead of silently skipped.
+          shopt -s nullglob
+          for t in tests/*_golden*.py; do
+            echo "== $t =="
+            python3 "$t" || exit 1
+          done
       - name: record-registry cross-check (if present)
         run: |
           if [ -f tools/check-record-registry.py ]; then
