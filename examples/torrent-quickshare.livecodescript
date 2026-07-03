@@ -859,12 +859,14 @@ command qsHandleEvent pEvent
          qsRefreshXfers
          break
       case "externalIp"
-         -- libtorrent discovered our public IP; if a web share is live, the internet
-         -- link can now be shown (UPnP/NAT-PMP path).
+         -- libtorrent discovered our public IP; if a web share is live AND the router
+         -- port was mapped, the internet link becomes usable (qsCwShowLinks gates it).
          put pEvent["externalIp"] into sCwExtIp
          if sCwActive is "true" then
             qsCwShowLinks
-            qsLog "Your internet address is " & pEvent["externalIp"] & " - the internet link is ready above (works if your router opened the port)."
+            if sCwMapId is not 0 then
+               qsLog "Your internet address is " & pEvent["externalIp"] & " - the internet link is ready above."
+            end if
          end if
          break
       case "portMapped"
@@ -2453,12 +2455,20 @@ command qsStartClearweb pPath, pName
    put 0 into sCwMapId
    put empty into sCwExtIp
    put qsLanIp() into sCwLanIp
-   -- ask the router to open the port automatically (UPnP / NAT-PMP via libtorrent).
-   -- Best-effort: a portMapped / portMapError / externalIp event arrives later through
-   -- the poll loop (qsHandleEvent) and updates the internet link.
-   put btMapPort(sSession, tPort, tPort, true) into sCwMapId
+   -- Ask the router to open the port automatically (UPnP / NAT-PMP via libtorrent).
+   -- Best-effort and NON-FATAL: this is only for the INTERNET link - the LAN link
+   -- works without it - so any failure (an older native library without the port-map
+   -- ABI, UPnP off, no mapper) must never break the share. Wrap it so a throw or a 0
+   -- both just mean "no automatic internet link". A portMapped / portMapError /
+   -- externalIp event arrives later through the poll loop and fills in the link.
+   put 0 into sCwMapId
+   try
+      put btMapPort(sSession, tPort, tPort, true) into sCwMapId
+   catch tErr
+      put 0 into sCwMapId
+   end try
    if sCwMapId is 0 then
-      qsLog "Automatic router port-opening is unavailable (" & btLastError() & "). The local-network link works now; for the internet link you may need to forward port " & tPort & " manually, or use Tor."
+      qsLog "No automatic internet link (router port-opening unavailable on this setup). The local-network link above works now; to share over the internet, forward port " & tPort & " to this computer, or use the Tor option."
    end if
    qsCwShowLinks
    set the text of field "qsSharing" to ("Sharing " & quote & sCwName & quote & " on the web - keep this window open. Anyone with the link can download it in a browser (no app needed); your IP is visible and it is not encrypted.")
@@ -2836,7 +2846,9 @@ command qsCwShowLinks
    if sCwLanIp is not empty then
       put ("http://" & sCwLanIp & ":" & sCwPort & tPath) into tLan
    end if
-   if sCwExtIp is not empty then
+   -- only advertise the internet link when the router port is actually mapped, so we
+   -- never hand out an address that would just time out (public IP but a closed port)
+   if sCwExtIp is not empty and sCwMapId is not 0 then
       put ("http://" & sCwExtIp & ":" & sCwPort & tPath) into tWan
    end if
    if tWan is not empty then
