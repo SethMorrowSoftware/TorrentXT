@@ -2,14 +2,16 @@
 
 Five self-contained demo apps and one reusable helper, all written in pure xTalk on
 top of the **TorrentXT** extension. Each demo is a single stack script: you paste it
-into a stack, reopen the stack, and it builds its own UI and starts a BitTorrent
-session automatically. No helper stacks, no manual layout.
+into a stack, reopen the stack, and it builds its own UI and starts automatically (a
+BitTorrent session, or - for the Onion File Server - a Tor connection). No helper
+stacks, no manual layout.
 
 ## What is here
 
 | File | What it is | Needs cryptoXT? |
 |------|------------|-----------------|
-| `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. | Only for the optional passphrase lock |
+| `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you (optionally anonymously over Tor). | Only for the optional passphrase lock |
+| `torrent-onion-fileserver.livecodescript` | Share a whole **folder** over Tor as a browsable web page: pick a folder, get a private `.onion` link, open it in Tor Browser to browse and download with resumable, seekable downloads. | No (needs OnionXT + a local Tor daemon) |
 | `torrent-client.livecodescript` | A full multi-torrent client: add magnets / `.torrent` files / URLs, seed a folder, and manage many torrents with a live Files / Peers / Trackers / Log inspector. | No |
 | `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). | Only for private (passphrase) channels |
 | `torrent-rp1-chat.livecodescript` | A two-machine **messaging** demo: two peers meet on a shared "room" id and chat directly over the `rp1` peer-wire extension, with no tracker, no server, and no file transfer at all. | No |
@@ -31,6 +33,12 @@ peer-to-peer messaging (a different paradigm: no files, just live messages).
    channels in the channels demo, and the passphrase lock in quickshare and on your
    channel identity). Its library id is `org.openxtalk.library.sodium`. Everything
    except those encryption features works without it.
+4. **(For the Onion File Server, and quickshare's optional Tor mode) Install
+   OnionXT** (library id `org.openxtalk.library.onion`, which itself needs cryptoXT)
+   and run a **local Tor daemon** with the control port enabled - a system tor on
+   `127.0.0.1:9051`, or Tor Browser on `9151`. These demos detect all of this and
+   fail closed with a clear message when it is missing; the rest of TorrentXT is
+   unaffected.
 
 ## Running any demo
 
@@ -60,6 +68,28 @@ the whole file.
 Optional: type a **passphrase** before dropping the file (needs cryptoXT) and the
 share is encrypted end to end. The code carries a verifier, so a wrong passphrase is
 caught instantly with no wasted download.
+
+### Onion File Server (`torrent-onion-fileserver.livecodescript`)
+The companion to Quick Share: instead of sending one file by a code, it serves a
+whole **folder** to a plain web browser over Tor. Click **Start**, wait for the pill
+to read `ready`, click **Share Folder** and pick a folder; when it says REACHABLE,
+open the printed `http://<address>.onion/` in **Tor Browser** to browse the folder
+(subfolders included) and download any file. There is no web server to install, no
+hosting account, and no port forwarding - the server's IP address stays hidden by
+Tor, and so does each visitor's.
+
+It reuses Quick Share's proven serve path (the chunked send pump, the OnionXT accept
+loop) and generalises it from one file to a directory tree, adding two things a naive
+folder server lacks: files are **streamed** in 64 KiB slices (a multi-GB file never
+loads into memory), and downloads support **HTTP Range**, so a Tor-interrupted
+transfer resumes instead of restarting and audio/video seeks in the browser. There is
+no passphrase here: a browser cannot decrypt, so a browsable share is cleartext *over*
+the onion (the onion transport is the privacy). For an encrypted, verified one-file
+transfer, use Quick Share with a passphrase.
+
+This demo needs the **OnionXT** extension (and its SodiumXT dependency) and a **local
+Tor daemon** with the control port enabled (`127.0.0.1:9051`, or Tor Browser's
+`9151`); it does not use the TorrentXT swarm at all.
 
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
