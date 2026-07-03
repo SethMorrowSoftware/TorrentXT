@@ -42,7 +42,7 @@ metadata title is "TorrentXT"
 -- ===================================================================== --
 
 -- Must equal BTX_ABI_VERSION in src/btx_abi.h; _checkABI() throws on skew.
-constant kABIVersion is 10
+constant kABIVersion is 11
 
 -- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
 -- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
@@ -124,6 +124,9 @@ constant kFieldEvtInfoHashV1 is 70
 constant kFieldEvtInfoHashV2 is 71
 constant kFieldEvtName is 72
 constant kFieldEvtEndpoint is 73
+constant kFieldEvtExternalIp is 74
+constant kFieldEvtMapExternalPort is 75
+constant kFieldEvtMapTransport is 76
 constant kFieldDhtNodes is 100
 constant kFieldDhtNodeCache is 101
 constant kFieldDhtGlobalNodes is 102
@@ -189,6 +192,9 @@ constant kAlertRp1PeerConnected is 26
 constant kAlertRp1Handshake is 27
 constant kAlertRp1Message is 28
 constant kAlertRp1PeerDisconnected is 29
+constant kAlertPortMapped is 30
+constant kAlertPortMapError is 31
+constant kAlertExternalIp is 32
 
 -- ===================================================================== --
 --  Module state: the reusable poll/status buffers
@@ -292,6 +298,8 @@ private foreign handler _btx_dht_get_immutable(in pS as CInt, in pTarget as ZStr
 private foreign handler _btx_dht_put_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSec as ZStringUTF8, in pSalt as ZStringUTF8, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:torrentxt>btx_dht_put_mutable!cdecl"
 private foreign handler _btx_dht_get_mutable(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_mutable!cdecl"
 private foreign handler _btx_dht_get_peers(in pS as CInt, in pId as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_get_peers!cdecl"
+private foreign handler _btx_add_port_mapping(in pS as CInt, in pExternalPort as CInt, in pLocalPort as CInt, in pIsTcp as CInt) returns CInt binds to "c:torrentxt>btx_add_port_mapping!cdecl"
+private foreign handler _btx_delete_port_mapping(in pS as CInt, in pMappingId as CInt) returns CInt binds to "c:torrentxt>btx_delete_port_mapping!cdecl"
 private foreign handler _btx_dht_bep44_signbuf(in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:torrentxt>btx_dht_bep44_signbuf!cdecl"
 private foreign handler _btx_dht_put_signed(in pS as CInt, in pPub as ZStringUTF8, in pSalt as ZStringUTF8, in pSeq as ZStringUTF8, in pValue as Pointer, in pLen as CInt, in pSig as ZStringUTF8) returns CInt binds to "c:torrentxt>btx_dht_put_signed!cdecl"
 
@@ -616,6 +624,12 @@ private handler _fieldKey(in pId as Integer) returns String
       return "source"
    else if pId is kFieldUrlSeed then
       return "urlSeed"
+   else if pId is kFieldEvtExternalIp then
+      return "externalIp"
+   else if pId is kFieldEvtMapExternalPort then
+      return "externalPort"
+   else if pId is kFieldEvtMapTransport then
+      return "transport"
    else
       return ""
    end if
@@ -682,6 +696,12 @@ private handler _alertName(in pCode as Integer) returns String
       return "rp1Message"
    else if pCode is kAlertRp1PeerDisconnected then
       return "rp1PeerDisconnected"
+   else if pCode is kAlertPortMapped then
+      return "portMapped"
+   else if pCode is kAlertPortMapError then
+      return "portMapError"
+   else if pCode is kAlertExternalIp then
+      return "externalIp"
    else
       return "torrentEvent"
    end if
@@ -905,6 +925,38 @@ public handler btDhtGetPeers(in pSession as Integer, in pId as String) returns I
    variable tR as Integer
    unsafe
       put _btx_dht_get_peers(pSession, pId) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Ask the router (UPnP / NAT-PMP) to open pExternalPort and forward it to
+-- pLocalPort on THIS machine, so a plain browser can reach a local server with
+-- no manual port forwarding. pIsTcp true = TCP (use it for an HTTP server).
+-- Returns a mapping id (> 0) to pass to btUnmapPort, or 0 if no mapper is active
+-- (UPnP/NAT-PMP off) or the port is bad. The ACTUAL external port a router
+-- assigns (it may differ from what you asked for) and which mapper won arrive
+-- later as a "portMapped" event (fields externalPort, transport); a failure
+-- arrives as "portMapError", and the machine's external IP as an "externalIp"
+-- event. NOTE: this is the CLEAR-WEB path - the IP is public, so it is NOT
+-- anonymous (use the Tor onion path for that).
+public handler btMapPort(in pSession as Integer, in pExternalPort as Integer, in pLocalPort as Integer, in pIsTcp as Boolean) returns Integer
+   variable tR as Integer
+   variable tTcp as Integer
+   put 0 into tTcp
+   if pIsTcp then
+      put 1 into tTcp
+   end if
+   unsafe
+      put _btx_add_port_mapping(pSession, pExternalPort, pLocalPort, tTcp) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Withdraw a mapping created by btMapPort (idempotent; a stale id is a no-op).
+public handler btUnmapPort(in pSession as Integer, in pMappingId as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _btx_delete_port_mapping(pSession, pMappingId) into tR
    end unsafe
    return tR
 end handler

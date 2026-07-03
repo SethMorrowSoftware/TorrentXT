@@ -138,6 +138,10 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_dht_announce(h,
               "0123456789abcdef0123456789abcdef01234567", 6881) < 0);
 
+        /* --- ABI v11 port mapping on a bogus SESSION handle --- */
+        CHECK(btx_add_port_mapping(h, 8080, 8080, 1) == 0);  /* handle-getter: 0 */
+        CHECK(btx_delete_port_mapping(h, 1) < 0);            /* action: error code */
+
         /* --- ABI v8 filtering / streaming / extended add on a bogus handle --- */
         CHECK(btx_ip_filter_add(h, "1.2.3.0", "1.2.3.255", 1) < 0);
         CHECK(btx_ip_filter_clear(h) < 0);
@@ -670,6 +674,32 @@ static void test_rp1() {
     CHECK(btx::test::live_session_count() == 0);
 }
 
+/* =========================================================================
+ *  ABI v11 — UPnP/NAT-PMP port mapping requests are handle-safe and validated
+ * ========================================================================= */
+static void test_port_mapping() {
+    int s = btx_session_new();
+    CHECK(s > 0);
+
+    /* Bad ports are rejected (return 0, not a crash) on a LIVE session. */
+    CHECK(btx_add_port_mapping(s, 0, 8080, 1) == 0);
+    CHECK(btx_add_port_mapping(s, 8080, 70000, 1) == 0);
+
+    /* A real request: UPnP + NAT-PMP are on by default, so add_port_mapping
+     * returns at least one mapper handle even with no router present. It must be a
+     * valid id (>= 0), never a crash; the ACTUAL external port arrives later as a
+     * portMapped alert (not observable here without a live router). */
+    int mid = btx_add_port_mapping(s, 8080, 8080, 1);
+    CHECK(mid >= 0);
+    if (mid > 0) {
+        CHECK(btx_delete_port_mapping(s, mid) == BTX_OK);
+    }
+    /* Deleting a stale id is a clean no-op (BTX_OK), never a crash. */
+    CHECK(btx_delete_port_mapping(s, 999999) == BTX_OK);
+
+    btx_session_free(s);
+}
+
 int main() {
     test_session_lifecycle();
     test_bogus_handles_are_noops();
@@ -681,6 +711,7 @@ int main() {
     test_drain_oversized_makes_progress();
     test_dht_bep44();
     test_rp1();
+    test_port_mapping();
 
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

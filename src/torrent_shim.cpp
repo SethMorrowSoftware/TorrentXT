@@ -149,6 +149,10 @@ struct PendingAlert {
     bool hasDhtAuthoritative = false; long long dhtAuthoritative = 0;
     bool hasDhtNumSuccess = false;    long long dhtNumSuccess = 0;
     bool hasDhtPeers = false;         std::string dhtPeers;  /* newline "ip:port" */
+    /* ---- connectivity (A_PORT_MAPPED / A_PORT_MAP_ERROR / A_EXTERNAL_IP) ---- */
+    bool hasExternalIp = false;       std::string externalIp;
+    bool hasMapExternalPort = false;  long long mapExternalPort = 0;
+    bool hasMapTransport = false;     std::string mapTransport;  /* "upnp" / "natpmp" */
 };
 
 /* ====================================================================== *
@@ -501,6 +505,12 @@ struct SessionState {
     long long dhtNodeCache   = 0;
     long long dhtTorrents    = 0;
     long long dhtGlobalNodes = 0;
+
+    /* UPnP/NAT-PMP mappings requested via btx_add_port_mapping, keyed by the small
+     * int id we hand script (so btx_delete_port_mapping can withdraw them). One
+     * request yields one handle per active mapper (UPnP + NAT-PMP). */
+    int nextMappingId = 1;
+    std::unordered_map<int, std::vector<lt::port_mapping_t>> portMappings;
 };
 
 /* The two handle tables (plan §5: one for sessions, one for torrents). Sessions
@@ -716,6 +726,7 @@ extern "C" BTX_API int BTX_CALL btx_session_new(void) {
             | lt::alert_category::tracker
             | lt::alert_category::dht
             | lt::alert_category::stats          /* session_stats_alert -> DHT counts */
+            | lt::alert_category::port_mapping   /* portmap_alert -> external port opened */
             | lt::alert_category::performance_warning;
         sp.set_int(lt::settings_pack::alert_mask, mask);
 
@@ -2187,6 +2198,38 @@ bool extract_alert(SessionState *st, lt::alert *a, PendingAlert &out) {
         out.hasDhtPeers = true; out.dhtPeers = std::move(joined);
         return true;
     }
+    if (auto *p = lt::alert_cast<lt::portmap_alert>(a)) {
+        /* A router (UPnP or NAT-PMP) opened a port for us. external_port may differ
+         * from the one we asked for, so report the ACTUAL one; map_transport says
+         * which mapper won. This is how a clear-web server becomes reachable with
+         * no manual port forwarding. */
+        out.type = btx::A_PORT_MAPPED;
+        out.hasMapExternalPort = true;
+        out.mapExternalPort = static_cast<long long>(p->external_port);
+        out.hasMapTransport = true;
+        out.mapTransport =
+            (p->map_transport == lt::portmap_transport::natpmp) ? "natpmp" : "upnp";
+        out.hasMessage = true; out.message = p->message();
+        return true;
+    }
+    if (auto *p = lt::alert_cast<lt::portmap_error_alert>(a)) {
+        out.type = btx::A_PORT_MAP_ERROR;
+        out.hasMapTransport = true;
+        out.mapTransport =
+            (p->map_transport == lt::portmap_transport::natpmp) ? "natpmp" : "upnp";
+        out.hasErrorCode = true;    out.errorCode = p->error.value();
+        out.hasErrorMessage = true; out.errorMessage = p->error.message();
+        out.hasMessage = true;      out.message = p->message();
+        return true;
+    }
+    if (auto *p = lt::alert_cast<lt::external_ip_alert>(a)) {
+        /* libtorrent learned this machine's external IP (from a UPnP router or from
+         * peers). The clear-web URL is http://<this ip>:<mapped port>/. */
+        out.type = btx::A_EXTERNAL_IP;
+        out.hasExternalIp = true;
+        out.externalIp = p->external_address.to_string();
+        return true;
+    }
 
     /* Unmapped alert: not surfaced. The broad alert_mask still lets a few
      * uninteresting categories through; we drop them HERE (not at the queue) so
@@ -2237,6 +2280,9 @@ void write_alert_entry(btx::RecordWriter &rw, const PendingAlert &pa) {
         if (pa.hasDhtAuthoritative) r.put_int(btx::F_DHT_AUTHORITATIVE, pa.dhtAuthoritative);
         if (pa.hasDhtNumSuccess)    r.put_int(btx::F_DHT_NUM_SUCCESS, pa.dhtNumSuccess);
         if (pa.hasDhtPeers)         r.put_str(btx::F_DHT_PEERS, pa.dhtPeers);
+        if (pa.hasExternalIp)       r.put_str(btx::F_EVT_EXTERNAL_IP, pa.externalIp);
+        if (pa.hasMapExternalPort)  r.put_int(btx::F_EVT_MAP_EXTERNAL_PORT, pa.mapExternalPort);
+        if (pa.hasMapTransport)     r.put_str(btx::F_EVT_MAP_TRANSPORT, pa.mapTransport);
         r.finish();
     }
     rw.patch_u16(bodyAt, static_cast<uint16_t>(rw.pos() - bodyStart));
@@ -2368,6 +2414,49 @@ extern "C" BTX_API int BTX_CALL btx_dht_add_bootstrap(int s, const char *host,
         /* add_dht_node takes a (host, port) pair; libtorrent resolves it on its
          * own threads. A bad host surfaces later as a (non-fatal) DHT alert. */
         st->ses->add_dht_node({host, port});
+        return BTX_OK;
+    });
+}
+
+/* ---- UPnP / NAT-PMP port mapping ------------------------------------------
+ * Reuse libtorrent's router-mapping machinery so a clear-web local server is
+ * reachable without manual port forwarding. add_port_mapping asks every active
+ * mapper (UPnP + NAT-PMP) to open the port; the REAL external port + which
+ * mapper won arrive asynchronously as an A_PORT_MAPPED / A_PORT_MAP_ERROR alert
+ * on the drain, so this call just returns an id we can delete by later. */
+extern "C" BTX_API int BTX_CALL btx_add_port_mapping(int s, int externalPort,
+                                                     int localPort, int isTcp) {
+    BTX_GUARD_INT({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return 0; }
+        if (externalPort <= 0 || externalPort > 65535 ||
+            localPort <= 0 || localPort > 65535) {
+            set_error("bad port for mapping (1..65535)"); return 0;
+        }
+        lt::portmap_protocol proto =
+            isTcp ? lt::portmap_protocol::tcp : lt::portmap_protocol::udp;
+        std::vector<lt::port_mapping_t> handles =
+            st->ses->add_port_mapping(proto, externalPort, localPort);
+        if (handles.empty()) {
+            set_error("no port-mapper active (UPnP/NAT-PMP disabled or unavailable)");
+            return 0;
+        }
+        int id = st->nextMappingId++;
+        st->portMappings.emplace(id, std::move(handles));
+        return id;   /* > 0 mapping id; the assigned external port comes via the alert */
+    });
+}
+
+extern "C" BTX_API int BTX_CALL btx_delete_port_mapping(int s, int mappingId) {
+    BTX_GUARD_ACTION({
+        SessionState *st = session_for(s);
+        if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
+        auto it = st->portMappings.find(mappingId);
+        if (it == st->portMappings.end()) return BTX_OK;  /* stale id: harmless no-op */
+        for (lt::port_mapping_t h : it->second) {
+            st->ses->delete_port_mapping(h);
+        }
+        st->portMappings.erase(it);
         return BTX_OK;
     });
 }
