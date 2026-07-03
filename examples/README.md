@@ -97,6 +97,21 @@ internet link and tells you the single port to **forward manually**; if you are 
 internet link isn't possible at all and it points you to Tor. The local-network link
 always works regardless.
 
+**Host a web app.** Any of the folder-serving modes (Tor or direct web link) is a real
+static web host. If the folder has an **`index.html`**, it is served as a website's home
+page; other files (`css`, `js`, `wasm`, ES modules, fonts, images, source maps, ...) are
+served with correct MIME types, with **HTTP Range** so media streams and seeks. A
+**single-page app** works automatically: an unresolved path that looks like a client-side
+route (no file extension) falls back to `index.html` so the app's own router takes over,
+while a genuinely missing asset still returns 404. Two things to know:
+- The **Tor `.onion`** path is the best home for an app: it serves at the root, and Tor
+  Browser treats an onion as a **secure context**, so features that need HTTPS (service
+  workers, some Web APIs) work. Plain `http://` over the direct web link is *not* a secure
+  context, so those features are blocked there.
+- Over the **direct web link** the app lives under `http://<ip>:<port>/<token>/`, so build
+  it with **relative** asset paths (or a matching base) - absolute paths like `/app.js`
+  resolve above the token and 404. Over Tor (served at the root) absolute paths are fine.
+
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
 `.torrent` path, or a 40-hex info-hash into the Add box (or drag one onto the

@@ -16,6 +16,7 @@ Mirrors these LiveCodeScript handlers:
   qsFsMime        -> mime()
   qsFsHtmlEscape  -> html_escape()
   qsCwServe       -> capability_route() (clearweb: the /<token>/ capability gate)
+  qsSiteSpaTarget -> spa_is_route()     (SPA fallback: a route vs a missing asset)
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
@@ -113,6 +114,13 @@ _MIME = {
     "mp4": "video/mp4", "m4v": "video/mp4", "webm": "video/webm",
     "mp3": "audio/mpeg", "ogg": "audio/ogg", "oga": "audio/ogg", "wav": "audio/wav",
     "zip": "application/zip",
+    # web-app essentials
+    "wasm": "application/wasm", "mjs": "application/javascript; charset=utf-8",
+    "xml": "application/xml; charset=utf-8", "map": "application/json; charset=utf-8",
+    "webmanifest": "application/manifest+json",
+    "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "otf": "font/otf",
+    "eot": "application/vnd.ms-fontobject", "avif": "image/avif",
+    "csv": "text/csv; charset=utf-8",
 }
 
 
@@ -132,6 +140,17 @@ def html_escape(text):
     out = out.replace('"', "&quot;")
     out = out.replace("'", "&#39;")
     return out
+
+
+# ---- qsSiteSpaTarget: the SPA route-vs-asset heuristic ----------------------
+
+def spa_is_route(rel_path):
+    """Mirror qsSiteSpaTarget's route-vs-asset heuristic (the part independent of the
+    filesystem): the last '/' segment with NO '.' looks like a client-side route (fall
+    back to index.html); a segment WITH a '.' looks like a missing asset (real 404).
+    The caller separately requires a root index.html to exist before falling back."""
+    leaf = rel_path.replace("\\", "/").split("/")[-1]
+    return "." not in leaf
 
 
 # ---- qsCwServe: the clearweb /<token>/ capability gate ----------------------
@@ -207,6 +226,18 @@ def main():
         ("data.bin", "application/octet-stream"),
         ("noextension", "application/octet-stream"),
         ("a.tar.gz", "application/octet-stream"),   # only the final ext is looked up
+        ("app.wasm", "application/wasm"),           # web-app essentials
+        ("module.mjs", "application/javascript; charset=utf-8"),
+        ("feed.xml", "application/xml; charset=utf-8"),
+        ("bundle.js.map", "application/json; charset=utf-8"),
+        ("site.webmanifest", "application/manifest+json"),
+        ("f.woff", "font/woff"),
+        ("font.WOFF2", "font/woff2"),
+        ("f.ttf", "font/ttf"),
+        ("f.otf", "font/otf"),
+        ("f.eot", "application/vnd.ms-fontobject"),
+        ("pic.avif", "image/avif"),
+        ("data.csv", "text/csv; charset=utf-8"),
     ]:
         check("mime(%r)" % path, mime(path), want)
 
@@ -232,10 +263,25 @@ def main():
     ]:
         check("capability_route(%r)" % path, capability_route(path, tok), want)
 
+    # -- SPA fallback: is an unresolved path a client-side route or a missing asset? --
+    for path, want in [
+        ("/dashboard", True),                      # a route -> index.html
+        ("/users/42", True),
+        ("/deep/route/here", True),
+        ("/", True),                               # empty leaf -> route (resolves anyway)
+        ("/a.b/c", True),                          # dot is in a PARENT segment, not the leaf
+        ("/app.js", False),                        # a missing asset -> real 404
+        ("/assets/logo.png", False),
+        ("/favicon.ico", False),
+        ("/a/b.min.js", False),
+        ("/style.css", False),
+    ]:
+        check("spa_is_route(%r)" % path, spa_is_route(path), want)
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
-    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, capability gate all match)")
+    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, capability gate, SPA fallback all match)")
     return 0
 
 

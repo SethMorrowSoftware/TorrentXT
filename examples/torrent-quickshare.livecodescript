@@ -159,7 +159,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-10"
+constant kQsUiVersion = "qs-ui-2026-11"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -282,7 +282,7 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file or folder here to share" & return & "(or click to choose a file; a FOLDER + Tor or Web link becomes a browsable page)")
+   set the text of field "qsDrop" to (return & "Drag a file or folder here to share" & return & "(a folder becomes a browsable page - or, if it has index.html, a hosted web app)")
    -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
    -- plaintext file shared over Tor is served this way; the URL appears at the right.
    qsButton "qsWebCheck", "Serve as web download", "24,186,220,208"
@@ -2018,7 +2018,7 @@ end qsFsParseReq
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
 -- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
 command qsFsServePath pStream, pHeaders
-   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot
+   local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa
    put pHeaders["__method"] into tMethod
    if tMethod is not "GET" and tMethod is not "HEAD" then
       qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
@@ -2057,7 +2057,13 @@ command qsFsServePath pStream, pHeaders
       qsFsServeFile pStream, tDisk, tPath, pHeaders
       exit qsFsServePath
    end if
-   qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
+   -- unresolved: a SPA route falls back to index.html; otherwise a real 404
+   put qsSiteSpaTarget(tRoot, tPath) into tSpa
+   if tSpa is not empty then
+      qsFsServeFile pStream, tSpa, "index.html", pHeaders
+   else
+      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
+   end if
 end qsFsServePath
 
 -- Serve a file: size it, honour a Range, write the HTTP head, then arm the pump. The
@@ -2259,6 +2265,34 @@ function qsFsNotFound pPath
       qsFsHtmlEscape(pPath) & " in this share.</p><p><a href='/'>Back to the top</a></p>" & qsFsPageBottom()
 end qsFsNotFound
 
+-- Single-page-app fallback (auto, no configuration). When a request does not resolve
+-- to a real file or folder, and the served folder is a WEBSITE (has index.html at its
+-- root), and the requested path looks like a client-side ROUTE (its last segment has
+-- no ".", so it is not a missing asset such as app.js or logo.png), serve the root
+-- index.html so the app's own router handles the route - the standard behaviour of a
+-- static host for a SPA. Returns the index.html disk path, or empty for "send a real
+-- 404". Safe: pRelPath already passed the ".." guard, and we serve a FIXED file (root
+-- index.html), never a path-derived one, so there is no traversal here. A folder with
+-- no root index.html is a plain file share and never falls back (returns empty). A
+-- missing ASSET (a path whose leaf has an extension) always gets a real 404.
+function qsSiteSpaTarget pRoot, pRelPath
+   local tIndex, tLeaf, tSavedID, tRel
+   put pRoot & "/index.html" into tIndex
+   if there is no file tIndex then
+      return ""
+   end if
+   put pRelPath into tRel
+   replace "\" with "/" in tRel
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   put the last item of tRel into tLeaf
+   set the itemDelimiter to tSavedID
+   if tLeaf contains "." then
+      return ""
+   end if
+   return tIndex
+end qsSiteSpaTarget
+
 -- Shared page chrome. Single-quoted HTML attributes so the string literals never
 -- contain a double quote. Light + dark, mobile-friendly, no external assets.
 function qsFsPageTop pTitle
@@ -2383,6 +2417,30 @@ function qsFsMime pPath
       return "audio/wav"
    else if tExtn is "zip" then
       return "application/zip"
+   else if tExtn is "wasm" then
+      return "application/wasm"
+   else if tExtn is "mjs" then
+      return "application/javascript; charset=utf-8"
+   else if tExtn is "xml" then
+      return "application/xml; charset=utf-8"
+   else if tExtn is "map" then
+      return "application/json; charset=utf-8"
+   else if tExtn is "webmanifest" then
+      return "application/manifest+json"
+   else if tExtn is "woff" then
+      return "font/woff"
+   else if tExtn is "woff2" then
+      return "font/woff2"
+   else if tExtn is "ttf" then
+      return "font/ttf"
+   else if tExtn is "otf" then
+      return "font/otf"
+   else if tExtn is "eot" then
+      return "application/vnd.ms-fontobject"
+   else if tExtn is "avif" then
+      return "image/avif"
+   else if tExtn is "csv" then
+      return "text/csv; charset=utf-8"
    end if
    return "application/octet-stream"
 end qsFsMime
@@ -2556,7 +2614,7 @@ end qsCwData
 -- Parse, check the capability token (the first path segment), then route: for a file
 -- share only the one file is reachable; for a folder share, browse within the root.
 command qsCwServe pSocketID
-   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID
+   local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa
    put qsFsParseReq(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
    if tMethod is not "GET" and tMethod is not "HEAD" then
@@ -2611,7 +2669,13 @@ command qsCwServe pSocketID
       qsCwServeFile pSocketID, tDisk, tRest, tHeaders
       exit qsCwServe
    end if
-   qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+   -- unresolved: a SPA route falls back to index.html; otherwise a real 404
+   put qsSiteSpaTarget(sCwRoot, tRest) into tSpa
+   if tSpa is not empty then
+      qsCwServeFile pSocketID, tSpa, "index.html", tHeaders
+   else
+      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+   end if
 end qsCwServe
 
 -- Serve a file over the socket: size it, honour a Range, write the head, then pump the
