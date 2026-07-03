@@ -417,6 +417,24 @@ def check_prefixed_token_shadows(path, cleaned):
     return problems
 
 
+# xTalk has NO `does not begin with` / `does not end with` / `does not contain`
+# operator: the parser errors on `does` (confirmed on-engine in OXT). The valid
+# negation is `not (X begins with Y)` / `not (X contains Y)`, or `X is not ...`.
+# Matched on cleaned lines so a `does not ...` inside a string or comment is ignored.
+DOES_NOT_OPERATOR = re.compile(r"\bdoes\s+not\s+(begin|end|contain)s?\b", re.IGNORECASE)
+
+
+def check_does_not_operator(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        if DOES_NOT_OPERATOR.search(line):
+            problems.append(Problem(path, lineno,
+                "`does not begin/end with` / `does not contain` is not a valid xTalk "
+                "operator - the parser errors on `does`; negate with `not (...)`, e.g. "
+                "`not (X begins with Y)` or `not (X contains Y)`, or use `X is not ...`"))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -441,8 +459,10 @@ def check_file(path):
         problems += check_lcb_lowercase_names(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
-    # universal xTalk rule (both dialects): no name that spells a reserved token
+    # universal xTalk rules (both dialects): no name that spells a reserved token,
+    # and no invalid `does not <op>` negation.
     problems += check_prefixed_token_shadows(path, cleaned)
+    problems += check_does_not_operator(path, cleaned)
     return problems
 
 

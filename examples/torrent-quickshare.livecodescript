@@ -2190,7 +2190,7 @@ function qsFsParseRange pRange, pTotal
    if pRange is empty then
       return ""
    end if
-   if pRange does not begin with "bytes=" then
+   if not (pRange begins with "bytes=") then
       return ""
    end if
    put char 7 to -1 of pRange into tSpec       -- after "bytes="
