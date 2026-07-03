@@ -108,6 +108,7 @@ local sCwName           -- display name (file leaf or folder leaf)
 local sCwToken          -- the random capability token that gates every request
 local sCwPort           -- the TCP port the listener + the port-map use
 local sCwMapId          -- the btMapPort mapping id (0 = none/no UPnP)
+local sCwMapped         -- "true" once a portMapped event confirms the router opened it
 local sCwExtIp          -- the discovered public IP (from the externalIp event), or empty
 local sCwLanIp          -- the best-effort LAN IP for the local link
 -- per-connection state, keyed by the LiveCode socket id
@@ -434,6 +435,11 @@ command qsStart
    end if
    btSetBool sSession, "enable_dht", true
    btSetBool sSession, "enable_lsd", true
+   -- UPnP + NAT-PMP: let libtorrent open a router port automatically for the clearweb
+   -- direct-link feature (btMapPort). On by default in libtorrent, but set explicitly
+   -- so the port mappers are certainly active.
+   btSetBool sSession, "enable_upnp", true
+   btSetBool sSession, "enable_natpmp", true
    btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
@@ -859,24 +865,27 @@ command qsHandleEvent pEvent
          qsRefreshXfers
          break
       case "externalIp"
-         -- libtorrent discovered our public IP; if a web share is live AND the router
-         -- port was mapped, the internet link becomes usable (qsCwShowLinks gates it).
+         -- libtorrent discovered our public IP (from UPnP, the DHT, or a tracker). Use
+         -- it to build the internet link even if the router did not open the port - the
+         -- user can forward it manually; qsCwStatusText explains the state.
          put pEvent["externalIp"] into sCwExtIp
          if sCwActive is "true" then
+            qsLog "Your public IP is " & pEvent["externalIp"] & "."
             qsCwShowLinks
-            if sCwMapId is not 0 then
-               qsLog "Your internet address is " & pEvent["externalIp"] & " - the internet link is ready above."
-            end if
          end if
          break
       case "portMapped"
+         -- the router confirmed the mapping: the internet link is now live.
          if sCwActive is "true" then
-            qsLog "Router opened port " & pEvent["externalPort"] & " via " & pEvent["transport"] & " - the internet link should work now."
+            put "true" into sCwMapped
+            qsLog "Router opened port " & pEvent["externalPort"] & " via " & pEvent["transport"] & " - the internet link is live."
+            qsCwShowLinks
          end if
          break
       case "portMapError"
          if sCwActive is "true" then
-            qsLog "The router would not open the port automatically. The local-network link still works; for the internet, forward port " & sCwPort & " to this computer, or use the Tor option."
+            qsLog "Router refused to open the port automatically. To share over the internet, forward port " & sCwPort & " (TCP) to " & sCwLanIp & " in your router settings, then use the internet link above; otherwise use Tor. The local-network link still works."
+            qsCwShowLinks
          end if
          break
       default
@@ -2453,6 +2462,7 @@ command qsStartClearweb pPath, pName
    end if
    put "true" into sCwActive
    put 0 into sCwMapId
+   put "false" into sCwMapped
    put empty into sCwExtIp
    put qsLanIp() into sCwLanIp
    -- Ask the router to open the port automatically (UPnP / NAT-PMP via libtorrent).
@@ -2468,10 +2478,16 @@ command qsStartClearweb pPath, pName
       put 0 into sCwMapId
    end try
    if sCwMapId is 0 then
-      qsLog "No automatic internet link (router port-opening unavailable on this setup). The local-network link above works now; to share over the internet, forward port " & tPort & " to this computer, or use the Tor option."
+      qsLog "Could not ask the router to open the port automatically (UPnP/NAT-PMP off or unsupported). The local-network link works now; for the internet, forward port " & tPort & " (TCP) to this computer manually, or use Tor."
+   else
+      qsLog "Asked the router to open port " & tPort & " automatically - waiting for it to confirm (a portMapped or portMapError follows)."
    end if
-   qsCwShowLinks
-   set the text of field "qsSharing" to ("Sharing " & quote & sCwName & quote & " on the web - keep this window open. Anyone with the link can download it in a browser (no app needed); your IP is visible and it is not encrypted.")
+   -- Find our public IP so the internet link can show a real address. libtorrent only
+   -- reports it (the externalIp event) once it sees peer/tracker traffic, which a
+   -- torrent-less clearweb session never has - so we ask a lightweight HTTP echo. This
+   -- also returns the TRUE internet-facing IP, making carrier-NAT detection accurate.
+   qsCwFetchPublicIp
+   qsCwShowLinks       -- qsCwStatusText (inside) sets the Sharing line for the state
    qsLog "Web share started for " & quote & sCwName & quote & " on port " & tPort & ". On the same network the link works right away."
 end qsStartClearweb
 
@@ -2846,11 +2862,15 @@ command qsCwShowLinks
    if sCwLanIp is not empty then
       put ("http://" & sCwLanIp & ":" & sCwPort & tPath) into tLan
    end if
-   -- only advertise the internet link when the router port is actually mapped, so we
-   -- never hand out an address that would just time out (public IP but a closed port)
-   if sCwExtIp is not empty and sCwMapId is not 0 then
+   -- Show the internet link whenever we know a PUBLIC IP - if the router opened the
+   -- port it works immediately, otherwise it works once the user forwards the port
+   -- (qsCwStatusText explains which). A private / carrier-NAT address is never a
+   -- usable internet link, so it is not shown.
+   if sCwExtIp is not empty and not qsIsPrivateIp(sCwExtIp) then
       put ("http://" & sCwExtIp & ":" & sCwPort & tPath) into tWan
    end if
+   -- the primary link (qsCode, with the Copy button) is the internet link when we have
+   -- one, else the LAN link; the other goes in qsWebLink.
    if tWan is not empty then
       set the text of field "qsCode" to tWan
       set the text of field "qsWebLink" to tLan
@@ -2859,9 +2879,106 @@ command qsCwShowLinks
       set the text of field "qsWebLink" to tLan
    else
       set the text of field "qsCode" to ("http://YOUR-IP:" & sCwPort & tPath)
-      set the text of field "qsWebLink" to "(could not detect your IP - put this computer's address before the : )"
+      set the text of field "qsWebLink" to "(could not detect your IP; use the local link or Tor)"
    end if
+   qsCwStatusText
 end qsCwShowLinks
+
+-- Explain, in the Sharing line, exactly what works: the internet link is live (router
+-- opened the port), needs a manual forward (router would not), impossible (carrier
+-- NAT), or still detecting the public IP.
+command qsCwStatusText
+   local tMsg
+   if not sCwActive then
+      exit qsCwStatusText
+   end if
+   if sCwExtIp is not empty and not qsIsPrivateIp(sCwExtIp) then
+      if sCwMapped is "true" then
+         put ("Internet link is LIVE (top link) - your router opened the port automatically. Anyone can open it in a browser; keep this window open.") into tMsg
+      else
+         put ("Internet link is shown above, but your router did not open the port automatically. Forward port " & sCwPort & " (TCP) to this computer (" & sCwLanIp & ") in your router's settings, then it works. On the same network, the local link works right now.") into tMsg
+      end if
+   else if sCwExtIp is not empty then
+      put ("A direct internet link is not possible here - your connection uses carrier-grade NAT (shared public IP " & sCwExtIp & "). Use the local-network link, or share over Tor (which always reaches the internet).") into tMsg
+   else
+      put ("Local-network link is live. Looking up your public IP for an internet link... if none appears you are likely behind carrier NAT - use Tor for internet sharing.") into tMsg
+   end if
+   set the text of field "qsSharing" to tMsg
+end qsCwStatusText
+
+-- Is pIp a private / loopback / carrier-NAT address (so it can never be a usable
+-- internet link)? RFC 1918 (10/8, 172.16-31/12, 192.168/16), CGNAT (100.64-127/10),
+-- link-local (169.254/16), loopback (127/8).
+function qsIsPrivateIp pIp
+   local tA, tB, tSavedID
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "."
+   put item 1 of pIp into tA
+   put item 2 of pIp into tB
+   set the itemDelimiter to tSavedID
+   if tA is not a number then
+      return false
+   end if
+   if tA is 10 or tA is 127 then
+      return true
+   end if
+   if tA is 192 and tB is 168 then
+      return true
+   end if
+   if tA is 169 and tB is 254 then
+      return true
+   end if
+   if tA is 172 and tB is a number and tB >= 16 and tB <= 31 then
+      return true
+   end if
+   if tA is 100 and tB is a number and tB >= 64 and tB <= 127 then
+      return true
+   end if
+   return false
+end qsIsPrivateIp
+
+-- Fetch our public (internet-facing) IP from a lightweight HTTP echo, so the internet
+-- link can show a real address even when libtorrent never reports one. ASYNCHRONOUS
+-- (load URL ... with message) so a slow/unreachable echo never freezes the single UI
+-- thread; the reply lands in qsCwIpReply. Non-fatal - if it fails, the LAN link and
+-- the "forward the port / look up your IP" guidance still stand. VERIFY (on-engine):
+-- the load URL / with-message flow and that plain-HTTP URL access is available.
+command qsCwFetchPublicIp
+   local tErr
+   try
+      load URL "http://api.ipify.org/" with message "qsCwIpReply"
+   catch tErr
+   end try
+end qsCwFetchPublicIp
+
+command qsCwIpReply pUrl, pStatus
+   local tIp, tErr, tSavedID, tOk
+   if pStatus is not "cached" then
+      try
+         unload URL pUrl
+      catch tErr
+      end try
+      exit qsCwIpReply           -- "error"/other: leave the IP unset; guidance stands
+   end if
+   put qsTrim(URL pUrl) into tIp
+   try
+      unload URL pUrl
+   catch tErr
+   end try
+   if not sCwActive then
+      exit qsCwIpReply
+   end if
+   -- validate it really looks like an IPv4 (reject an HTML error page etc.)
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "."
+   put (the number of items of tIp is 4 and item 1 of tIp is a number and item 4 of tIp is a number) into tOk
+   set the itemDelimiter to tSavedID
+   if not tOk then
+      exit qsCwIpReply
+   end if
+   put tIp into sCwExtIp
+   qsCwShowLinks
+end qsCwIpReply
 
 -- RECEIVE entry: parse a BTXTOR1 code, verify the passphrase locally BEFORE dialing,
 -- then dial the onion and wire the receiver state machine.
