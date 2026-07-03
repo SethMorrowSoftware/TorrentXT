@@ -91,9 +91,11 @@ same machinery a torrent client uses), so on most home networks there is nothing
 configure; on the same LAN it works instantly. The link carries a random **token**, so
 an open port is not an open directory - only people you send the link to can reach it.
 This path is fast but not private: your IP is visible and the download is not encrypted
-(use Tor for anonymity). If the router refuses UPnP (or you are behind carrier-grade
-NAT), the local-network link still works and Quick Share tells you which port to forward
-or to fall back to Tor.
+(use Tor for anonymity). If the router won't do UPnP, Quick Share still shows the
+internet link and tells you the single port to **forward manually**; if you are behind
+**carrier-grade NAT** (a shared public IP, common on mobile and some fibre), a direct
+internet link isn't possible at all and it points you to Tor. The local-network link
+always works regardless.
 
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
