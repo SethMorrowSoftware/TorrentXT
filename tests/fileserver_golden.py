@@ -201,6 +201,42 @@ def safe_filename(name):
     return out if out else "download"
 
 
+# ---- qsRateShort / qsEtaShort: compact Transfers-row stats -------------------
+# Compact data-rate ("1.2M/s") and ETA ("1h2m") strings that fit the narrow progress
+# column. Mirror qsRateShort / qsEtaShort. _round1 reproduces LiveCode's
+# `the round of (v*10)/10` (round half away from zero, number formatted with no .0).
+
+def _round1(v):
+    import math
+    x = v * 10.0
+    r = (math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)) / 10.0
+    return "%g" % r
+
+
+def rate_short(bps):
+    if isinstance(bps, bool) or not isinstance(bps, (int, float)) or bps <= 0:
+        return "0B/s"
+    units = ["B", "K", "M", "G", "T"]
+    v, u = float(bps), 0
+    while v >= 1024 and u < len(units) - 1:
+        v /= 1024
+        u += 1
+    return _round1(v) + units[u] + "/s"
+
+
+def eta_short(secs):
+    if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs < 0:
+        return ""
+    s = int(secs)                                  # trunc toward zero (LiveCode trunc)
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    if s < 86400:
+        return "%dh%dm" % (s // 3600, (s % 3600) // 60)
+    return ">1d"
+
+
 # ---- fsHtmlEscape: & first, then the rest -----------------------------------
 
 def html_escape(text):
@@ -563,6 +599,20 @@ def main():
     ]:
         check("safe_filename(%r)" % name, safe_filename(name), want)
 
+    # -- compact transfer-row rate + ETA formatting --
+    for bps, want in [
+        (0, "0B/s"), (-5, "0B/s"), (512, "512B/s"), (1024, "1K/s"),
+        (1536, "1.5K/s"), (1048576, "1M/s"), (1300000, "1.2M/s"),
+        (1073741824, "1G/s"), (2000, "2K/s"),
+    ]:
+        check("rate_short(%d)" % bps, rate_short(bps), want)
+    for secs, want in [
+        (-1, ""), (0, "0s"), (45, "45s"), (59, "59s"), (60, "1m"), (125, "2m"),
+        (3599, "59m"), (3600, "1h0m"), (3725, "1h2m"), (86399, "23h59m"),
+        (86400, ">1d"), (200000, ">1d"), (44.9, "44s"),
+    ]:
+        check("eta_short(%r)" % secs, eta_short(secs), want)
+
     # -- editor LAN-first gate (only local peers may reach the editor) --
     for conn, want in [
         ("cw:192.168.1.5:52000", True),           # home LAN
@@ -606,7 +656,7 @@ def main():
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
           "HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape, "
           "editor confinement, LAN-first gate, query parse, size probe, "
-          "filename sanitise all match)")
+          "filename sanitise, rate + ETA format all match)")
     return 0
 
 

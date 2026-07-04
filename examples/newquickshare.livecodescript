@@ -881,7 +881,7 @@ end qsGetFile
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
-   local tIH, tDisp, tDir, tK, tE
+   local tIH, tDisp, tDir, tK, tE, tProg, tRemain
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
    end if
@@ -907,7 +907,24 @@ command qsRefreshXfers
          put sXferName[tIH] into tDisp
          put tDir && "(locked)" into tDir
       end if
-      put qsTrunc(tDisp, 26) & tab & tDir & tab & qsBar(tPct) & return after tRows
+      -- compact live stats in place of a text bar: percent, rate, and (downloading) ETA
+      put tPct & "%" into tProg
+      if tDir contains "receiving" then
+         if tS["downloadRate"] is a number and tS["downloadRate"] > 0 then
+            put tProg && qsRateShort(tS["downloadRate"]) into tProg
+            if tS["totalWanted"] is a number and tS["totalDone"] is a number then
+               put (tS["totalWanted"] - tS["totalDone"]) into tRemain
+               if tRemain > 0 then
+                  put tProg && qsEtaShort(tRemain / tS["downloadRate"]) into tProg
+               end if
+            end if
+         end if
+      else if tDir contains "sending" then
+         if tS["uploadRate"] is a number and tS["uploadRate"] > 0 then
+            put tProg && qsRateShort(tS["uploadRate"]) into tProg
+         end if
+      end if
+      put qsTrunc(tDisp, 26) & tab & tDir & tab & tProg & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
    end repeat
@@ -927,7 +944,7 @@ command qsRefreshXfers
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "stopped" & return after tRows
       else
          put (the round of (tE["got"] / tE["total"] * 1000) / 10) into tPct
-         put qsTrunc(tE["name"], 26) & tab & tDir & tab & qsBar(tPct) & return after tRows
+         put qsTrunc(tE["name"], 26) & tab & tDir & tab & tPct & "%  " & qsBytes(tE["got"]) & return after tRows
       end if
       add 1 to tLineNum
    end repeat
@@ -1070,6 +1087,46 @@ function qsBytes pBytes
    end repeat
    return (the round of (tVal * 10) / 10) && (item tI of tUnits)
 end qsBytes
+
+-- A COMPACT data rate for the Transfers rows, e.g. "1.2M/s" (short unit, no space) so it
+-- fits the narrow progress column. 0/empty -> "0B/s". Item delimiter saved + restored.
+-- Pinned by rate_short() in the golden.
+function qsRateShort pBps
+   local tV, tU, tUnit, tUnits, tSavedID
+   if pBps is empty or pBps is not a number or pBps <= 0 then
+      return "0B/s"
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to comma
+   put "B,K,M,G,T" into tUnits
+   put pBps into tV
+   put 1 into tU
+   repeat while tV >= 1024 and tU < the number of items of tUnits
+      put tV / 1024 into tV
+      add 1 to tU
+   end repeat
+   put (item tU of tUnits) into tUnit
+   set the itemDelimiter to tSavedID
+   return (the round of (tV * 10) / 10) & tUnit & "/s"
+end qsRateShort
+
+-- A short ETA from a seconds count: "45s", "3m", "1h12m", or ">1d". Empty for a bad
+-- input. Pinned by eta_short() in the golden.
+function qsEtaShort pSecs
+   local tS
+   if pSecs is empty or pSecs is not a number or pSecs < 0 then
+      return ""
+   end if
+   put trunc(pSecs) into tS
+   if tS < 60 then
+      return tS & "s"
+   else if tS < 3600 then
+      return (tS div 60) & "m"
+   else if tS < 86400 then
+      return (tS div 3600) & "h" & ((tS mod 3600) div 60) & "m"
+   end if
+   return ">1d"
+end qsEtaShort
 
 function qsTrunc pText, pLen
    if the number of chars of pText <= pLen then
@@ -2838,6 +2895,7 @@ command qsFsServePath pStream, pHeaders
       qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
       exit qsFsServePath
    end if
+   qsAccessLog "via Tor", tMethod, tPath
    -- a registered dynamic route answers FIRST (any method, so a POST works); only
    -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
    put toUpper(tMethod) & space & tPath into tRouteKey
@@ -2925,6 +2983,22 @@ function qsHttpDisposition pForMime, pHeaders
    end if
    return ("Content-Disposition: " & tKind & "; filename=" & quote & tName & quote & tCrlf)
 end qsHttpDisposition
+
+-- The clearweb peer's IP, from the accepted-socket id "<ip>:<port>[|n]".
+function qsCwPeer pSocketID
+   local tIp, tSavedID
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to ":"
+   put item 1 of pSocketID into tIp
+   set the itemDelimiter to tSavedID
+   return tIp
+end qsCwPeer
+
+-- A compact ACCESS-LOG line in the Activity panel, so you can SEE the server working:
+-- who connected and what they asked for. pPeer is an IP (clearweb) or "via Tor".
+command qsAccessLog pPeer, pMethod, pPath
+   qsLog (pPeer & "  " & toUpper(pMethod) & " " & pPath)
+end qsAccessLog
 
 -- Serve a file: size it, honour a Range, write the HTTP head, then arm the pump. The
 -- file is NEVER read whole into memory.
@@ -3099,12 +3173,16 @@ end qsFsWatchdog
 -- each file's size is in its Content-Length. Rows are built first so the header can
 -- show the final count.
 function qsFsListing pDiskFolder, pUrlPath
-   local tSaved, tFiles, tFolders, tName, tRows, tOut, tCount, tHeading
+   local tSaved, tFiles, tFolders, tName, tRows, tOut, tCount, tHeading, tBase, tSz
    put the defaultFolder into tSaved
    set the defaultFolder to pDiskFolder
    put the files into tFiles
    put the folders into tFolders
    set the defaultFolder to tSaved
+   put pDiskFolder into tBase                -- for per-file sizing; ensure one trailing /
+   if the last char of tBase is not "/" then
+      put "/" after tBase
+   end if
    -- present entries in a stable, case-insensitive A-Z order (the OS order is arbitrary)
    sort lines of tFolders ascending text by toLower(each)
    sort lines of tFiles ascending text by toLower(each)
@@ -3125,8 +3203,11 @@ function qsFsListing pDiskFolder, pUrlPath
       if tName is empty then
          next repeat
       end if
+      -- per-file size (cheap now: the O(log n) seek probe, not a full read)
+      put qsBytes(qsFileSize(tBase & tName)) into tSz
       put "<li class='file t-" & qsFsIcon(tName, false) & "'><a href='" & qsFsPathEncode(tName) & "'>" & \
-         "<svg class='ic'><use href='#i-" & qsFsIcon(tName, false) & "'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
+         "<svg class='ic'><use href='#i-" & qsFsIcon(tName, false) & "'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & \
+         "</span><span class='sz'>" & tSz & "</span></a></li>" after tRows
       add 1 to tCount
    end repeat
    if pUrlPath is "/" then
@@ -3308,7 +3389,8 @@ function qsFsPageTop pTitle
       "ul.fl{list-style:none;margin:0;padding:.4em}" & \
       "ul.fl li a{display:flex;align-items:center;gap:.72em;padding:.5em .72em;border-radius:9px;color:inherit;text-decoration:none;transition:background .12s}" & \
       "ul.fl li a:hover{background:#f1f5fb}" & \
-      "ul.fl li .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" & \
+      "ul.fl li .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" & \
+      "ul.fl li .sz{flex:0 0 auto;color:#8a909a;font-size:.85em;font-variant-numeric:tabular-nums;padding-left:1em}" & \
       "ul.fl li.dir .nm{font-weight:600;color:#2c5aa0}" & \
       "ul.fl li.up a{color:#8a909a}ul.fl li.up .nm{font-size:.9em}" & \
       ".ic{width:20px;height:20px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}" & \
@@ -3642,6 +3724,7 @@ command qsCwServe pSocketID
       qsCwSendText pSocketID, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
       exit qsCwServe
    end if
+   qsAccessLog qsCwPeer(pSocketID), tMethod, tPath
    put the itemDelimiter into tSavedID
    set the itemDelimiter to "/"
    put item 2 of tPath into tTok            -- /<token>/... ; item 1 is "" (leading /)
