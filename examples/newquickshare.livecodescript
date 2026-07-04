@@ -59,6 +59,7 @@ local sShareCodeByHandle -- array: torrent handle -> the share code we minted fo
 -- selection survives the 2-4 Hz repaint and Stop/Copy act on the right item.
 local sXferRow          -- array: list line number -> "type|key" identity for that row
 local sXferSel          -- the currently selected row identity ("type|key"), or empty
+local sLastXferRows     -- last text set into the qsXfers list (only retype it on a change)
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -236,9 +237,16 @@ on dragDrop
    end if
    put the dragData["files"] into tFiles
    if tFiles is empty then
-      pass dragDrop
+      -- some platforms/drops deliver a lone path as "text" rather than "files"
+      put the dragData["text"] into tFiles
    end if
-   -- one file at a time keeps the demo simple; the first dropped item wins
+   if tFiles is empty then
+      -- NEVER swallow a drop silently: OS file-drop delivery is occasionally flaky,
+      -- so say so and point at the always-reliable click fallback.
+      qsLog "That drop did not register any file - drag again (a little slower), or click the drop area to choose a file or folder instead."
+      exit dragDrop
+   end if
+   -- one item at a time keeps the demo simple; the first dropped item wins
    qsShareFile (line 1 of tFiles)
 end dragDrop
 
@@ -405,6 +413,7 @@ command qsBuild
    set the tabStops of field "qsXfers" to "230,340"
    set the textFont of field "qsXfers" to "Courier"
    set the textSize of field "qsXfers" to 10
+   put empty into sLastXferRows   -- freshly (re)built list: force the next refresh to paint
    -- per-row management: pick a row, then act on THAT share/transfer
    qsCap "qsXferHint", "Select a row to manage it:", "656,438,876,458"
    qsButton "qsXferCopy", "Copy code", "884,435,976,461"
@@ -801,12 +810,27 @@ command qsShareFile pPath
    end if
 end qsShareFile
 
+-- Click-to-choose fallback for the drop area. Offers BOTH a file and a folder picker
+-- (OS folder drops are the flakiest to deliver, and a folder is the natural way to web-
+-- share several files), so a user is never stuck when a drag does not register. The
+-- chosen item runs the SAME qsShareFile path as a drop, honouring the selected method.
 command qsBrowseFile
-   answer file "Choose a file to share:"
-   if it is empty then
+   local tChoice, tPath
+   answer "What would you like to share?" with "Cancel" or "A folder" or "A file"
+   put it into tChoice
+   if tChoice is "A file" then
+      answer file "Choose a file to share:"
+      put it into tPath
+   else if tChoice is "A folder" then
+      answer folder "Choose a folder to share:"
+      put it into tPath
+   else
       exit qsBrowseFile
    end if
-   qsShareFile it
+   if tPath is empty then
+      exit qsBrowseFile
+   end if
+   qsShareFile tPath
 end qsBrowseFile
 
 command qsCopyCode
@@ -1015,32 +1039,41 @@ command qsRefreshXfers
    if tLineNum is 0 then
       put "   Nothing yet. Drag a file to share, or paste a code to download." into tRows
    end if
-   lock screen
-   set the text of field "qsXfers" to tRows
-   -- keep the user's selection pinned to the SAME item across this repaint: rows
-   -- reorder (the torrent enumeration is not stable) and a plain hilitedLine would
-   -- drift to a different transfer. Re-find the selected identity by value; if the
-   -- item has ended (no row carries it), drop the selection.
-   if sXferSel is not empty then
-      put 0 into tSelLine
-      repeat for each key tK in sXferRow
-         if sXferRow[tK] is sXferSel then
-            put tK into tSelLine
-            exit repeat
+   -- Only RETYPE the list when its content actually changed. A wholesale field relayout
+   -- + redraw every poll is the biggest avoidable UI cost (the OXT perf playbook), and -
+   -- more importantly here - a repaint mid-drag can compete with the OS drop delivery and
+   -- make a drop intermittently fail to register. An idle set of shares produces the same
+   -- tRows every pass, so we skip it entirely; an active transfer (its % changes) still
+   -- updates as before.
+   if tRows is not sLastXferRows then
+      put tRows into sLastXferRows
+      lock screen
+      set the text of field "qsXfers" to tRows
+      -- keep the user's selection pinned to the SAME item across this repaint: rows
+      -- reorder (the torrent enumeration is not stable) and a plain hilitedLine would
+      -- drift to a different transfer. Re-find the selected identity by value; if the
+      -- item has ended (no row carries it), drop the selection.
+      if sXferSel is not empty then
+         put 0 into tSelLine
+         repeat for each key tK in sXferRow
+            if sXferRow[tK] is sXferSel then
+               put tK into tSelLine
+               exit repeat
+            end if
+         end repeat
+         if tSelLine > 0 then
+            set the hilitedLines of field "qsXfers" to tSelLine
+         else
+            -- the selected item ended: drop BOTH the tracked identity and the field's
+            -- lingering highlight. Retyping the list text does not reset the hilite, so a
+            -- stale highlight would be re-read next pass and re-bound to whatever
+            -- unrelated transfer now sits on that line number (a wrong Stop/Copy target).
+            put empty into sXferSel
+            set the hilitedLines of field "qsXfers" to empty
          end if
-      end repeat
-      if tSelLine > 0 then
-         set the hilitedLines of field "qsXfers" to tSelLine
-      else
-         -- the selected item ended: drop BOTH the tracked identity and the field's
-         -- lingering highlight. Retyping the list text does not reset the hilite, so a
-         -- stale highlight would be re-read next pass and re-bound to whatever unrelated
-         -- transfer now sits on that line number (a wrong Stop/Copy target).
-         put empty into sXferSel
-         set the hilitedLines of field "qsXfers" to empty
       end if
+      unlock screen
    end if
-   unlock screen
    put btDhtState(sSession) into tD
    put tD["nodes"] into tNodes
    if tNodes is a number and tNodes > 0 then
@@ -1922,9 +1955,12 @@ function qsFileSizeSeek pPath
 end qsFileSizeSeek
 
 -- The fallback: read the whole file in bounded 4 MiB chunks (O(file size) I/O, O(1)
--- memory). Always correct; used only when the seek probe bows out.
+-- memory). Always correct; used only when the seek probe bows out. Hardened with an
+-- 8 GiB ceiling so an engine whose read never signals EOF can NEVER spin this loop
+-- forever and freeze the single UI thread (which would look like "the shared page never
+-- loads" - every served file's size passes through here).
 function qsFileSizeRead pPath
-   local tSize
+   local tSize, tErr
    put 0 into tSize
    open file pPath for binary read
    if the result is not empty then
@@ -1933,9 +1969,16 @@ function qsFileSizeRead pPath
    repeat
       read from file pPath for 4194304
       if it is empty then
-         exit repeat
+         exit repeat                        -- EOF (or a read error): done
       end if
       add the number of bytes in it to tSize
+      if tSize > 8589934592 then            -- 8 GiB serve ceiling: bail rather than spin
+         try
+            close file pPath
+         catch tErr
+         end try
+         return empty                       -- an engine that never signals EOF: give up
+      end if
    end repeat
    close file pPath
    return tSize
