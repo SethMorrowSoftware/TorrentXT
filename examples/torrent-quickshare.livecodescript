@@ -95,6 +95,16 @@ local sFsTxDeadline     -- array: stream -> the milliseconds of the last activit
 -- transports; on the direct web link a route sits under the token, e.g.
 -- http://<ip>:<port>/<token>/_qs/info.
 local sHttpRoutes       -- array: "METHOD /path" -> handler name in this script
+-- The optional live WEB EDITOR (Phase C). Turns the served folder read-WRITE from a
+-- browser, so it is deliberately locked down: OFF by default; a cryptoXT (Argon2id)
+-- edit password; a random per-login session token; and - the hard rule - editing is
+-- LAN-ONLY (a request from a non-local peer, or any Tor request, is refused), while
+-- the site itself stays publicly shareable. Every write path is confined to the
+-- served root by qsEditSafePath (the security linchpin, adversarially golden-tested).
+local sEditOn           -- "true" when the editor is enabled for this session
+local sEditSalt         -- Argon2id salt for the edit password
+local sEditVerify       -- sxSecretBox verifier: proves a login password is correct
+local sEditSession      -- the current valid edit-session token (random hex), or empty
 -- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
 -- a file/folder to any browser at http://<ip>:<port>/<token>/... . TorrentXT's
 -- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
@@ -156,6 +166,11 @@ constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (a
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
 constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (head + body) > 256 KB
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
+constant kEditTokenBytes = 24          -- live-editor session token: 24 random bytes (192 bits)
+constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to prove a login
+constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
+constant kEditMaxFileBytes = 262144    -- editor: biggest file it will read/save (256 KB; a save
+                                       -- is additionally bounded by kFsMaxReq at the transport)
 constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this, anon path
 constant kTorSocksPort = "9050"        -- system/standalone tor
 constant kTorControlPort = "9051"
@@ -165,7 +180,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-11"
+constant kQsUiVersion = "qs-ui-2026-12"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -232,6 +247,9 @@ on mouseUp
       case "qsWebCheck"
          qsToggleWeb
          break
+      case "qsEditToggle"
+         qsToggleEdit
+         break
       case "qsWebCopy"
          qsCopyWebLink
          break
@@ -250,7 +268,7 @@ command qsBuild
    qsClearGeneratedUI
    lock screen
    set the width of this stack to 620
-   set the height of this stack to 664
+   set the height of this stack to 696
    set the backgroundColor of this card to "237,239,243"
    set the title of this stack to "TorrentXT - Quick Share"
    -- title band
@@ -309,29 +327,40 @@ command qsBuild
    set the opaque of field "qsCode" to true
    set the backgroundColor of field "qsCode" to "255,250,225"
    qsButton "qsCopy", "Copy", "500,260,596,290"
+   -- OPTIONAL live web editor (LAN-only). Tick it and set an edit password to make the
+   -- web-shared FOLDER editable from a browser on your own network (visit the shared
+   -- link with /_edit on the end). Off by default; needs cryptoXT for the password.
+   qsButton "qsEditToggle", "Enable web editing", "24,300,214,322"
+   set the style of button "qsEditToggle" to "checkbox"
+   set the autoHilite of button "qsEditToggle" to false
+   qsLabel "qsEditPassCap", "Edit password:", "220,302,318,322", 10
+   qsField "qsEditPass", "322,300,486,322", false
+   qsLabel "qsEditHint", "LAN only", "492,302,596,322", 9
+   set the foregroundColor of field "qsEditHint" to "150,110,40"
+   set the textAlign of field "qsEditHint" to "right"
    -- RECEIVE: paste a code, an optional passphrase (only if it is locked), download
-   qsSection "qsRecvSec", "Receive a file", "24,308,596,330"
-   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,336,596,354", 10
-   qsField "qsRecvCode", "24,358,490,390", false
+   qsSection "qsRecvSec", "Receive a file", "24,340,596,362"
+   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,368,596,386", 10
+   qsField "qsRecvCode", "24,390,490,422", false
    set the textFont of field "qsRecvCode" to "Courier"
    set the textSize of field "qsRecvCode" to 11
-   qsButton "qsGet", "Download", "500,358,596,390"
-   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,396,300,416", 10
-   qsField "qsRecvPass", "304,394,596,418", false
+   qsButton "qsGet", "Download", "500,390,596,422"
+   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,428,300,448", 10
+   qsField "qsRecvPass", "304,426,596,450", false
    -- TRANSFERS: see it working
-   qsSection "qsXferSec", "Transfers", "24,430,596,452"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,456,596,474", 9
+   qsSection "qsXferSec", "Transfers", "24,462,596,484"
+   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,488,596,506", 9
    set the tabStops of field "qsXferHead" to "210,330"
    set the textFont of field "qsXferHead" to "Courier"
    set the textSize of field "qsXferHead" to 9
-   qsList "qsXfers", "24,476,596,556", false
+   qsList "qsXfers", "24,508,596,588", false
    set the tabStops of field "qsXfers" to "210,330"
    set the textFont of field "qsXfers" to "Courier"
    set the textSize of field "qsXfers" to 10
-   qsLabel "qsStatus", "", "24,560,596,580", 10
+   qsLabel "qsStatus", "", "24,592,596,612", 10
    set the foregroundColor of field "qsStatus" to "90,96,105"
    -- a small activity log
-   qsList "qsLog", "24,586,596,652", true
+   qsList "qsLog", "24,618,596,684", true
    set the textSize of field "qsLog" to 9
    qsAddTips
    qsOnionPill
@@ -427,6 +456,9 @@ command qsAddTips
    set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
    set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
    set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
+   set the tooltip of button "qsEditToggle" to "Make the web-shared FOLDER editable from a browser - but ONLY from a device on your own local network (never over the internet or Tor). Set an edit password first. Visit the shared link with /_edit added on the end to open the editor. Needs cryptoXT (org.openxtalk.library.sodium)."
+   set the tooltip of field "qsEditPass" to "A password you choose to unlock the live editor. Anyone on your LAN who opens the /_edit page must type it before they can change files. Needs cryptoXT installed."
+   set the tooltip of field "qsEditHint" to "The live editor only answers devices on your local network; internet and Tor visitors can view the site but never reach the editor."
    set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work."
 end qsAddTips
 
@@ -464,6 +496,18 @@ command qsStart
    -- script: on myHandler pConn, pRequest ... qsHttpReply pConn, 200, ...).
    put empty into sHttpRoutes
    qsHttpRoute "GET", "/_qs/info", "qsInfoRoute"
+   -- the live web editor (Phase C). Always registered, but every handler refuses unless
+   -- the editor is enabled AND the caller is LAN-local (see qsEditReachable), so these
+   -- routes are invisible (404) to Tor and to public clearweb visitors.
+   put "false" into sEditOn
+   put empty into sEditSalt
+   put empty into sEditVerify
+   put empty into sEditSession
+   qsHttpRoute "GET", "/_edit", "qsEditPageRoute"
+   qsHttpRoute "POST", "/_edit/login", "qsEditLoginRoute"
+   qsHttpRoute "GET", "/_edit/api/list", "qsEditListRoute"
+   qsHttpRoute "GET", "/_edit/api/read", "qsEditReadRoute"
+   qsHttpRoute "PUT", "/_edit/api/write", "qsEditWriteRoute"
    if sHasOnion then
       qsOnionStart
    else
@@ -2144,12 +2188,18 @@ function qsHttpReason pCode
       return "No Content"
    else if pCode is 400 then
       return "Bad Request"
+   else if pCode is 401 then
+      return "Unauthorized"
    else if pCode is 403 then
       return "Forbidden"
    else if pCode is 404 then
       return "Not Found"
    else if pCode is 405 then
       return "Method Not Allowed"
+   else if pCode is 409 then
+      return "Conflict"
+   else if pCode is 413 then
+      return "Payload Too Large"
    else if pCode is 500 then
       return "Internal Server Error"
    end if
@@ -2189,6 +2239,452 @@ command qsInfoRoute pConn, pRequest
       tQ & "method" & tQ & ":" & tQ & qsJsonEscape(pRequest["__method"]) & tQ & "}" into tJson
    qsHttpReply pConn, 200, "application/json; charset=utf-8", tJson
 end qsInfoRoute
+
+-- ============================================================================
+-- THE LIVE WEB EDITOR (Phase C). LAN-ONLY, password-gated, OFF by default. See the
+-- editor state locals up top for the trust model. Its routes are registered once in
+-- qsStart and are always present; every one gates on qsEditReachable first, so a Tor
+-- visitor or a public clearweb peer just gets a 404 and never learns an editor exists.
+-- cryptoXT (sx*) is required for the password - without it the editor cannot be enabled
+-- (it fails closed). Writes are confined to the served folder by qsEditSafePath.
+-- ----------------------------------------------------------------------------
+
+-- Is this connection from the local network (so it MAY reach the editor)? The only
+-- trustworthy signal is the TCP peer address the engine hands us, which a remote
+-- attacker cannot forge across the internet - NEVER a request header. Tor (ox:) is by
+-- definition remote, so it is always refused. For clearweb (cw:) the connection token
+-- carries the accepted-socket id "<ip>:<port>"; the peer ip is up to the first colon.
+function qsEditIsLocal pConn
+   local tKind, tId, tIp, tSavedID, tA, tB
+   put char 1 to 3 of pConn into tKind
+   if tKind is not "cw:" then
+      return false                    -- Tor, and anything unexpected: not local
+   end if
+   put char 4 to -1 of pConn into tId
+   if tId begins with "::1" then
+      return true                     -- IPv6 loopback ("::1:<port>")
+   end if
+   -- The rest assumes an IPv4 "<ip>:<port>" peer id (what OXT's TCP listener yields on a
+   -- LAN). A globally-routable IPv6 peer (2xxx.., fe80.., fc00..) has a non-numeric first
+   -- field, so it falls through to false = REMOTE - a safe default. IPv6 LAN peers other
+   -- than loopback are therefore not recognised as local (refused, never wrongly allowed).
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to ":"
+   put item 1 of tId into tIp         -- "<ip>:<port>[|n]" -> the ip
+   set the itemDelimiter to "."
+   put item 1 of tIp into tA
+   put item 2 of tIp into tB
+   set the itemDelimiter to tSavedID
+   if tA is not a number then
+      return false
+   end if
+   -- Deliberately STRICTER than qsIsPrivateIp: a true LAN / loopback only. Carrier-NAT
+   -- space (100.64/10) is the ISP's SHARED range, not your home network, so it is NOT
+   -- treated as local for the editor - even though qsIsPrivateIp (used only to decide
+   -- whether to SHOW an internet link) accepts it. Loopback 127/8, RFC-1918 10/8 +
+   -- 172.16-31/12 + 192.168/16, and link-local 169.254/16 are the local ranges.
+   if tA is 10 or tA is 127 then
+      return true
+   end if
+   if tA is 192 and tB is 168 then
+      return true
+   end if
+   if tA is 169 and tB is 254 then
+      return true
+   end if
+   if tA is 172 and tB is a number and tB >= 16 and tB <= 31 then
+      return true
+   end if
+   return false
+end qsEditIsLocal
+
+-- The disk root the editor may read/write: the CURRENTLY-shared clearweb FOLDER. A
+-- single-file share or no active folder share -> empty (editing unavailable). Editing
+-- is tied to the clearweb folder server because that is the only surface a LAN browser
+-- can reach.
+function qsEditServedRoot
+   if sCwActive is "true" and sCwKind is "folder" then
+      return sCwRoot
+   end if
+   return ""
+end qsEditServedRoot
+
+-- Is the editor even reachable for this connection? It must be ENABLED, cryptoXT must
+-- be present, there must be a served folder, AND the peer must be local. The outer
+-- gate: when false the route answers 404 (invisible to the caller), never hinting an
+-- editor could exist.
+function qsEditReachable pConn
+   if sEditOn is not "true" then
+      return false
+   end if
+   if not sCanEncrypt then
+      return false
+   end if
+   if qsEditServedRoot() is empty then
+      return false
+   end if
+   return qsEditIsLocal(pConn)
+end qsEditReachable
+
+-- Does pKey open the edit verifier (proving the login password was correct)? Mirrors
+-- qsKeyOpensVerifier; a wrong key makes sxSecretBoxOpen throw, which we catch as false.
+function qsEditKeyOpens pKey
+   local tOut, tErr
+   if sEditVerify is empty then
+      return false
+   end if
+   try
+      put sxSecretBoxOpen(sEditVerify, pKey) into tOut
+   catch tErr
+      return false
+   end try
+   return (textDecode(tOut, "ASCII") is kEditVerify)
+end qsEditKeyOpens
+
+-- Is this request authorised to EDIT? Reachable (enabled + local + served folder) AND
+-- carrying the current session token in the x-edit-token header. The token is minted
+-- only by a correct-password login, so this is the write gate.
+function qsEditAuthed pConn, pRequest
+   if not qsEditReachable(pConn) then
+      return false
+   end if
+   if sEditSession is empty then
+      return false
+   end if
+   return (pRequest["x-edit-token"] is sEditSession)
+end qsEditAuthed
+
+-- Enable the editor with a login password. Derives an Argon2id key from the password +
+-- a fresh random salt, seals a known marker under it as the verifier, and stores salt +
+-- verifier (never the password or the key). Any existing session is invalidated, so
+-- changing the password forces a re-login. Requires cryptoXT; returns "" on success or
+-- an error string. KDF params (opslimit "2", interactive memory) match the share-code
+-- path - keep them identical across the demo.
+function qsEditEnable pPassword
+   local tSalt, tKey, tErr
+   if not sCanEncrypt then
+      return "The live editor needs cryptoXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
+   end if
+   if pPassword is empty then
+      return "Set an edit password first."
+   end if
+   try
+      put sxRandomBytes(16) into tSalt
+      put sxPwHash(textEncode(pPassword, "UTF-8"), tSalt, 32, "2", sxPwMemInteractive()) into tKey
+      put sxSecretBox(textEncode(kEditVerify, "ASCII"), tKey) into sEditVerify
+   catch tErr
+      return ("Could not set up the editor: " & tErr)
+   end try
+   put tSalt into sEditSalt
+   put "" into sEditSession            -- force a fresh login under the new password
+   put "true" into sEditOn
+   return ""
+end qsEditEnable
+
+-- The LAN editor URL, logged when the editor is on AND a folder is web-shared (a single
+-- file or no clearweb folder means there is nothing to edit yet - say so instead).
+command qsEditShowLink
+   if sEditOn is not "true" then
+      exit qsEditShowLink
+   end if
+   if qsEditServedRoot() is empty then
+      qsLog "Editing is armed - it becomes reachable once you share a FOLDER via web link (not a single file)."
+      exit qsEditShowLink
+   end if
+   if sCwLanIp is empty then
+      qsLog ("Editor: open http://YOUR-LAN-IP:" & sCwPort & "/" & sCwToken & "/_edit on a device on this network.")
+   else
+      qsLog ("Editor: open http://" & sCwLanIp & ":" & sCwPort & "/" & sCwToken & "/_edit on this network.")
+   end if
+end qsEditShowLink
+
+-- Disable the editor and forget everything about it: no session, no salt, no verifier.
+command qsEditDisable
+   put "false" into sEditOn
+   put "" into sEditSalt
+   put "" into sEditVerify
+   put "" into sEditSession
+end qsEditDisable
+
+-- POST /_edit/login : the request body is the candidate password (raw UTF-8 bytes). On
+-- a correct password we mint a NEW random session token (invalidating any prior one)
+-- and return it as plain text for the browser to keep and send back in x-edit-token. A
+-- wrong password -> 401, with no hint about which half was wrong.
+command qsEditLoginRoute pConn, pRequest
+   local tPass, tKey, tErr, tToken
+   if not qsEditReachable(pConn) then
+      qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
+      exit qsEditLoginRoute
+   end if
+   put textDecode(pRequest["__body"], "UTF-8") into tPass
+   if tPass is empty then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Missing password."
+      exit qsEditLoginRoute
+   end if
+   try
+      put sxPwHash(textEncode(tPass, "UTF-8"), sEditSalt, 32, "2", sxPwMemInteractive()) into tKey
+   catch tErr
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Login failed."
+      exit qsEditLoginRoute
+   end try
+   if not qsEditKeyOpens(tKey) then
+      qsHttpReply pConn, 401, "text/plain; charset=utf-8", "Wrong password."
+      exit qsEditLoginRoute
+   end if
+   put qsMakeToken(kEditTokenBytes) into tToken
+   put tToken into sEditSession
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", tToken
+end qsEditLoginRoute
+
+-- Uniform refusal for an authenticated editor API: 404 when the editor is not even
+-- reachable for this caller (keep it invisible), 401 when it IS reachable but the
+-- request has no valid session (the browser should re-login).
+command qsEditDeny pConn
+   if qsEditReachable(pConn) then
+      qsHttpReply pConn, 401, "text/plain; charset=utf-8", "Not logged in."
+   else
+      qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
+   end if
+end qsEditDeny
+
+-- One URL-decoded query-string value, or empty. Splits on & (as lines) then = (as
+-- items) using DIFFERENT delimiters so neither loop rescans the other's separator -
+-- no mid-loop delimiter change (an xTalk footgun).
+function qsQueryParam pQuery, pName
+   local tLine, tSavedID, tSavedLD, tRet
+   put "" into tRet
+   put the lineDelimiter into tSavedLD
+   put the itemDelimiter into tSavedID
+   set the lineDelimiter to "&"
+   set the itemDelimiter to "="
+   repeat for each line tLine in pQuery
+      if item 1 of tLine is pName then
+         if the number of items of tLine >= 2 then
+            put urlDecode(item 2 to -1 of tLine) into tRet
+         end if
+         exit repeat
+      end if
+   end repeat
+   set the lineDelimiter to tSavedLD
+   set the itemDelimiter to tSavedID
+   return tRet
+end qsQueryParam
+
+-- GET /_edit : the editor page itself. Reachable (enabled + local + served folder)
+-- callers get the self-contained HTML; everyone else gets a 404. The page carries the
+-- login form, so it needs no session yet.
+command qsEditPageRoute pConn, pRequest
+   if not qsEditReachable(pConn) then
+      qsHttpReply pConn, 404, "text/plain; charset=utf-8", "Not found."
+      exit qsEditPageRoute
+   end if
+   qsHttpReply pConn, 200, "text/html; charset=utf-8", qsEditHtml()
+end qsEditPageRoute
+
+-- GET /_edit/api/list : newline-separated relative paths of every file under the
+-- served folder (forward slashes). Auth required.
+command qsEditListRoute pConn, pRequest
+   if not qsEditAuthed(pConn, pRequest) then
+      qsEditDeny pConn
+      exit qsEditListRoute
+   end if
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", qsEditFileList(qsEditServedRoot())
+end qsEditListRoute
+
+-- GET /_edit/api/read?path=REL : the file's bytes as text/plain (UTF-8). Auth
+-- required; the path is confined to the served root by qsEditSafePath, and a file
+-- bigger than the editor cap is refused (a browser textarea is for text/code).
+command qsEditReadRoute pConn, pRequest
+   local tRel, tDisk, tData
+   if not qsEditAuthed(pConn, pRequest) then
+      qsEditDeny pConn
+      exit qsEditReadRoute
+   end if
+   put qsQueryParam(pRequest["__query"], "path") into tRel
+   put qsEditSafePath(qsEditServedRoot(), tRel) into tDisk
+   if tDisk is empty then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
+      exit qsEditReadRoute
+   end if
+   if there is no file tDisk then
+      qsHttpReply pConn, 404, "text/plain; charset=utf-8", "No such file."
+      exit qsEditReadRoute
+   end if
+   put "" into tData
+   open file tDisk for binary read
+   if the result is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Could not open the file."
+      exit qsEditReadRoute
+   end if
+   -- read in chunks and stop the moment we cross the cap (avoids reading a huge file
+   -- twice just to size it; a browser textarea is for text/code, not big binaries)
+   repeat
+      read from file tDisk for 65536
+      if it is empty then
+         exit repeat
+      end if
+      put it after tData
+      if the number of bytes in tData > kEditMaxFileBytes then
+         close file tDisk
+         qsHttpReply pConn, 413, "text/plain; charset=utf-8", "This file is too large to edit in the browser."
+         exit qsEditReadRoute
+      end if
+   end repeat
+   close file tDisk
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", tData
+end qsEditReadRoute
+
+-- PUT /_edit/api/write?path=REL : replace (or create) the file with the request body.
+-- Auth required; qsEditSafePath confines the target to the served root. The body is
+-- already bounded by kFsMaxReq at the transport, and we re-check the editor cap.
+command qsEditWriteRoute pConn, pRequest
+   local tRel, tDisk, tBody, tErr
+   if not qsEditAuthed(pConn, pRequest) then
+      qsEditDeny pConn
+      exit qsEditWriteRoute
+   end if
+   put qsQueryParam(pRequest["__query"], "path") into tRel
+   put qsEditSafePath(qsEditServedRoot(), tRel) into tDisk
+   if tDisk is empty then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
+      exit qsEditWriteRoute
+   end if
+   if there is a folder tDisk then
+      qsHttpReply pConn, 409, "text/plain; charset=utf-8", "That path is a folder."
+      exit qsEditWriteRoute
+   end if
+   put pRequest["__body"] into tBody
+   if the number of bytes in tBody > kEditMaxFileBytes then
+      qsHttpReply pConn, 413, "text/plain; charset=utf-8", "That file is too large to save through the editor."
+      exit qsEditWriteRoute
+   end if
+   open file tDisk for binary write
+   if the result is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", "Could not open the file for writing."
+      exit qsEditWriteRoute
+   end if
+   write tBody to file tDisk
+   put the result into tErr
+   close file tDisk
+   if tErr is not empty then
+      qsHttpReply pConn, 500, "text/plain; charset=utf-8", ("Write failed: " & tErr)
+      exit qsEditWriteRoute
+   end if
+   qsHttpReply pConn, 200, "text/plain; charset=utf-8", "Saved."
+end qsEditWriteRoute
+
+-- Every file under pRoot, as newline-separated forward-slash relative paths. Recursion
+-- is depth-bounded (kEditMaxDepth) so a directory symlink loop cannot run away.
+function qsEditFileList pRoot
+   return qsEditListDir(pRoot, "", 0)
+end qsEditFileList
+
+function qsEditListDir pRoot, pRel, pDepth
+   local tSaved, tFiles, tFolders, tName, tOut, tChildRel, tDiskDir
+   put "" into tOut
+   if pRel is empty then
+      put pRoot into tDiskDir
+   else
+      put pRoot & "/" & pRel into tDiskDir
+   end if
+   put the defaultFolder into tSaved
+   set the defaultFolder to tDiskDir
+   put the files into tFiles
+   put the folders into tFolders
+   set the defaultFolder to tSaved
+   repeat for each line tName in tFiles
+      if tName is empty then
+         next repeat
+      end if
+      if pRel is empty then
+         put tName & return after tOut
+      else
+         put pRel & "/" & tName & return after tOut
+      end if
+   end repeat
+   if pDepth >= kEditMaxDepth then
+      return tOut
+   end if
+   repeat for each line tName in tFolders
+      if tName is "." or tName is ".." or tName is empty then
+         next repeat
+      end if
+      if pRel is empty then
+         put tName into tChildRel
+      else
+         put pRel & "/" & tName into tChildRel
+      end if
+      put qsEditListDir(pRoot, tChildRel, pDepth + 1) after tOut
+   end repeat
+   return tOut
+end qsEditListDir
+
+-- The self-contained editor page: no external assets (CSP/offline safe), all HTML
+-- attributes single-quoted and all JS single-quoted so the string never needs a double
+-- quote. The JS derives its API base from location.pathname (which ends in /_edit,
+-- token prefix and all), logs in for a session token, lists files, and reads/saves via
+-- plain-text endpoints so there is no JSON to parse.
+function qsEditHtml
+   return ("<!doctype html><html><head><meta charset='utf-8'>" & \
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>" & \
+      "<title>TorrentXT Live Editor</title><style>" & \
+      "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;color:#1c2430;background:#fff;height:100vh;display:flex;flex-direction:column}" & \
+      "#bar{padding:.6em .9em;border-bottom:1px solid #e5e8ee;display:flex;gap:.8em;align-items:baseline;flex:0 0 auto}" & \
+      "#bar b{font-size:1.05em}#msg{font-size:.85em}.muted{color:#8a909a}" & \
+      "#login{max-width:24em;margin:3em auto;padding:0 1em}#login input{width:100%;padding:.5em;font-size:1em;margin:.4em 0}" & \
+      "#app{flex:1 1 auto;display:flex;min-height:0}" & \
+      "#files{flex:0 0 15em;overflow:auto;border-right:1px solid #e5e8ee;padding:.4em}" & \
+      "#files .f{padding:.3em .4em;font-size:.86em;cursor:pointer;border-radius:4px;word-break:break-all}" & \
+      "#files .f:hover{background:#eef2f8}#files .f.on{background:#2c5aa0;color:#fff}" & \
+      "#pane{flex:1 1 auto;display:flex;flex-direction:column;min-width:0}" & \
+      "#tools{padding:.4em;display:flex;gap:.4em;border-bottom:1px solid #e5e8ee}" & \
+      "#tools input{flex:1 1 auto;padding:.4em;font-family:ui-monospace,monospace}" & \
+      "button{padding:.4em .8em;cursor:pointer;border:1px solid #b9c1cd;background:#f6f8fb;border-radius:5px}button:hover{background:#eef2f8}" & \
+      "#ed{flex:1 1 auto;width:100%;border:0;padding:.7em;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em;resize:none;outline:none;line-height:1.45}" & \
+      "@media(prefers-color-scheme:dark){body{background:#12151a;color:#dfe4ea}#bar,#files,#tools{border-color:#2a2f38}" & \
+      "#files .f:hover{background:#20242c}#tools input,#ed{background:#12151a;color:#dfe4ea}" & \
+      "button{background:#20242c;color:#dfe4ea;border-color:#39404b}button:hover{background:#2a2f38}}" & \
+      "</style></head><body>" & \
+      "<div id='bar'><b>TorrentXT Live Editor</b><span id='msg' class='muted'>LAN-only. Changes are written to the shared folder.</span></div>" & \
+      "<div id='login'><p>This folder is shared live. Enter the edit password to make changes.</p>" & \
+      "<input id='pw' type='password' placeholder='edit password' autofocus>" & \
+      "<button id='unlock'>Unlock</button></div>" & \
+      "<div id='app' style='display:none'><div id='files'></div>" & \
+      "<div id='pane'><div id='tools'>" & \
+      "<input id='path' placeholder='path/to/file.html' spellcheck='false'>" & \
+      "<button id='save'>Save</button><button id='new'>New</button><button id='reload'>Refresh</button></div>" & \
+      "<textarea id='ed' spellcheck='false' placeholder='Select a file on the left, or type a path and Save to create one.'></textarea>" & \
+      "</div></div>" & \
+      "<script>(function(){" & \
+      "var base=location.pathname.slice(0,location.pathname.lastIndexOf('/_edit'))+'/_edit';" & \
+      "var token='';var cur='';" & \
+      "var msg=document.getElementById('msg');" & \
+      "function say(t){msg.textContent=t;}" & \
+      "function api(p,o){o=o||{};o.headers=o.headers||{};if(token)o.headers['x-edit-token']=token;return fetch(base+p,o);}" & \
+      "function unlock(){var pw=document.getElementById('pw').value;" & \
+      "fetch(base+'/login',{method:'POST',body:pw}).then(function(r){if(!r.ok){say('Login failed. Check the password.');return null;}return r.text();})" & \
+      ".then(function(t){if(!t)return;token=t;document.getElementById('login').style.display='none';document.getElementById('app').style.display='flex';list();})" & \
+      ".catch(function(){say('Network error.');});}" & \
+      "function list(){api('/api/list').then(function(r){return r.text();}).then(function(t){" & \
+      "var box=document.getElementById('files');box.innerHTML='';var n=0;" & \
+      "t.split('\n').forEach(function(name){name=name.trim();if(!name)return;n++;" & \
+      "var d=document.createElement('div');d.className='f';d.textContent=name;" & \
+      "d.onclick=function(){open1(name);};box.appendChild(d);});" & \
+      "say(n+' file(s). Click one to edit.');}).catch(function(){say('Could not list files.');});}" & \
+      "function mark(name){var fs=document.getElementById('files').children;for(var i=0;i<fs.length;i++){fs[i].className=(fs[i].textContent===name)?'f on':'f';}}" & \
+      "function open1(name){api('/api/read?path='+encodeURIComponent(name)).then(function(r){if(!r.ok){say('Could not open '+name);return null;}return r.text();})" & \
+      ".then(function(t){if(t===null)return;cur=name;document.getElementById('path').value=name;document.getElementById('ed').value=t;mark(name);say('Editing '+name);});}" & \
+      "function save(){var p=document.getElementById('path').value.trim();if(!p){say('Enter a file path first.');return;}" & \
+      "api('/api/write?path='+encodeURIComponent(p),{method:'PUT',body:document.getElementById('ed').value}).then(function(r){" & \
+      "return r.text().then(function(t){if(r.ok){say('Saved '+p);if(p!==cur){cur=p;list();}}else{say('Save failed: '+t);}});}).catch(function(){say('Network error.');});}" & \
+      "function newFile(){cur='';document.getElementById('path').value='';document.getElementById('ed').value='';mark('');document.getElementById('path').focus();say('New file - type a path, then Save.');}" & \
+      "document.getElementById('unlock').onclick=unlock;" & \
+      "document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')unlock();});" & \
+      "document.getElementById('save').onclick=save;" & \
+      "document.getElementById('new').onclick=newFile;" & \
+      "document.getElementById('reload').onclick=list;" & \
+      "})();</script></body></html>")
+end qsEditHtml
 
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
 -- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
@@ -2477,6 +2973,60 @@ function qsSiteSpaTarget pRoot, pRelPath
    return tIndex
 end qsSiteSpaTarget
 
+-- THE editor security linchpin. Resolve a browser-supplied relative path to an
+-- absolute disk path *confined to the served root*, or return empty to refuse. It
+-- rejects anything that could climb out or reach an absolute location before it
+-- ever touches the disk: any ".." (dot-dot in any segment), any ":" (a Windows
+-- drive or a scheme like http:), and any control byte (NUL / CR / LF / tab, which
+-- could smuggle a second path or fool the OS). Then it rebuilds the path from clean
+-- segments only - "" and "." are dropped, a bare ".." aborts - so the result is
+-- always pRoot followed by ordinary names. Mirrored byte-for-byte by edit_safe_path
+-- in tests/fileserver_golden.py, which pins ~20 adversarial vectors; change both
+-- together or the confinement guarantee drifts. NOTE this is LEXICAL confinement: the
+-- returned string is guaranteed under pRoot, but if the sharer placed a SYMLINK inside
+-- the shared folder pointing elsewhere, the OS follows it on open. The editor never
+-- CREATES links (a save always writes a regular file), so this is only reachable via a
+-- link the sharer put there themselves - on a LAN-only, password-gated surface. Don't
+-- share a folder containing links you would not want followed.
+function qsEditSafePath pRoot, pRelPath
+   local tRel, tSeg, tOut, tSavedID, tCh, tBad
+   put pRelPath into tRel
+   replace "\" with "/" in tRel
+   if tRel contains ".." then
+      return ""
+   end if
+   if tRel contains ":" then
+      return ""
+   end if
+   put false into tBad
+   repeat for each char tCh in tRel
+      if charToNum(tCh) < 32 then
+         put true into tBad
+      end if
+   end repeat
+   if tBad then
+      return ""
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   put "" into tOut
+   repeat for each item tSeg in tRel
+      if tSeg is empty or tSeg is "." then
+         next repeat
+      end if
+      if tSeg is ".." then
+         set the itemDelimiter to tSavedID
+         return ""
+      end if
+      put "/" & tSeg after tOut
+   end repeat
+   set the itemDelimiter to tSavedID
+   if tOut is empty then
+      return ""
+   end if
+   return pRoot & tOut
+end qsEditSafePath
+
 -- Shared page chrome. Single-quoted HTML attributes so the string literals never
 -- contain a double quote. Light + dark, mobile-friendly, no external assets.
 function qsFsPageTop pTitle
@@ -2731,6 +3281,7 @@ command qsStartClearweb pPath, pName
    qsCwFetchPublicIp
    qsCwShowLinks       -- qsCwStatusText (inside) sets the Sharing line for the state
    qsLog "Web share started for " & quote & sCwName & quote & " on port " & tPort & ". On the same network the link works right away."
+   qsEditShowLink      -- if the editor is armed and this is a folder, point to /_edit
 end qsStartClearweb
 
 command qsStopClearweb
@@ -3062,14 +3613,19 @@ on socketTimeout pSocketID
 end socketTimeout
 
 -- A random capability token, hex (URL-safe). Uses cryptoXT's CSPRNG when present;
--- else OXT's random() (weaker, but still an unguessable demo link).
-function qsMakeToken
-   local tRaw, tHex, tI, tByte
+-- else OXT's random() (weaker, but still an unguessable demo link). pBytes is the
+-- entropy in bytes; empty defaults to the clearweb token size.
+function qsMakeToken pBytes
+   local tRaw, tHex, tI, tByte, tN
+   put pBytes into tN
+   if tN is not a number or tN < 1 then
+      put kCwTokenBytes into tN
+   end if
    put "" into tRaw
    if sCanEncrypt then
-      put sxRandomBytes(kCwTokenBytes) into tRaw
+      put sxRandomBytes(tN) into tRaw
    else
-      repeat kCwTokenBytes times
+      repeat tN times
          put numToByte(random(256) - 1) after tRaw
       end repeat
    end if
@@ -3551,6 +4107,40 @@ command qsToggleWeb
       set the hilite of button "qsWebCheck" to true
    end if
 end qsToggleWeb
+
+-- Flip the "Enable web editing" checkbox (managed two-state; autoHilite off). ON arms
+-- the LAN-only editor from the edit password (a fresh Argon2id key + verifier); OFF
+-- forgets the password and any live login session. Anything that would leave it half-on
+-- (no cryptoXT, blank password, KDF error) reports and leaves the box unchecked.
+command qsToggleEdit
+   local tPass, tErr
+   if sEditOn is "true" then
+      qsEditDisable
+      set the hilite of button "qsEditToggle" to false
+      qsLog "Live web editing turned OFF."
+      exit qsToggleEdit
+   end if
+   if not sCanEncrypt then
+      set the hilite of button "qsEditToggle" to false
+      qsLog "Live editing needs cryptoXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
+      exit qsToggleEdit
+   end if
+   put field "qsEditPass" into tPass
+   if tPass is empty then
+      set the hilite of button "qsEditToggle" to false
+      qsLog "Type an edit password first, then tick 'Enable web editing'."
+      exit qsToggleEdit
+   end if
+   put qsEditEnable(tPass) into tErr
+   if tErr is not empty then
+      set the hilite of button "qsEditToggle" to false
+      qsLog tErr
+      exit qsToggleEdit
+   end if
+   set the hilite of button "qsEditToggle" to true
+   qsLog "Live web editing is ON (LAN devices only)."
+   qsEditShowLink
+end qsToggleEdit
 
 command qsCopyWebLink
    if field "qsWebLink" is empty then

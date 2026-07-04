@@ -132,6 +132,26 @@ the browser gives up. Routes run on the one UI thread, so keep a handler **light
 (return quickly); for real data a handler can read/write files or use the engine's
 SQLite. This is a small backend for a self-hosted appliance, not a high-traffic server.
 
+**Edit it live from a browser.** Tick **Enable web editing** and set an **edit
+password**, and the web-shared *folder* becomes editable from a browser: open the shared
+link with **`/_edit`** on the end (e.g. `http://<ip>:<port>/<token>/_edit`) to get a tiny
+built-in editor - a file list, a text pane, and Save. This is deliberately locked down:
+- **LAN-only, always.** The editor answers **only devices on your own local network** -
+  it decides from the browser's TCP address (which a remote client cannot forge), not any
+  header. **Internet and Tor visitors can view the site but can never reach the editor**,
+  even while the port is open to the world for the public link. Carrier-NAT (100.64/10)
+  addresses are treated as *remote*, not LAN.
+- **Password-gated.** The password is run through **Argon2id** (via **cryptoXT** /
+  `org.openxtalk.library.sodium`); a correct login mints a random session token the
+  browser sends back on every save. Without cryptoXT the editor cannot be enabled.
+- **Off by default**, and confined: every write is resolved by `qsEditSafePath`, which
+  refuses anything that could escape the served folder (any `..`, drive/`scheme:` colon,
+  or control byte), so a save can only ever land **inside the shared folder**.
+- It edits **text/code** files up to ~256 KB (a browser textarea, not a binary editor).
+
+The LAN-only rule and the write-path confinement are pinned by adversarial vectors in
+`tests/fileserver_golden.py` (`edit_is_local`, `edit_safe_path`).
+
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
 `.torrent` path, or a 40-hex info-hash into the Add box (or drag one onto the
