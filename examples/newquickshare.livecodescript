@@ -205,7 +205,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2026-12"
+constant kQsUiVersion = "nqs-ui-2027-01"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -343,22 +343,24 @@ command qsBuild
    -- =============== LEFT: SEND ===============
    qsPanel "qsSendPanel", "20,62,620,584"
    qsHdr "qsSendHdr", "1     Send a file or folder", "36,72,420,96"
-   qsLabel "qsMethodCap", "How do you want to share it?", "36,106,420,124", 11
+   -- Signal that a sensible default is already picked (so no up-front decision is demanded),
+   -- and keep the jargon out of the labels (it lives in the grey captions + tooltips).
+   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "36,106,604,124", 11
    set the textStyle of field "qsMethodCap" to "bold"
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
    -- sTorSend/sWebShare by qsSetMethod/qsSyncMethod). Each has a one-line plain caption.
    qsButton "qsMethodCode", "Share code", "36,126,190,148"
    set the style of button "qsMethodCode" to "radioButton"
    set the autoHilite of button "qsMethodCode" to false
-   qsCap "qsMethodCodeD", "Peer-to-peer, resumable.", "56,148,220,166"
+   qsCap "qsMethodCodeD", "Resumable. Needs the app.", "56,148,230,166"
    qsButton "qsMethodTor", "Private - Tor", "236,126,400,148"
    set the style of button "qsMethodTor" to "radioButton"
    set the autoHilite of button "qsMethodTor" to false
-   qsCap "qsMethodTorD", "Hides both IPs; no torrent.", "256,148,432,166"
+   qsCap "qsMethodTorD", "Hides both IP addresses.", "256,148,432,166"
    qsButton "qsMethodWeb", "Web link", "432,126,600,148"
    set the style of button "qsMethodWeb" to "radioButton"
    set the autoHilite of button "qsMethodWeb" to false
-   qsCap "qsMethodWebD", "Any browser, no app.", "452,148,604,166"
+   qsCap "qsMethodWebD", "Any browser. Not encrypted.", "440,148,604,166"
    -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
    qsLabel "qsSendPassCap", "Encrypt (optional):", "36,180,176,198", 11
    qsField "qsSendPass", "184,176,604,202", false
@@ -1820,12 +1822,60 @@ end qsSetMethod
 
 -- Paint the three radios from the current state (both off = the Share code option).
 command qsSyncMethod
+   local tIsTor, tIsWeb, tIsCode
    if there is no button "qsMethodCode" then
       exit qsSyncMethod
    end if
    set the hilite of button "qsMethodTor" to (sTorSend is "true")
    set the hilite of button "qsMethodWeb" to (sWebShare is "true")
    set the hilite of button "qsMethodCode" to (sTorSend is not "true" and sWebShare is not "true")
+   put (sTorSend is "true") into tIsTor
+   put (sWebShare is "true") into tIsWeb
+   put (not tIsTor and not tIsWeb) into tIsCode
+   -- ENCRYPT ROW: show the passphrase field only where encryption can actually work
+   -- (Share code, or Tor). For a Web link a browser cannot decrypt, and without cryptoXT
+   -- nothing can - in both cases HIDE the field and turn the caption into a full-width
+   -- plain-English reason, so the affordance never misleads (qsShareFile already ignores
+   -- a passphrase on the web branch, so this changes no share behaviour).
+   if tIsWeb then
+      set the visible of field "qsSendPass" to false
+      set the rect of field "qsSendPassCap" to "36,180,604,198"
+      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      put "Not encrypted - a web link opens in any browser, which cannot decrypt." into field "qsSendPassCap"
+   else if sCanEncrypt is not "true" then
+      set the visible of field "qsSendPass" to false
+      set the rect of field "qsSendPassCap" to "36,180,604,198"
+      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      put "Encrypt: install cryptoXT (org.openxtalk.library.sodium) to lock this file." into field "qsSendPassCap"
+   else
+      set the visible of field "qsSendPass" to true
+      set the rect of field "qsSendPassCap" to "36,180,176,198"
+      set the foregroundColor of field "qsSendPassCap" to empty   -- restore the default dark
+      put "Encrypt (optional):" into field "qsSendPassCap"
+   end if
+   -- MORE OPTIONS: reveal only the advanced control(s) that apply to THIS method; the
+   -- common Share-code path shows NONE (fully decluttered). qsWebLink/qsWebCopy are a
+   -- SHARED secondary-link OUTPUT (both the Tor web-download AND the clearweb Web path
+   -- write to it), so they stay visible for tor AND web - only qsWebCheck is Tor-only and
+   -- the editor group is Web-only.
+   set the visible of field "qsMoreCap" to (not tIsCode)
+   set the visible of button "qsWebCheck" to tIsTor
+   set the visible of field "qsWebLink" to (not tIsCode)
+   set the visible of button "qsWebCopy" to (not tIsCode)
+   set the visible of button "qsEditToggle" to tIsWeb
+   set the visible of field "qsEditPassCap" to tIsWeb
+   set the visible of field "qsEditPass" to tIsWeb
+   set the visible of field "qsEditHint" to tIsWeb
+   -- never leave an advanced mode silently armed once its context is gone (the qsOnionPill
+   -- idiom); guarded so this is a no-op at build time when nothing was armed.
+   if sWebServe is "true" and not tIsTor then
+      put "false" into sWebServe
+      set the hilite of button "qsWebCheck" to false
+   end if
+   if sEditOn is "true" and not tIsWeb then
+      qsEditDisable
+      set the hilite of button "qsEditToggle" to false
+   end if
 end qsSyncMethod
 
 -- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
