@@ -2109,6 +2109,11 @@ function qsHttpParseHead pHeadBytes
       if tColon > 1 then
          put toLower(qsTrim(char 1 to (tColon - 1) of tLine)) into tName
          put qsTrim(char (tColon + 1) to -1 of tLine) into tValue
+         -- "__" is our reserved pseudo-field namespace (__method/__path/__query/__body);
+         -- never let a client header shadow one. (Real HTTP header names never start "__".)
+         if tName begins with "__" then
+            next repeat
+         end if
          put tValue into tOut[tName]
       end if
    end repeat
@@ -2557,6 +2562,13 @@ command qsEditWriteRoute pConn, pRequest
    if the number of bytes in tBody > kEditMaxFileBytes then
       qsHttpReply pConn, 413, "text/plain; charset=utf-8", "That file is too large to save through the editor."
       exit qsEditWriteRoute
+   end if
+   -- REPLACE the file wholesale. `open file ... for binary write` does NOT truncate in
+   -- this engine (it overwrites from offset 0 and leaves any longer tail in place), so
+   -- saving a SHORTER file would otherwise keep stale trailing bytes. Delete first - the
+   -- same guard qsEncryptFile uses - so the saved bytes are exactly the new content.
+   if there is a file tDisk then
+      delete file tDisk
    end if
    open file tDisk for binary write
    if the result is not empty then
