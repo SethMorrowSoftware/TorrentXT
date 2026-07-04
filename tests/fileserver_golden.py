@@ -14,6 +14,7 @@ Mirrors these LiveCodeScript handlers:
   qsFsParseRange  -> parse_range()      (RFC 7233 single-range; 416 on out-of-range)
   qsFsServePath   -> traversal_ok()     (".." refused after urlDecode + \\ -> /)
   qsFsMime        -> mime()
+  qsFsIcon        -> fs_icon()          (directory-listing icon/colour type token)
   qsFsHtmlEscape  -> html_escape()
   qsCwServe       -> capability_route() (clearweb: the /<token>/ capability gate)
   qsSiteSpaTarget -> spa_is_route()     (SPA fallback: a route vs a missing asset)
@@ -135,6 +136,31 @@ def mime(path):
     # is its own last item -> unknown -> octet-stream).
     extn = path.split(".")[-1].lower()
     return _MIME.get(extn, "application/octet-stream")
+
+
+# ---- qsFsIcon: directory-listing icon/colour type token ---------------------
+# Groups a filename (or folder) into one of dir/img/vid/aud/code/doc/zip/pdf/file for
+# the listing's per-row icon. Same extension-family idea as mime(); mirrors qsFsIcon.
+
+_ICON = {
+    "img": "png jpg jpeg gif webp svg ico avif bmp heic",
+    "vid": "mp4 m4v webm mov mkv avi",
+    "aud": "mp3 ogg oga wav flac m4a aac",
+    "code": "html htm css js mjs json xml yml yaml wasm map ts tsx jsx py rb go rs c h cpp sh",
+    "doc": "txt md log csv doc docx rtf odt",
+    "zip": "zip tar gz tgz rar 7z bz2 xz",
+    "pdf": "pdf",
+}
+
+
+def fs_icon(name, is_dir):
+    if is_dir:
+        return "dir"
+    extn = name.split(".")[-1].lower()
+    for token, exts in _ICON.items():
+        if extn in exts.split():
+            return token
+    return "file"
 
 
 # ---- fsHtmlEscape: & first, then the rest -----------------------------------
@@ -459,6 +485,26 @@ def main():
     ]:
         check("edit_safe_path(%r)" % rel, edit_safe_path(R, rel), want)
 
+    # -- directory-listing icon classification --
+    for name, is_dir, want in [
+        ("photos", True, "dir"),                  # a folder
+        ("index.html", False, "code"),            # web source -> code icon
+        ("app.min.js", False, "code"),            # last ext only
+        ("styles.css", False, "code"),
+        ("logo.PNG", False, "img"),               # case-insensitive
+        ("clip.mp4", False, "vid"),
+        ("song.flac", False, "aud"),
+        ("notes.txt", False, "doc"),
+        ("readme.md", False, "doc"),
+        ("data.csv", False, "doc"),
+        ("archive.tar.gz", False, "zip"),         # final ext gz -> zip
+        ("manual.pdf", False, "pdf"),
+        ("photo.heic", False, "img"),
+        ("blob.bin", False, "file"),              # unknown -> generic
+        ("Makefile", False, "file"),              # no extension -> generic
+    ]:
+        check("fs_icon(%r)" % name, fs_icon(name, is_dir), want)
+
     # -- editor LAN-first gate (only local peers may reach the editor) --
     for conn, want in [
         ("cw:192.168.1.5:52000", True),           # home LAN
@@ -499,9 +545,9 @@ def main():
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
-    print("fileserver_golden: OK (range parse, traversal guard, MIME, HTML escape, "
-          "capability gate, SPA fallback, HTTP framing, JSON escape, editor confinement, "
-          "LAN-first gate, query parse all match)")
+    print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
+          "HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape, "
+          "editor confinement, LAN-first gate, query parse all match)")
     return 0
 
 

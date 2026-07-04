@@ -2920,41 +2920,115 @@ end qsFsWatchdog
 -- HTML-escaped and path-encoded; links are relative so a subfolder browses in.
 -- Per-file sizes are omitted (OXT has no cheap size call - sizing every file would
 -- read each one just to draw a page); the size is in each file's Content-Length.
+-- The browsable directory page (used by BOTH transports). A card with a header
+-- (folder icon + path + item-count pill), one rounded row per entry with a
+-- type-coloured icon, and a brand footer. Per-file sizes are omitted on purpose (OXT
+-- has no cheap size call - sizing every file would read each one just to draw a page);
+-- each file's size is in its Content-Length. Rows are built first so the header can
+-- show the final count.
 function qsFsListing pDiskFolder, pUrlPath
-   local tSaved, tFiles, tFolders, tName, tOut, tCount
+   local tSaved, tFiles, tFolders, tName, tRows, tOut, tCount, tHeading
    put the defaultFolder into tSaved
    set the defaultFolder to pDiskFolder
    put the files into tFiles
    put the folders into tFolders
    set the defaultFolder to tSaved
-   put qsFsPageTop("Index of " & qsFsHtmlEscape(pUrlPath)) into tOut
-   put "<h1>Index of " & qsFsHtmlEscape(pUrlPath) & "</h1><ul class='fl'>" after tOut
-   if pUrlPath is not "/" then
-      put "<li class='up'><a href='../'>.. (up a level)</a></li>" after tOut
-   end if
+   put "" into tRows
    put 0 into tCount
+   if pUrlPath is not "/" then
+      put "<li class='up'><a href='../'><svg class='ic'><use href='#i-up'/></svg><span class='nm'>Up a level</span></a></li>" after tRows
+   end if
    repeat for each line tName in tFolders
-      if tName is "." or tName is ".." then
+      if tName is "." or tName is ".." or tName is empty then
          next repeat
       end if
-      put "<li class='dir'><a href='" & qsFsPathEncode(tName) & "/'>" & qsFsHtmlEscape(tName) & "/</a></li>" after tOut
+      put "<li class='dir t-dir'><a href='" & qsFsPathEncode(tName) & "/'>" & \
+         "<svg class='ic'><use href='#i-dir'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
       add 1 to tCount
    end repeat
    repeat for each line tName in tFiles
       if tName is empty then
          next repeat
       end if
-      put "<li class='file'><a href='" & qsFsPathEncode(tName) & "'>" & qsFsHtmlEscape(tName) & "</a></li>" after tOut
+      put "<li class='file t-" & qsFsIcon(tName, false) & "'><a href='" & qsFsPathEncode(tName) & "'>" & \
+         "<svg class='ic'><use href='#i-" & qsFsIcon(tName, false) & "'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
       add 1 to tCount
    end repeat
-   put "</ul><p class='muted'>" & tCount & " item(s) - shared anonymously over Tor. Downloads resume if interrupted.</p>" after tOut
+   if pUrlPath is "/" then
+      put "Home" into tHeading
+   else
+      put qsFsHtmlEscape(pUrlPath) into tHeading
+   end if
+   put qsFsPageTop("Index of " & qsFsHtmlEscape(pUrlPath)) into tOut
+   put qsFsIconSprite() after tOut
+   put "<main class='card'><header class='hd'><svg class='fi'><use href='#i-dir'/></svg>" & \
+      "<h1>" & tHeading & "</h1><span class='cnt'>" & tCount & " item(s)</span></header>" after tOut
+   put "<ul class='fl'>" & tRows & "</ul>" after tOut
+   put "<footer class='ft'><svg class='ic'><use href='#i-dl'/></svg>" & \
+      "<span>Shared with <b>TorrentXT</b> - downloads resume if interrupted.</span></footer></main>" after tOut
    put qsFsPageBottom() after tOut
    return tOut
 end qsFsListing
 
+-- Classify a file (or folder) into an icon/colour type token used by the listing:
+-- one of dir/img/vid/aud/code/doc/zip/pdf/file. Mirrors qsFsMime's extension families;
+-- the extension is the last dot-item, lowercased. Item delimiter is saved + restored
+-- around the whole lookup (it is set to '.' then ',' internally), with a SINGLE exit so
+-- it can never leak. Pinned by fs_icon() in tests/fileserver_golden.py.
+function qsFsIcon pName, pIsDir
+   local tExtn, tSavedID, tType
+   if pIsDir then
+      return "dir"
+   end if
+   put "file" into tType
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "."
+   put toLower(the last item of pName) into tExtn
+   set the itemDelimiter to ","
+   if tExtn is among the items of "png,jpg,jpeg,gif,webp,svg,ico,avif,bmp,heic" then
+      put "img" into tType
+   else if tExtn is among the items of "mp4,m4v,webm,mov,mkv,avi" then
+      put "vid" into tType
+   else if tExtn is among the items of "mp3,ogg,oga,wav,flac,m4a,aac" then
+      put "aud" into tType
+   else if tExtn is among the items of "html,htm,css,js,mjs,json,xml,yml,yaml,wasm,map,ts,tsx,jsx,py,rb,go,rs,c,h,cpp,sh" then
+      put "code" into tType
+   else if tExtn is among the items of "txt,md,log,csv,doc,docx,rtf,odt" then
+      put "doc" into tType
+   else if tExtn is among the items of "zip,tar,gz,tgz,rar,7z,bz2,xz" then
+      put "zip" into tType
+   else if tExtn is "pdf" then
+      put "pdf" into tType
+   end if
+   set the itemDelimiter to tSavedID
+   return tType
+end qsFsIcon
+
+-- The icon set as a hidden inline SVG sprite (defined once per page; each row references
+-- a symbol with <use>). Feather-style line icons; they inherit stroke + colour from the
+-- .ic / .t-* CSS, so the same geometry recolours per type and adapts to dark mode.
+function qsFsIconSprite
+   return ("<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0' style='position:absolute' aria-hidden='true'>" & \
+      "<symbol id='i-dir' viewBox='0 0 24 24'><path d='M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z'/></symbol>" & \
+      "<symbol id='i-file' viewBox='0 0 24 24'><path d='M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z'/><polyline points='13 2 13 9 20 9'/></symbol>" & \
+      "<symbol id='i-img' viewBox='0 0 24 24'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></symbol>" & \
+      "<symbol id='i-vid' viewBox='0 0 24 24'><polygon points='23 7 16 12 23 17 23 7'/><rect x='1' y='5' width='15' height='14' rx='2'/></symbol>" & \
+      "<symbol id='i-aud' viewBox='0 0 24 24'><path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/></symbol>" & \
+      "<symbol id='i-code' viewBox='0 0 24 24'><polyline points='16 18 22 12 16 6'/><polyline points='8 6 2 12 8 18'/></symbol>" & \
+      "<symbol id='i-doc' viewBox='0 0 24 24'><path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14 2 14 8 20 8'/><line x1='16' y1='13' x2='8' y2='13'/><line x1='16' y1='17' x2='8' y2='17'/></symbol>" & \
+      "<symbol id='i-pdf' viewBox='0 0 24 24'><path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14 2 14 8 20 8'/><line x1='16' y1='13' x2='8' y2='13'/><line x1='16' y1='17' x2='8' y2='17'/></symbol>" & \
+      "<symbol id='i-zip' viewBox='0 0 24 24'><path d='M21 8v13H3V8'/><rect x='1' y='3' width='22' height='5'/><line x1='10' y1='12' x2='14' y2='12'/></symbol>" & \
+      "<symbol id='i-up' viewBox='0 0 24 24'><polyline points='9 14 4 9 9 4'/><path d='M20 20v-7a4 4 0 0 0-4-4H4'/></symbol>" & \
+      "<symbol id='i-dl' viewBox='0 0 24 24'><path d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'/><polyline points='7 10 12 15 17 10'/><line x1='12' y1='15' x2='12' y2='3'/></symbol>" & \
+      "<symbol id='i-warn' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></symbol>" & \
+      "</svg>")
+end qsFsIconSprite
+
 function qsFsNotFound pPath
-   return qsFsPageTop("Not found") & "<h1>Not found</h1><p class='muted'>There is nothing at " & \
-      qsFsHtmlEscape(pPath) & " in this share.</p><p><a href='/'>Back to the top</a></p>" & qsFsPageBottom()
+   return (qsFsPageTop("Not found") & qsFsIconSprite() & \
+      "<main class='card'><header class='hd'><svg class='fi' style='color:#dc2626'><use href='#i-warn'/></svg>" & \
+      "<h1>Not found</h1></header><div class='msg'>There is nothing at " & qsFsHtmlEscape(pPath) & \
+      " in this share.<br><br><a href='/'>Back to the top</a></div></main>" & qsFsPageBottom())
 end qsFsNotFound
 
 -- Single-page-app fallback (auto, no configuration). When a request does not resolve
@@ -3041,17 +3115,41 @@ end qsEditSafePath
 
 -- Shared page chrome. Single-quoted HTML attributes so the string literals never
 -- contain a double quote. Light + dark, mobile-friendly, no external assets.
+-- Shared page chrome (folder listing, 404, web-download-off). Single-quoted HTML
+-- attributes so the string literal never needs a double quote. A centred card with a
+-- gradient header, rounded rows, type-coloured icons, and a brand footer; light + dark,
+-- mobile-friendly, fully self-contained (no external asset - required over Tor and CSP).
 function qsFsPageTop pTitle
    return ("<!doctype html><html><head><meta charset='utf-8'>" & \
       "<meta name='viewport' content='width=device-width,initial-scale=1'>" & \
       "<title>" & pTitle & "</title><style>" & \
-      "body{font-family:system-ui,-apple-system,sans-serif;max-width:46em;margin:2.4em auto;padding:0 1.1em;color:#1c2430;background:#fff}" & \
-      "h1{font-size:1.25em;border-bottom:1px solid #e5e8ee;padding-bottom:.4em}" & \
-      "ul.fl{list-style:none;padding:0;margin:1em 0}ul.fl li{padding:.34em .2em;border-bottom:1px solid #f0f2f6}" & \
-      "ul.fl li.dir a{font-weight:600}a{color:#2c5aa0;text-decoration:none}a:hover{text-decoration:underline}" & \
-      ".muted{color:#8a909a;font-size:.9em}" & \
-      "@media(prefers-color-scheme:dark){body{background:#12151a;color:#dfe4ea}h1{border-color:#2a2f38}" & \
-      "ul.fl li{border-color:#20242c}a{color:#7ea6e0}.muted{color:#828a96}}" & \
+      "*{box-sizing:border-box}" & \
+      "body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:2.2em 1em;color:#1c2430;background:#f4f6fa;-webkit-font-smoothing:antialiased}" & \
+      ".card{max-width:52em;margin:0 auto;background:#fff;border:1px solid #e6e9f0;border-radius:14px;box-shadow:0 1px 3px rgba(20,30,50,.06),0 10px 34px rgba(20,30,50,.05);overflow:hidden}" & \
+      ".hd{display:flex;align-items:center;gap:.7em;padding:1.05em 1.25em;border-bottom:1px solid #eef1f6;background:linear-gradient(180deg,#fbfcfe,#f5f8fc)}" & \
+      ".hd .fi{width:26px;height:26px;color:#2c5aa0;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}" & \
+      ".hd h1{font-size:1.05em;margin:0;font-weight:640;letter-spacing:.2px;word-break:break-all}" & \
+      ".hd .cnt{margin-left:auto;font-size:.76em;color:#5b6472;background:#eef2f8;border:1px solid #e2e8f2;padding:.18em .62em;border-radius:999px;white-space:nowrap}" & \
+      "ul.fl{list-style:none;margin:0;padding:.4em}" & \
+      "ul.fl li a{display:flex;align-items:center;gap:.72em;padding:.5em .72em;border-radius:9px;color:inherit;text-decoration:none;transition:background .12s}" & \
+      "ul.fl li a:hover{background:#f1f5fb}" & \
+      "ul.fl li .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" & \
+      "ul.fl li.dir .nm{font-weight:600;color:#2c5aa0}" & \
+      "ul.fl li.up a{color:#8a909a}ul.fl li.up .nm{font-size:.9em}" & \
+      ".ic{width:20px;height:20px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}" & \
+      ".t-dir .ic{color:#e8a317}.t-img .ic{color:#22a06b}.t-vid .ic{color:#8b5cf6}.t-aud .ic{color:#ec4899}" & \
+      ".t-code .ic{color:#3b82f6}.t-doc .ic{color:#64748b}.t-zip .ic{color:#b45309}.t-pdf .ic{color:#dc2626}.t-file .ic{color:#94a3b8}" & \
+      ".ft{display:flex;align-items:center;gap:.5em;padding:.85em 1.25em;border-top:1px solid #eef1f6;background:#fafbfd;color:#8a909a;font-size:.82em}" & \
+      ".ft .ic{width:15px;height:15px;color:#2c5aa0}.ft b{font-weight:600;color:#2c5aa0}" & \
+      ".msg{padding:1.4em 1.25em;color:#5b6472;line-height:1.55}.msg a{color:#2c5aa0}" & \
+      "@media(prefers-color-scheme:dark){" & \
+      "body{background:#0e1116;color:#dfe4ea}" & \
+      ".card{background:#161a20;border-color:#262c35;box-shadow:0 1px 3px rgba(0,0,0,.3),0 12px 38px rgba(0,0,0,.32)}" & \
+      ".hd{background:linear-gradient(180deg,#1a1f26,#161a20);border-color:#242a33}" & \
+      ".hd .fi{color:#7ea6e0}.hd .cnt{background:#20262f;border-color:#2b323c;color:#aab2bf}" & \
+      "ul.fl li a:hover{background:#1e242c}ul.fl li.dir .nm{color:#7ea6e0}" & \
+      ".ft{background:#141820;border-color:#242a33;color:#828a96}.ft .ic,.ft b{color:#7ea6e0}" & \
+      ".msg{color:#aab2bf}.msg a{color:#7ea6e0}}" & \
       "</style></head><body>")
 end qsFsPageTop
 
@@ -4165,10 +4263,10 @@ end qsCopyWebLink
 
 -- Shown to a browser when the sender did NOT tick 'Serve as web download'.
 function qsHtmlDisabled
-   return ("<!doctype html><html><head><meta charset='utf-8'><title>Not available</title></head>" & \
-      "<body style='font-family:system-ui,sans-serif;max-width:34em;margin:3em auto;padding:0 1em'>" & \
-      "<h2>Web download is off</h2><p>The sender shared this file for the app only. Ask them for the " & \
-      "share code, or to tick 'Serve as web download'.</p></body></html>")
+   return (qsFsPageTop("Not available") & qsFsIconSprite() & \
+      "<main class='card'><header class='hd'><svg class='fi' style='color:#e8a317'><use href='#i-warn'/></svg>" & \
+      "<h1>Web download is off</h1></header><div class='msg'>The sender shared this file for the app only. " & \
+      "Ask them for the share code, or to tick 'Serve as web download'.</div></main>" & qsFsPageBottom())
 end qsHtmlDisabled
 
 command qsLog pMsg

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="TorrentXT">
+  <defs>
+    <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="42" height="42" rx="11" fill="url(#lg)"/>
+  <g fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="24" cy="14" r="3.4"/>
+    <circle cx="15" cy="33" r="3.4"/>
+    <circle cx="33" cy="33" r="3.4"/>
+    <path d="M24 17.4V26M24 26l-7 5M24 26l7 5"/>
+  </g>
+</svg>
