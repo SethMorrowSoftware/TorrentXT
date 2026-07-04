@@ -205,7 +205,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2027-02"
+constant kQsUiVersion = "nqs-ui-2027-03"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- One palette for every generated control, so the whole surface shifts together
@@ -418,33 +418,40 @@ command qsBuild
    set the backgroundColor of this card to kClrPage
    set the title of this stack to "newQuickShare"
 
-   -- title band + tagline + live Tor status chip (repainted only by qsOnionPill)
-   qsLabel "qsTitle", "newQuickShare", "0,0,1100,56", 16
-   set the opaque of field "qsTitle" to true
-   set the backgroundColor of field "qsTitle" to kClrBand
+   -- title band (a plain filled graphic) + tagline + live Tor status chip. Each
+   -- band label auto-sizes in qsLabel, then is CENTERED on the band's midline
+   -- (y 28) by its measured height - no font-metric guessing (the pass-1 lesson).
+   qsGfx "qsTitleBg", "0,0,1100,56"
+   set the style of graphic "qsTitleBg" to "rectangle"
+   set the filled of graphic "qsTitleBg" to true
+   set the backgroundColor of graphic "qsTitleBg" to kClrBand
+   set the lineSize of graphic "qsTitleBg" to 0
+   qsLabel "qsTitle", "newQuickShare", "12,4,400,52", 16
    set the foregroundColor of field "qsTitle" to kClrBandText
    set the textStyle of field "qsTitle" to "bold"
-   set the margins of field "qsTitle" to "20,17,8,8"   -- padding, not space-hacks
-   qsLabel "qsTagline", "Send & receive files - by code, over Tor, or a web link.", "240,22,820,40", 10
+   set the top of field "qsTitle" to (28 - ((the height of field "qsTitle") div 2))
+   qsLabel "qsTagline", "Send & receive files - by code, over Tor, or a web link.", "240,4,830,52", 10
    set the foregroundColor of field "qsTagline" to kClrBandSub
+   set the top of field "qsTagline" to (28 - ((the height of field "qsTagline") div 2))
    -- the Tor chip: a rounded pill whose color + text track the daemon state
-   qsGfx "qsTorPillBg", "880,15,1080,41"
-   set the roundRadius of graphic "qsTorPillBg" to 13
+   qsGfx "qsTorPillBg", "870,14,1080,42"
+   set the roundRadius of graphic "qsTorPillBg" to 14
    set the filled of graphic "qsTorPillBg" to true
    set the backgroundColor of graphic "qsTorPillBg" to kClrPillOff
    set the lineSize of graphic "qsTorPillBg" to 0
-   qsLabel "qsTorPill", "Tor: off", "888,21,1072,37", 10
+   qsLabel "qsTorPill", "Tor: off", "878,4,1072,52", 10
    set the foregroundColor of field "qsTorPill" to kClrPillOffText
    set the textAlign of field "qsTorPill" to "center"
+   set the top of field "qsTorPill" to (28 - ((the height of field "qsTorPill") div 2))
 
    -- =============== LEFT: SEND ===============
    qsPanel "qsSendPanel", "20,72,620,596"
-   qsBadge "qsStep1", "40,86,66,112", "1"
-   qsHdr "qsSendHdr", "Send a file or folder", "76,90,440,110"
+   qsBadge "qsStep1", "40,90,66,116", "1"
+   qsHdr "qsSendHdr", "Send a file or folder", "76,86,440,114"
    -- Signal that a sensible default is already picked (so no up-front decision is
    -- demanded), and keep the jargon out of the labels (it lives in the grey
    -- captions + tooltips).
-   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "40,126,600,142", 10
+   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "40,124,600,144", 10
    set the textStyle of field "qsMethodCap" to "bold"
    set the foregroundColor of field "qsMethodCap" to kClrInkSoft
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
@@ -463,7 +470,7 @@ command qsBuild
    set the autoHilite of button "qsMethodWeb" to false
    qsCap "qsMethodWebD", "Any browser. Not encrypted.", "439,170,600,186"
    -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
-   qsLabel "qsSendPassCap", "Encrypt (optional):", "40,198,164,214", 10
+   qsLabel "qsSendPassCap", "Encrypt (optional):", "40,193,164,215", 10
    qsField "qsSendPass", "172,194,600,222", false
    -- the drag zone: the hero action, so it gets the most visual weight - a dashed
    -- rounded target (qsDropBg) with a transparent click/drop overlay field on top
@@ -494,27 +501,27 @@ command qsBuild
    qsButton "qsChooseFile", "Choose a file...", "40,340,314,368"
    qsButton "qsChooseFolder", "Choose a folder...", "326,340,600,368"
    -- the resulting code / link, with a Copy button, then a plain-English status line
-   qsLabel "qsCodeCap", "Share this with your friend", "40,386,440,404", 12
+   qsLabel "qsCodeCap", "Share this with your friend", "40,382,440,404", 12
    set the textStyle of field "qsCodeCap" to "bold"
    qsField "qsCode", "40,410,512,446", true
    set the textFont of field "qsCode" to qsMonoFont()
    set the textSize of field "qsCode" to 12
-   set the margins of field "qsCode" to 8
+   set the margins of field "qsCode" to "8,8,8,8"
    set the backgroundColor of field "qsCode" to kClrCodeBg
    set the borderColor of field "qsCode" to kClrCodeLine
    -- a long locked/Tor code never wraps into an unreadable clipped block: it shows
    -- one clean line and Copy (or a click) always carries the FULL text
    set the dontWrap of field "qsCode" to true
    qsButton "qsCopy", "Copy", "520,410,600,446"
-   qsLabel "qsSharing", "", "40,454,600,498", 10
+   qsLabel "qsSharing", "", "40,452,600,506", 10
    set the foregroundColor of field "qsSharing" to kClrInkSoft
    put "Nothing is shared yet - pick a method above, then drop a file." into field "qsSharing"
    -- MORE OPTIONS: a quiet labelled divider; qsSyncMethod reveals + lays out only
    -- the advanced row(s) that apply to the chosen method (Share code shows none)
-   qsCap "qsMoreCap", "MORE OPTIONS", "40,508,132,522"
+   qsCap "qsMoreCap", "MORE OPTIONS", "40,510,132,528"
    set the textSize of field "qsMoreCap" to 9
    set the textStyle of field "qsMoreCap" to "bold"
-   qsGfx "qsMoreLine", "138,514,600,515"
+   qsGfx "qsMoreLine", "138,520,600,521"
    set the style of graphic "qsMoreLine" to "rectangle"
    set the filled of graphic "qsMoreLine" to true
    set the backgroundColor of graphic "qsMoreLine" to kClrCardLine
@@ -532,62 +539,61 @@ command qsBuild
    qsButton "qsEditToggle", "Enable web editing", "40,560,304,582"
    set the style of button "qsEditToggle" to "checkbox"
    set the autoHilite of button "qsEditToggle" to false
-   qsLabel "qsEditPassCap", "Password:", "310,564,376,580", 10
+   qsLabel "qsEditPassCap", "Password:", "310,557,376,583", 10
    qsField "qsEditPass", "380,558,520,584", false
-   qsLabel "qsEditHint", "LAN only", "526,564,600,580", 9
+   qsLabel "qsEditHint", "LAN only", "526,557,600,583", 9
    set the foregroundColor of field "qsEditHint" to kClrWarn
    set the textAlign of field "qsEditHint" to "right"
 
    -- =============== RIGHT: RECEIVE ===============
    qsPanel "qsRecvPanel", "640,72,1080,244"
-   qsBadge "qsStep2", "656,86,682,112", "2"
-   qsHdr "qsRecvSec", "Receive a file", "692,90,940,110"
-   qsLabel "qsRecvCap", "Paste the code your friend sent you:", "656,124,1064,140", 10
+   qsBadge "qsStep2", "656,90,682,116", "2"
+   qsHdr "qsRecvSec", "Receive a file", "692,86,940,114"
+   qsLabel "qsRecvCap", "Paste the code your friend sent you:", "656,122,1064,142", 10
    set the foregroundColor of field "qsRecvCap" to kClrInkSoft
    qsField "qsRecvCode", "656,146,948,180", false
    set the textFont of field "qsRecvCode" to qsMonoFont()
    set the textSize of field "qsRecvCode" to 11
-   set the margins of field "qsRecvCode" to 8
+   set the margins of field "qsRecvCode" to "8,8,8,8"
    set the dontWrap of field "qsRecvCode" to true
    qsButton "qsGet", "Download", "956,146,1064,180"
    -- Enter in either Receive field also clicks Download (returnInField above); the
    -- default ring marks Download as the primary action of the whole right column
    set the default of button "qsGet" to true
-   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "656,192,1064,208", 10
+   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "656,186,1064,206", 10
    set the foregroundColor of field "qsRecvPassCap" to kClrInkSoft
-   qsField "qsRecvPass", "656,210,1064,234", false
+   qsField "qsRecvPass", "656,212,1064,236", false
    -- =============== RIGHT: TRANSFERS & SHARES ===============
    -- One actionable list of everything live: downloads, code seeds, and Tor/web pages.
    -- Click a row to select it, then Copy code (re-fetch that share's code) or Stop it.
    -- Multiple code shares run at once - each is its own selectable, stoppable row.
    qsPanel "qsXferPanel", "640,256,1080,474"
-   qsHdr "qsXferSec", "Transfers & shares", "656,270,940,290"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "656,298,1064,312", 9
+   qsHdr "qsXferSec", "Transfers & shares", "656,268,940,292"
+   -- the head's default left margin (8) lands within 1px of the list body's text
+   -- origin (1px border + 6px margin), so the columns line up without magic
+   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "655,298,1064,316", 9
    set the tabStops of field "qsXferHead" to "230,340"
    set the textFont of field "qsXferHead" to qsMonoFont()
    set the foregroundColor of field "qsXferHead" to kClrInkMute
-   -- match the list body's text origin (6px field margin + 1px border) so the
-   -- column heads sit exactly over their columns
-   set the margins of field "qsXferHead" to "7,0,0,0"
-   qsList "qsXfers", "656,316,1064,426", false
+   qsList "qsXfers", "656,318,1064,426", false
    set the tabStops of field "qsXfers" to "230,340"
    set the textFont of field "qsXfers" to qsMonoFont()
    set the textSize of field "qsXfers" to 10
    put empty into sLastXferRows   -- freshly (re)built list: force the next refresh to paint
    -- per-row management: pick a row, then act on THAT share/transfer
-   qsCap "qsXferHint", "Select a row to manage it:", "656,436,868,454"
+   qsCap "qsXferHint", "Select a row to manage it:", "656,434,868,456"
    qsButton "qsXferCopy", "Copy code", "876,432,968,460"
    qsButton "qsXferStop", "Stop", "976,432,1064,460"
    -- =============== RIGHT: ACTIVITY ===============
    qsPanel "qsActPanel", "640,486,1080,596"
-   qsHdr "qsActSec", "Activity", "656,498,940,518"
+   qsHdr "qsActSec", "Activity", "656,494,940,518"
    qsList "qsLog", "656,524,1064,584", true
    set the textSize of field "qsLog" to 9
    set the foregroundColor of field "qsLog" to kClrInkSoft
    -- slim status strip along the very bottom: connection state left, live rates right
-   qsLabel "qsStatus", "", "20,606,700,628", 10
+   qsLabel "qsStatus", "", "20,604,700,634", 10
    set the foregroundColor of field "qsStatus" to kClrInkSoft
-   qsLabel "qsRates", "", "700,606,1080,628", 10
+   qsLabel "qsRates", "", "700,604,1080,634", 10
    set the foregroundColor of field "qsRates" to kClrInkSoft
    set the textAlign of field "qsRates" to "right"
    qsAddTips
@@ -623,6 +629,7 @@ command qsClearGeneratedUI
 end qsClearGeneratedUI
 
 command qsLabel pName, pText, pRect, pSize
+   local tTop
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -632,12 +639,22 @@ command qsLabel pName, pText, pRect, pSize
    set the borderWidth of field pName to 0
    set the opaque of field pName to false
    set the threeD of field pName to false
-   -- margins 0 so a label's rect places its text EXACTLY (the engine default of 8
-   -- makes every vertical alignment a guess); callers wanting padding set margins
-   set the margins of field pName to 0
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
+   -- OXT pass 1 taught us never to GUESS font metrics: hand-sized label rects
+   -- (and a single-number `set the margins to 0`, which OXT ignored) clipped the
+   -- bottom of every line on Windows. Ask the engine instead: grow the field to
+   -- its own formattedHeight (top edge pinned), so a label can never be shorter
+   -- than the text it holds, whatever the platform's line height and margins.
+   -- Empty labels (qsSharing, the status strip) keep their given rect: they
+   -- receive text later and must hold a fixed multi-line/strip height.
+   if pText is not empty then
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the height of field pName to the formattedHeight of field pName
+      set the top of field pName to tTop
+   end if
 end qsLabel
 
 -- Create-or-reuse a named graphic: the chrome layer (cards, the Tor chip, the
@@ -700,10 +717,13 @@ command qsBadge pName, pRect, pDigit
    set the filled of graphic (pName & "Bg") to true
    set the backgroundColor of graphic (pName & "Bg") to kClrAccent
    set the lineSize of graphic (pName & "Bg") to 0
-   qsLabel pName, pDigit, (tL & comma & (tT + 6) & comma & tR & comma & (tB - 4)), 11
+   -- the digit field auto-sizes in qsLabel; center it on the disc by MEASURED
+   -- height (pass 1 clipped the digit clean off by trusting guessed metrics)
+   qsLabel pName, pDigit, pRect, 11
    set the textStyle of field pName to "bold"
    set the foregroundColor of field pName to kClrBandText
    set the textAlign of field pName to "center"
+   set the top of field pName to (tT + (((tB - tT) - the height of field pName) div 2))
 end qsBadge
 
 -- A bold, dark section header sitting on a card (e.g. "Send a file or folder").
@@ -732,7 +752,8 @@ command qsField pName, pRect, pLocked
    set the borderColor of field pName to kClrFieldLine
    set the opaque of field pName to true
    set the backgroundColor of field pName to kClrCard
-   set the margins of field pName to 6
+   -- 4-item margins form ONLY: OXT ignored the single-number form on pass 1
+   set the margins of field pName to "6,6,6,6"
    set the textSize of field pName to 11
 end qsField
 
@@ -903,6 +924,9 @@ command qsStart
    -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
    -- without this the encrypt row would sit hidden + falsely captioned "install cryptoXT".
    qsSyncMethod
+   -- drop keyboard focus: without this the engine focuses the first traversal
+   -- control (the Share code radio) and draws a focus box around it at open
+   focus on nothing
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -2018,7 +2042,7 @@ command qsOnionServicePublished pInfo
    else
       -- plaintext, app-only: a browser hitting the onion gets a 'web download off' page
       set the text of field "qsWebLink" to ""
-      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. Send the code above; keep this window open. (Tick 'Also offer a Tor Browser download link' to allow a browser link too.)")
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden. Send the code above and keep this window open. Tick the checkbox below to also allow a Tor Browser link.")
       qsLog "Private Tor address published. Click Copy and send the code to your friend."
    end if
 end qsOnionServicePublished
@@ -2108,19 +2132,21 @@ command qsSyncMethod
    -- nothing can - in both cases HIDE the field and turn the caption into a full-width
    -- plain-English reason, so the affordance never misleads (qsShareFile already ignores
    -- a passphrase on the web branch, so this changes no share behaviour).
+   -- rect heights here must stay >= the build-time auto-sized height (qsLabel
+   -- measures the engine's real line height); 28px holds one line on any platform
    if tIsWeb then
       set the visible of field "qsSendPass" to false
-      set the rect of field "qsSendPassCap" to "40,198,600,214"
+      set the rect of field "qsSendPassCap" to "40,193,600,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Not encrypted - a web link opens in any browser, which cannot decrypt." into field "qsSendPassCap"
    else if sCanEncrypt is not "true" then
       set the visible of field "qsSendPass" to false
-      set the rect of field "qsSendPassCap" to "40,198,600,214"
+      set the rect of field "qsSendPassCap" to "40,193,600,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Encrypt: install cryptoXT (org.openxtalk.library.sodium) to lock this file." into field "qsSendPassCap"
    else
       set the visible of field "qsSendPass" to true
-      set the rect of field "qsSendPassCap" to "40,198,164,214"
+      set the rect of field "qsSendPassCap" to "40,193,164,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInk   -- back to a field label
       put "Encrypt (optional):" into field "qsSendPassCap"
    end if
@@ -2152,9 +2178,9 @@ command qsSyncMethod
       set the rect of field "qsWebLink" to "40,528,512,554"
       set the rect of button "qsWebCopy" to "520,526,600,554"
       set the rect of button "qsEditToggle" to "40,560,304,582"
-      set the rect of field "qsEditPassCap" to "310,564,376,580"
+      set the rect of field "qsEditPassCap" to "310,557,376,583"
       set the rect of field "qsEditPass" to "380,558,520,584"
-      set the rect of field "qsEditHint" to "526,564,600,580"
+      set the rect of field "qsEditHint" to "526,557,600,583"
    end if
    -- never leave an advanced mode silently armed once its context is gone (the qsOnionPill
    -- idiom); guarded so this is a no-op at build time when nothing was armed.
@@ -4984,7 +5010,7 @@ command qsCwStatusText
       if sCwMapped is "true" then
          put ("Internet link is LIVE (top link) - your router opened the port automatically. Anyone can open it in a browser; keep this window open.") into tMsg
       else
-         put ("Internet link is shown above, but your router did not open the port automatically. Forward port " & sCwPort & " (TCP) to this computer (" & sCwLanIp & ") in your router's settings, then it works. On the same network, the local link works right now.") into tMsg
+         put ("Internet link shown above, but the router did not open the port. Forward port " & sCwPort & " (TCP) to " & sCwLanIp & " in your router settings to enable it; the local link already works on your own network.") into tMsg
       end if
    else if sCwExtIp is not empty then
       put ("A direct internet link is not possible here - your connection uses carrier-grade NAT (shared public IP " & sCwExtIp & "). Use the local-network link, or share over Tor (which always reaches the internet).") into tMsg
