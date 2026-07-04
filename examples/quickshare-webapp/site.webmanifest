@@ -1,0 +1,13 @@
+{
+  "name": "TorrentXT Web App Demo",
+  "short_name": "TorrentXT",
+  "description": "A single-page demo hosted by TorrentXT Quick Share over Tor or a direct web link.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0e1116",
+  "theme_color": "#3b82f6",
+  "icons": [
+    { "src": "assets/logo.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

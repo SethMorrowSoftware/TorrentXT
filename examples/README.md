@@ -112,6 +112,12 @@ while a genuinely missing asset still returns 404. Two things to know:
   it with **relative** asset paths (or a matching base) - absolute paths like `/app.js`
   resolve above the token and 404. Over Tor (served at the root) absolute paths are fine.
 
+There is a **ready-made demo app** in [`quickshare-webapp/`](quickshare-webapp/): drag that
+folder onto Quick Share and share it to see static assets, correct MIME types, HTTP Range
+(a `<audio>` seek), automatic SPA routing (deep links + refresh), a live `GET /_qs/info`
+call, and a gallery of SVG/PNG images - the same folder working over Tor or the web link.
+See its [README](quickshare-webapp/README.md).
+
 **Give it a backend.** The server also does **dynamic routes**, so a hosted app can call
 back into your stack instead of being purely static. A built-in demo route answers
 `GET /_qs/info` with live share metadata as JSON - visit

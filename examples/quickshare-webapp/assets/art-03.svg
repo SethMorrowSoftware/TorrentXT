@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360" role="img" aria-label="Low-poly facets">
+  <rect width="480" height="360" fill="#0f172a"/>
+  <g stroke="#0f172a" stroke-width="1">
+    <polygon points="0,0 160,0 60,120" fill="#1d4ed8"/>
+    <polygon points="160,0 320,0 240,90 60,120" fill="#2563eb"/>
+    <polygon points="320,0 480,0 480,110 240,90" fill="#3b82f6"/>
+    <polygon points="0,0 60,120 0,220" fill="#4338ca"/>
+    <polygon points="60,120 240,90 190,230" fill="#6366f1"/>
+    <polygon points="240,90 480,110 360,220 190,230" fill="#7c3aed"/>
+    <polygon points="480,110 480,260 360,220" fill="#8b5cf6"/>
+    <polygon points="0,220 190,230 120,360 0,360" fill="#9333ea"/>
+    <polygon points="190,230 360,220 340,360 120,360" fill="#a855f7"/>
+    <polygon points="360,220 480,260 480,360 340,360" fill="#c026d3"/>
+  </g>
+</svg>

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360" role="img" aria-label="Concentric ripple">
+  <defs>
+    <radialGradient id="a2" cx="0.5" cy="0.5" r="0.7">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1f2937"/>
+    </radialGradient>
+  </defs>
+  <rect width="480" height="360" fill="url(#a2)"/>
+  <g fill="none" stroke-width="3">
+    <circle cx="240" cy="180" r="24" stroke="#22d3ee"/>
+    <circle cx="240" cy="180" r="52" stroke="#38bdf8" opacity="0.85"/>
+    <circle cx="240" cy="180" r="82" stroke="#818cf8" opacity="0.7"/>
+    <circle cx="240" cy="180" r="114" stroke="#a78bfa" opacity="0.55"/>
+    <circle cx="240" cy="180" r="148" stroke="#f472b6" opacity="0.4"/>
+    <circle cx="240" cy="180" r="184" stroke="#fb7185" opacity="0.28"/>
+  </g>
+  <circle cx="240" cy="180" r="10" fill="#e0f2fe"/>
+</svg>

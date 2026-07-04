@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360" role="img" aria-label="Layered waves">
+  <defs>
+    <linearGradient id="a5" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#06b6d4"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <rect width="480" height="360" fill="#ecfeff"/>
+  <path d="M0 130 C 80 90 160 170 240 130 S 400 90 480 130 V360 H0 Z" fill="url(#a5)" opacity="0.30"/>
+  <path d="M0 175 C 80 135 160 215 240 175 S 400 135 480 175 V360 H0 Z" fill="url(#a5)" opacity="0.45"/>
+  <path d="M0 220 C 80 180 160 260 240 220 S 400 180 480 220 V360 H0 Z" fill="url(#a5)" opacity="0.65"/>
+  <path d="M0 265 C 80 225 160 305 240 265 S 400 225 480 265 V360 H0 Z" fill="url(#a5)"/>
+</svg>

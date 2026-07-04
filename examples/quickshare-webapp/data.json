@@ -1,0 +1,13 @@
+{
+  "app": "TorrentXT Web App Demo",
+  "tagline": "A single-page app served from a shared folder - over Tor or a direct web link.",
+  "gallery": [
+    { "file": "assets/art-01.svg", "title": "Aurora",   "note": "linear + radial gradients" },
+    { "file": "assets/art-02.svg", "title": "Ripple",   "note": "concentric strokes" },
+    { "file": "assets/art-03.svg", "title": "Facets",   "note": "low-poly polygons" },
+    { "file": "assets/art-04.svg", "title": "Dusk",     "note": "layered scene" },
+    { "file": "assets/art-05.svg", "title": "Tide",     "note": "stacked wave paths" },
+    { "file": "assets/art-06.svg", "title": "Bokeh",    "note": "soft translucent discs" },
+    { "file": "assets/photo.png",  "title": "Gradient", "note": "raster PNG (image/png)" }
+  ]
+}
