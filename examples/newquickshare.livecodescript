@@ -150,6 +150,13 @@ local sCwTxPath         -- array: socket -> disk path of the file being streamed
 local sCwTxPos          -- array: socket -> next byte offset to read (0-based; honours a Range)
 local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
 local sCwTxName         -- array: socket -> the file's leaf name (for the log)
+-- HTTP keep-alive (persistent connections) for the small buffered TEXT responses only;
+-- a streamed file still closes its connection (bounding the risk to the framed path).
+local sCwKeep           -- array: socket -> "true" if THIS response may keep the connection open
+local sCwReqCount       -- array: socket -> requests already served on this connection (cap)
+local sCwDeadline       -- array: socket -> the milliseconds of the last activity (idle watchdog)
+local sCwMethod         -- array: socket -> the current request's method (HEAD must send no body)
+local sCwWriting        -- array: socket -> "true" while a buffered response write is in flight
 
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -182,6 +189,8 @@ constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (a
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
 constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (head + body) > 256 KB
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
+constant kCwMaxKeepAlive = 100         -- max requests served on one kept-alive connection
+constant kCwIdleTimeout = 30000        -- ms an idle kept-alive connection is held open, then closed
 constant kEditTokenBytes = 24          -- live-editor session token: 24 random bytes (192 bits)
 constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to prove a login
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
@@ -196,7 +205,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2026-12"
+constant kQsUiVersion = "nqs-ui-2027-01"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -334,22 +343,24 @@ command qsBuild
    -- =============== LEFT: SEND ===============
    qsPanel "qsSendPanel", "20,62,620,584"
    qsHdr "qsSendHdr", "1     Send a file or folder", "36,72,420,96"
-   qsLabel "qsMethodCap", "How do you want to share it?", "36,106,420,124", 11
+   -- Signal that a sensible default is already picked (so no up-front decision is demanded),
+   -- and keep the jargon out of the labels (it lives in the grey captions + tooltips).
+   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "36,106,604,124", 11
    set the textStyle of field "qsMethodCap" to "bold"
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
    -- sTorSend/sWebShare by qsSetMethod/qsSyncMethod). Each has a one-line plain caption.
    qsButton "qsMethodCode", "Share code", "36,126,190,148"
    set the style of button "qsMethodCode" to "radioButton"
    set the autoHilite of button "qsMethodCode" to false
-   qsCap "qsMethodCodeD", "Peer-to-peer, resumable.", "56,148,220,166"
+   qsCap "qsMethodCodeD", "Resumable. Needs the app.", "56,148,230,166"
    qsButton "qsMethodTor", "Private - Tor", "236,126,400,148"
    set the style of button "qsMethodTor" to "radioButton"
    set the autoHilite of button "qsMethodTor" to false
-   qsCap "qsMethodTorD", "Hides both IPs; no torrent.", "256,148,432,166"
+   qsCap "qsMethodTorD", "Hides both IP addresses.", "256,148,432,166"
    qsButton "qsMethodWeb", "Web link", "432,126,600,148"
    set the style of button "qsMethodWeb" to "radioButton"
    set the autoHilite of button "qsMethodWeb" to false
-   qsCap "qsMethodWebD", "Any browser, no app.", "452,148,604,166"
+   qsCap "qsMethodWebD", "Any browser. Not encrypted.", "440,148,604,166"
    -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
    qsLabel "qsSendPassCap", "Encrypt (optional):", "36,180,176,198", 11
    qsField "qsSendPass", "184,176,604,202", false
@@ -626,6 +637,10 @@ command qsStart
    else
       qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
+   -- repaint the method-driven UI now that sCanEncrypt + the method flags are known:
+   -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
+   -- without this the encrypt row would sit hidden + falsely captioned "install cryptoXT".
+   qsSyncMethod
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -1811,12 +1826,60 @@ end qsSetMethod
 
 -- Paint the three radios from the current state (both off = the Share code option).
 command qsSyncMethod
+   local tIsTor, tIsWeb, tIsCode
    if there is no button "qsMethodCode" then
       exit qsSyncMethod
    end if
    set the hilite of button "qsMethodTor" to (sTorSend is "true")
    set the hilite of button "qsMethodWeb" to (sWebShare is "true")
    set the hilite of button "qsMethodCode" to (sTorSend is not "true" and sWebShare is not "true")
+   put (sTorSend is "true") into tIsTor
+   put (sWebShare is "true") into tIsWeb
+   put (not tIsTor and not tIsWeb) into tIsCode
+   -- ENCRYPT ROW: show the passphrase field only where encryption can actually work
+   -- (Share code, or Tor). For a Web link a browser cannot decrypt, and without cryptoXT
+   -- nothing can - in both cases HIDE the field and turn the caption into a full-width
+   -- plain-English reason, so the affordance never misleads (qsShareFile already ignores
+   -- a passphrase on the web branch, so this changes no share behaviour).
+   if tIsWeb then
+      set the visible of field "qsSendPass" to false
+      set the rect of field "qsSendPassCap" to "36,180,604,198"
+      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      put "Not encrypted - a web link opens in any browser, which cannot decrypt." into field "qsSendPassCap"
+   else if sCanEncrypt is not "true" then
+      set the visible of field "qsSendPass" to false
+      set the rect of field "qsSendPassCap" to "36,180,604,198"
+      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      put "Encrypt: install cryptoXT (org.openxtalk.library.sodium) to lock this file." into field "qsSendPassCap"
+   else
+      set the visible of field "qsSendPass" to true
+      set the rect of field "qsSendPassCap" to "36,180,176,198"
+      set the foregroundColor of field "qsSendPassCap" to empty   -- restore the default dark
+      put "Encrypt (optional):" into field "qsSendPassCap"
+   end if
+   -- MORE OPTIONS: reveal only the advanced control(s) that apply to THIS method; the
+   -- common Share-code path shows NONE (fully decluttered). qsWebLink/qsWebCopy are a
+   -- SHARED secondary-link OUTPUT (both the Tor web-download AND the clearweb Web path
+   -- write to it), so they stay visible for tor AND web - only qsWebCheck is Tor-only and
+   -- the editor group is Web-only.
+   set the visible of field "qsMoreCap" to (not tIsCode)
+   set the visible of button "qsWebCheck" to tIsTor
+   set the visible of field "qsWebLink" to (not tIsCode)
+   set the visible of button "qsWebCopy" to (not tIsCode)
+   set the visible of button "qsEditToggle" to tIsWeb
+   set the visible of field "qsEditPassCap" to tIsWeb
+   set the visible of field "qsEditPass" to tIsWeb
+   set the visible of field "qsEditHint" to tIsWeb
+   -- never leave an advanced mode silently armed once its context is gone (the qsOnionPill
+   -- idiom); guarded so this is a no-op at build time when nothing was armed.
+   if sWebServe is "true" and not tIsTor then
+      put "false" into sWebServe
+      set the hilite of button "qsWebCheck" to false
+   end if
+   if sEditOn is "true" and not tIsWeb then
+      qsEditDisable
+      set the hilite of button "qsEditToggle" to false
+   end if
 end qsSyncMethod
 
 -- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
@@ -2642,6 +2705,25 @@ function qsHttpReqComplete pData
    return (tHave >= tContentLen)
 end qsHttpReqComplete
 
+-- The exact byte length of ONE complete request at the front of pData: the head (up to
+-- and including the terminating CRLFCRLF, i.e. tHeadEnd + 3 bytes) plus its
+-- Content-Length body. Used by keep-alive to trim the request just served and leave any
+-- pipelined bytes intact for the next one. Returns 0 if the head is not yet complete (a
+-- caller must never trim on 0). Pinned by keepalive_req_length() in the golden.
+function qsHttpReqLength pData
+   local tHeadEnd, tHeaders, tLen
+   put qsHttpHeaderEnd(pData) into tHeadEnd
+   if tHeadEnd is 0 then
+      return 0
+   end if
+   put qsHttpParseHead(byte 1 to (tHeadEnd - 1) of pData) into tHeaders
+   put tHeaders["content-length"] into tLen
+   if tLen is not an integer or tLen < 0 then
+      put 0 into tLen
+   end if
+   return tHeadEnd + 3 + tLen
+end qsHttpReqLength
+
 -- Parse the head block (request line + header lines, ASCII) into an array: __method /
 -- __path / __query, plus lowercased header names -> values. Save/restore delimiters.
 function qsHttpParseHead pHeadBytes
@@ -2652,6 +2734,7 @@ function qsHttpParseHead pHeadBytes
    set the lineDelimiter to (numToChar(13) & numToChar(10))
    put line 1 of tText into tReqLine
    put toUpper(word 1 of tReqLine) into tOut["__method"]
+   put word 3 of tReqLine into tOut["__version"]   -- e.g. HTTP/1.1 (keep-alive default)
    put word 2 of tReqLine into tResource
    set the itemDelimiter to "?"
    put item 1 of tResource into tOut["__path"]
@@ -4070,7 +4153,18 @@ command qsCwAccept pSocketID
    end if
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
+   put "false" into sCwKeep[pSocketID]
+   put "" into sCwMethod[pSocketID]        -- no method parsed yet (qsCwServe sets it)
+   put 0 into sCwReqCount[pSocketID]
+   put the milliseconds into sCwDeadline[pSocketID]
    read from socket pSocketID with message "qsCwData"
+   -- idle watchdog: closes a connection that stalls (never sends, or a kept-alive
+   -- connection that goes quiet), so a slow-loris or an abandoned keep-alive cannot
+   -- pile up sockets. Re-armed while the connection makes progress (qsCwData/qsCwWrote
+   -- refresh sCwDeadline). The socket id ("ip:port") MUST be quoted: `send` re-parses
+   -- the trailing text as an expression, and an unquoted id syntax-errors instead of
+   -- arriving intact.
+   send ("qsCwWatchdog " & quote & pSocketID & quote) to me in kCwIdleTimeout milliseconds
 end qsCwAccept
 
 command qsCwData pSocketID, pData
@@ -4080,9 +4174,14 @@ command qsCwData pSocketID, pData
    if sCwServed[pSocketID] is "true" then
       exit qsCwData            -- already answering; ignore trailing bytes
    end if
+   put the milliseconds into sCwDeadline[pSocketID]   -- recv activity: not idle
    put pData after sCwReq[pSocketID]
    if the number of bytes in sCwReq[pSocketID] > kFsMaxReq then
       put "true" into sCwServed[pSocketID]
+      -- this path never runs qsCwServe, so sCwKeep still holds the PREVIOUS request's
+      -- decision on a reused connection. Force close: the request is oversized/unframed,
+      -- so continuing (qsCwNext) would mis-trim the unread body into bogus requests.
+      put "false" into sCwKeep[pSocketID]
       qsCwSendText pSocketID, "413 Payload Too Large", "text/plain; charset=utf-8", "Request too large."
       exit qsCwData
    end if
@@ -4100,7 +4199,26 @@ command qsCwServe pSocketID
    local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
+   put tMethod into sCwMethod[pSocketID]   -- a HEAD reply must carry no body (qsCwSendText)
    put tHeaders["__path"] into tRaw
+   -- decide keep-alive for THIS request. We can only frame a request that ends at its
+   -- Content-Length; a chunked body is unframeable, so refuse it (and close, so its
+   -- trailing bytes can never be mis-read as the next request). HTTP/1.1 defaults to
+   -- keep-alive unless "Connection: close"; HTTP/1.0 needs an explicit "keep-alive".
+   put "false" into sCwKeep[pSocketID]
+   if tHeaders["transfer-encoding"] contains "chunked" then
+      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Chunked request bodies are not supported."
+      exit qsCwServe
+   end if
+   if tHeaders["__version"] is "HTTP/1.1" then
+      if toLower(tHeaders["connection"]) is not "close" then
+         put "true" into sCwKeep[pSocketID]
+      end if
+   else
+      if toLower(tHeaders["connection"]) is "keep-alive" then
+         put "true" into sCwKeep[pSocketID]
+      end if
+   end if
    put urlDecode(tRaw) into tPath
    replace "\" with "/" in tPath
    if tPath contains ".." then
@@ -4275,6 +4393,7 @@ command qsCwWrote pSocketID
    if sCwTxPath[pSocketID] is empty then
       exit qsCwWrote           -- already finished/cleaned
    end if
+   put the milliseconds into sCwDeadline[pSocketID]   -- send progress: not idle
    qsCwPump pSocketID
 end qsCwWrote
 
@@ -4283,29 +4402,60 @@ command qsCwFinish pSocketID
    qsCwClose pSocketID
 end qsCwFinish
 
--- Small text/redirect responses: write, then close only AFTER the write flushes (a
--- raw socket may drop unsent bytes if closed immediately, so we close in the
--- write-completion handler).
+-- Small text/redirect responses: fully buffered, with an exact Content-Length, so they
+-- are the ONLY responses that may keep the connection alive (a streamed file always
+-- closes - see qsCwServeFile). qsCwWantsKeep decides per response; on keep-alive we
+-- write with a "continue" completion (qsCwNext), else the terminal "close" completion.
+-- We always write BEFORE closing (a raw socket can drop unsent bytes if closed at once).
+function qsCwWantsKeep pSocketID
+   -- "< cap - 1": the response that will be the LAST one allowed must advertise close,
+   -- so we never send "keep-alive" and then close the socket under a pipelined next
+   -- request. Still serves exactly kCwMaxKeepAlive requests per connection.
+   return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < (kCwMaxKeepAlive - 1))
+end qsCwWantsKeep
+
 command qsCwSendText pSocketID, pStatus, pType, pBody
-   local tData, tHead, tCrlf
+   local tData, tHead, tCrlf, tKeep, tBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
+   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
    put qsHttpExtraHeaders() after tHead
-   put ("Connection: close" & tCrlf & tCrlf) after tHead
-   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
+   -- a HEAD reply must report the accurate Content-Length a GET would return but send NO
+   -- body; on a kept-alive connection an unread body would be mis-read as the framing of
+   -- the next response. (The file path already handles HEAD in qsCwServeFile.)
+   if sCwMethod[pSocketID] is "HEAD" then
+      put "" into tBody
+   else
+      put tData into tBody
+   end if
+   if tKeep then
+      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
+      qsCwWriteContinue pSocketID, (textEncode(tHead, "UTF-8") & tBody)
+   else
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tBody)
+   end if
 end qsCwSendText
 
 command qsCwSendRedirect pSocketID, pLocation
-   local tHead, tCrlf
+   local tHead, tCrlf, tKeep
    put (numToChar(13) & numToChar(10)) into tCrlf
+   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 301 Moved Permanently" & tCrlf & "Location: " & pLocation & tCrlf & \
-      "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
-   qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+      "Content-Length: 0" & tCrlf) into tHead
+   if tKeep then
+      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
+      qsCwWriteContinue pSocketID, textEncode(tHead, "UTF-8")
+   else
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+   end if
 end qsCwSendRedirect
 
 command qsCwWriteClose pSocketID, pBytes
+   put "true" into sCwWriting[pSocketID]   -- a buffered flush is in flight (watchdog: not idle)
    write pBytes to socket pSocketID with message "qsCwWroteClose"
    if the result is not empty then
       qsCwClose pSocketID
@@ -4313,8 +4463,87 @@ command qsCwWriteClose pSocketID, pBytes
 end qsCwWriteClose
 
 command qsCwWroteClose pSocketID
+   put "false" into sCwWriting[pSocketID]
    qsCwClose pSocketID
 end qsCwWroteClose
+
+-- Keep-alive write: after the response flushes, DO NOT close - advance to the next
+-- request on the same connection.
+command qsCwWriteContinue pSocketID, pBytes
+   put "true" into sCwWriting[pSocketID]   -- a buffered flush is in flight (watchdog: not idle)
+   write pBytes to socket pSocketID with message "qsCwWroteContinue"
+   if the result is not empty then
+      qsCwClose pSocketID
+   end if
+end qsCwWriteContinue
+
+command qsCwWroteContinue pSocketID
+   put "false" into sCwWriting[pSocketID]
+   qsCwNext pSocketID
+end qsCwWroteContinue
+
+-- One response is fully sent on a kept-alive connection: drop the request we just
+-- answered from the buffer (preserving any pipelined bytes for the next one), bump the
+-- per-connection request count against the cap, then serve or await the next request.
+command qsCwNext pSocketID
+   local tLen, tBuf
+   put qsHttpReqLength(sCwReq[pSocketID]) into tLen
+   if tLen <= 0 then
+      qsCwClose pSocketID          -- cannot frame what we just served; do not risk a hang
+      exit qsCwNext
+   end if
+   put sCwReq[pSocketID] into tBuf
+   delete byte 1 to tLen of tBuf
+   put tBuf into sCwReq[pSocketID]
+   add 1 to sCwReqCount[pSocketID]
+   put "false" into sCwServed[pSocketID]
+   -- next request's method is not parsed yet: a 413 fired before qsCwServe must not
+   -- inherit this request's method and wrongly suppress its body as if it were a HEAD.
+   put "" into sCwMethod[pSocketID]
+   put the milliseconds into sCwDeadline[pSocketID]
+   if sCwReqCount[pSocketID] >= kCwMaxKeepAlive then
+      qsCwClose pSocketID          -- connection hit its request cap; close politely
+      exit qsCwNext
+   end if
+   qsCwDrain pSocketID
+end qsCwNext
+
+-- Serve a request already buffered behind the one we just answered (HTTP pipelining),
+-- else re-arm the read for the next request's bytes.
+command qsCwDrain pSocketID
+   if qsHttpReqComplete(sCwReq[pSocketID]) then
+      put "true" into sCwServed[pSocketID]
+      qsCwServe pSocketID
+   else
+      read from socket pSocketID with message "qsCwData"
+   end if
+end qsCwDrain
+
+-- Close a kept-alive connection that has gone idle past kCwIdleTimeout. Re-arms itself
+-- while the connection is still alive but not yet idle; a no-op once cleaned/closed. Only
+-- a connection that is genuinely idle (waiting to READ the next request) is reaped - an
+-- in-progress file stream or an in-flight buffered write is NOT idle and must never be
+-- force-closed, or a slow/paused download or a large listing on a slow link is truncated.
+command qsCwWatchdog pSocketID
+   if sCwServed[pSocketID] is empty then
+      exit qsCwWatchdog            -- already cleaned up
+   end if
+   if not (pSocketID is among the lines of the openSockets) then
+      qsCwClean pSocketID
+      exit qsCwWatchdog
+   end if
+   if sCwTxPath[pSocketID] is not empty or sCwWriting[pSocketID] is "true" then
+      -- actively streaming a file, or flushing a buffered response: paced by
+      -- write-completion backpressure, not idle. Keep watching, do not close.
+      send ("qsCwWatchdog " & quote & pSocketID & quote) to me in kCwIdleTimeout milliseconds
+      exit qsCwWatchdog
+   end if
+   if (the milliseconds - sCwDeadline[pSocketID]) >= kCwIdleTimeout then
+      qsCwClose pSocketID
+      exit qsCwWatchdog
+   end if
+   send ("qsCwWatchdog " & quote & pSocketID & quote) to me in kCwIdleTimeout milliseconds
+end qsCwWatchdog
 
 command qsCwClose pSocketID
    qsCwSafeClose pSocketID
@@ -4339,6 +4568,11 @@ command qsCwClean pSocketID
    delete variable sCwTxPos[pSocketID]
    delete variable sCwTxRemaining[pSocketID]
    delete variable sCwTxName[pSocketID]
+   delete variable sCwKeep[pSocketID]
+   delete variable sCwReqCount[pSocketID]
+   delete variable sCwDeadline[pSocketID]
+   delete variable sCwMethod[pSocketID]
+   delete variable sCwWriting[pSocketID]
 end qsCwClean
 
 -- Stack-level socket messages. Act only on OUR clearweb sockets; pass anything else
