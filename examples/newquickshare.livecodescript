@@ -243,7 +243,7 @@ on dragDrop
    if tFiles is empty then
       -- NEVER swallow a drop silently: OS file-drop delivery is occasionally flaky,
       -- so say so and point at the always-reliable click fallback.
-      qsLog "That drop did not register any file - drag again (a little slower), or click the drop area to choose a file or folder instead."
+      qsLog "That drop did not register - drag delivery can be unreliable from a file window. Use the Choose a file / Choose a folder buttons instead (they always work)."
       exit dragDrop
    end if
    -- one item at a time keeps the demo simple; the first dropped item wins
@@ -253,7 +253,13 @@ end dragDrop
 on mouseUp
    switch the short name of the target
       case "qsDrop"
-         qsBrowseFile
+         qsChooseFile      -- clicking the drag zone is a shortcut to the file picker
+         break
+      case "qsChooseFile"
+         qsChooseFile
+         break
+      case "qsChooseFolder"
+         qsChooseFolder
          break
       case "qsCopy"
          qsCopyCode
@@ -327,7 +333,7 @@ command qsBuild
 
    -- =============== LEFT: SEND ===============
    qsPanel "qsSendPanel", "20,62,620,584"
-   qsHdr "qsSendHdr", "1     Send a file", "36,72,320,96"
+   qsHdr "qsSendHdr", "1     Send a file or folder", "36,72,420,96"
    qsLabel "qsMethodCap", "How do you want to share it?", "36,106,420,124", 11
    set the textStyle of field "qsMethodCap" to "bold"
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
@@ -347,8 +353,10 @@ command qsBuild
    -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
    qsLabel "qsSendPassCap", "Encrypt (optional):", "36,180,176,198", 11
    qsField "qsSendPass", "184,176,604,202", false
-   -- the drop area (also a click-to-choose button)
-   qsField "qsDrop", "36,214,604,320", true
+   -- the drag zone (drag delivery is OS/source-dependent - it can be unreliable from a
+   -- file-manager window, so the two explicit picker buttons below are the always-works
+   -- path, and a click on the zone itself opens the file picker as a shortcut)
+   qsField "qsDrop", "36,214,604,296", true
    set the opaque of field "qsDrop" to true
    set the backgroundColor of field "qsDrop" to "245,247,250"
    set the borderWidth of field "qsDrop" to 1
@@ -357,7 +365,12 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file or folder here" & return & "... or click to choose. A folder becomes a browsable page (or a hosted web app).")
+   set the text of field "qsDrop" to (return & "Drag a file or folder here" & return & "(from your desktop or a file window) - or use the buttons below.")
+   -- always-reliable pickers: separate file / folder choosers open the native dialog
+   -- directly (no guessing), so sharing a FOLDER is one obvious click even when a drag
+   -- will not register.
+   qsButton "qsChooseFile", "Choose a file...", "36,302,316,328"
+   qsButton "qsChooseFolder", "Choose a folder...", "324,302,604,328"
    -- the resulting code / link, with a Copy button, then a plain-English status line
    qsHdr "qsCodeCap", "Share this with your friend", "36,330,400,352"
    qsField "qsCode", "36,354,516,388", true
@@ -534,7 +547,9 @@ end qsList
 
 command qsAddTips
    set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
-   set the tooltip of field "qsDrop" to "Drag a file here, or click to choose one, to share it."
+   set the tooltip of field "qsDrop" to "Drag a file or folder here from your desktop or a file window. If a drag will not register (it can be unreliable from a file window), use the Choose buttons below - they always work."
+   set the tooltip of button "qsChooseFile" to "Open a dialog to pick a file to share, using the method selected above. Always works, even when a drag will not register."
+   set the tooltip of button "qsChooseFolder" to "Open a dialog to pick a FOLDER to share. Over a web link or Tor it becomes a browsable page; as a share code the whole folder is sent. Always works, even when a drag will not register."
    set the tooltip of field "qsCode" to "Your file's share code. Click Copy and send it to your friend."
    set the tooltip of button "qsCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
@@ -810,28 +825,26 @@ command qsShareFile pPath
    end if
 end qsShareFile
 
--- Click-to-choose fallback for the drop area. Offers BOTH a file and a folder picker
--- (OS folder drops are the flakiest to deliver, and a folder is the natural way to web-
--- share several files), so a user is never stuck when a drag does not register. The
--- chosen item runs the SAME qsShareFile path as a drop, honouring the selected method.
-command qsBrowseFile
-   local tChoice, tPath
-   answer "What would you like to share?" with "Cancel" or "A folder" or "A file"
-   put it into tChoice
-   if tChoice is "A file" then
-      answer file "Choose a file to share:"
-      put it into tPath
-   else if tChoice is "A folder" then
-      answer folder "Choose a folder to share:"
-      put it into tPath
-   else
-      exit qsBrowseFile
+-- Always-reliable pickers behind the two "Choose..." buttons (and a click on the drag
+-- zone). Separate file and folder choosers open the native dialog DIRECTLY - no "file or
+-- folder?" prompt to wade through - so a user is never stuck when an OS drag will not
+-- register (drag delivery is engine/source-dependent). Both run the SAME qsShareFile
+-- path as a drop, honouring the currently selected share method.
+command qsChooseFile
+   answer file "Choose a file to share:"
+   if it is empty then
+      exit qsChooseFile
    end if
-   if tPath is empty then
-      exit qsBrowseFile
+   qsShareFile it
+end qsChooseFile
+
+command qsChooseFolder
+   answer folder "Choose a folder to share:"
+   if it is empty then
+      exit qsChooseFolder
    end if
-   qsShareFile tPath
-end qsBrowseFile
+   qsShareFile it
+end qsChooseFolder
 
 command qsCopyCode
    if field "qsCode" is empty then
