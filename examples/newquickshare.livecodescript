@@ -150,6 +150,11 @@ local sCwTxPath         -- array: socket -> disk path of the file being streamed
 local sCwTxPos          -- array: socket -> next byte offset to read (0-based; honours a Range)
 local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
 local sCwTxName         -- array: socket -> the file's leaf name (for the log)
+-- HTTP keep-alive (persistent connections) for the small buffered TEXT responses only;
+-- a streamed file still closes its connection (bounding the risk to the framed path).
+local sCwKeep           -- array: socket -> "true" if THIS response may keep the connection open
+local sCwReqCount       -- array: socket -> requests already served on this connection (cap)
+local sCwDeadline       -- array: socket -> the milliseconds of the last activity (idle watchdog)
 
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -182,6 +187,8 @@ constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (a
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
 constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (head + body) > 256 KB
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
+constant kCwMaxKeepAlive = 100         -- max requests served on one kept-alive connection
+constant kCwIdleTimeout = 30000        -- ms an idle kept-alive connection is held open, then closed
 constant kEditTokenBytes = 24          -- live-editor session token: 24 random bytes (192 bits)
 constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to prove a login
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
@@ -2629,6 +2636,25 @@ function qsHttpReqComplete pData
    return (tHave >= tContentLen)
 end qsHttpReqComplete
 
+-- The exact byte length of ONE complete request at the front of pData: the head (up to
+-- and including the terminating CRLFCRLF, i.e. tHeadEnd + 3 bytes) plus its
+-- Content-Length body. Used by keep-alive to trim the request just served and leave any
+-- pipelined bytes intact for the next one. Returns 0 if the head is not yet complete (a
+-- caller must never trim on 0). Pinned by keepalive_req_length() in the golden.
+function qsHttpReqLength pData
+   local tHeadEnd, tHeaders, tLen
+   put qsHttpHeaderEnd(pData) into tHeadEnd
+   if tHeadEnd is 0 then
+      return 0
+   end if
+   put qsHttpParseHead(byte 1 to (tHeadEnd - 1) of pData) into tHeaders
+   put tHeaders["content-length"] into tLen
+   if tLen is not an integer or tLen < 0 then
+      put 0 into tLen
+   end if
+   return tHeadEnd + 3 + tLen
+end qsHttpReqLength
+
 -- Parse the head block (request line + header lines, ASCII) into an array: __method /
 -- __path / __query, plus lowercased header names -> values. Save/restore delimiters.
 function qsHttpParseHead pHeadBytes
@@ -2639,6 +2665,7 @@ function qsHttpParseHead pHeadBytes
    set the lineDelimiter to (numToChar(13) & numToChar(10))
    put line 1 of tText into tReqLine
    put toUpper(word 1 of tReqLine) into tOut["__method"]
+   put word 3 of tReqLine into tOut["__version"]   -- e.g. HTTP/1.1 (keep-alive default)
    put word 2 of tReqLine into tResource
    set the itemDelimiter to "?"
    put item 1 of tResource into tOut["__path"]
@@ -4057,7 +4084,15 @@ command qsCwAccept pSocketID
    end if
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
+   put "false" into sCwKeep[pSocketID]
+   put 0 into sCwReqCount[pSocketID]
+   put the milliseconds into sCwDeadline[pSocketID]
    read from socket pSocketID with message "qsCwData"
+   -- idle watchdog: closes a connection that stalls (never sends, or a kept-alive
+   -- connection that goes quiet), so a slow-loris or an abandoned keep-alive cannot
+   -- pile up sockets. Re-armed while the connection makes progress (qsCwData/qsCwWrote
+   -- refresh sCwDeadline).
+   send ("qsCwWatchdog " & pSocketID) to me in kCwIdleTimeout milliseconds
 end qsCwAccept
 
 command qsCwData pSocketID, pData
@@ -4067,6 +4102,7 @@ command qsCwData pSocketID, pData
    if sCwServed[pSocketID] is "true" then
       exit qsCwData            -- already answering; ignore trailing bytes
    end if
+   put the milliseconds into sCwDeadline[pSocketID]   -- recv activity: not idle
    put pData after sCwReq[pSocketID]
    if the number of bytes in sCwReq[pSocketID] > kFsMaxReq then
       put "true" into sCwServed[pSocketID]
@@ -4088,6 +4124,24 @@ command qsCwServe pSocketID
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
    put tHeaders["__path"] into tRaw
+   -- decide keep-alive for THIS request. We can only frame a request that ends at its
+   -- Content-Length; a chunked body is unframeable, so refuse it (and close, so its
+   -- trailing bytes can never be mis-read as the next request). HTTP/1.1 defaults to
+   -- keep-alive unless "Connection: close"; HTTP/1.0 needs an explicit "keep-alive".
+   put "false" into sCwKeep[pSocketID]
+   if tHeaders["transfer-encoding"] contains "chunked" then
+      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Chunked request bodies are not supported."
+      exit qsCwServe
+   end if
+   if tHeaders["__version"] is "HTTP/1.1" then
+      if toLower(tHeaders["connection"]) is not "close" then
+         put "true" into sCwKeep[pSocketID]
+      end if
+   else
+      if toLower(tHeaders["connection"]) is "keep-alive" then
+         put "true" into sCwKeep[pSocketID]
+      end if
+   end if
    put urlDecode(tRaw) into tPath
    replace "\" with "/" in tPath
    if tPath contains ".." then
@@ -4262,6 +4316,7 @@ command qsCwWrote pSocketID
    if sCwTxPath[pSocketID] is empty then
       exit qsCwWrote           -- already finished/cleaned
    end if
+   put the milliseconds into sCwDeadline[pSocketID]   -- send progress: not idle
    qsCwPump pSocketID
 end qsCwWrote
 
@@ -4270,26 +4325,45 @@ command qsCwFinish pSocketID
    qsCwClose pSocketID
 end qsCwFinish
 
--- Small text/redirect responses: write, then close only AFTER the write flushes (a
--- raw socket may drop unsent bytes if closed immediately, so we close in the
--- write-completion handler).
+-- Small text/redirect responses: fully buffered, with an exact Content-Length, so they
+-- are the ONLY responses that may keep the connection alive (a streamed file always
+-- closes - see qsCwServeFile). qsCwWantsKeep decides per response; on keep-alive we
+-- write with a "continue" completion (qsCwNext), else the terminal "close" completion.
+-- We always write BEFORE closing (a raw socket can drop unsent bytes if closed at once).
+function qsCwWantsKeep pSocketID
+   return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < kCwMaxKeepAlive)
+end qsCwWantsKeep
+
 command qsCwSendText pSocketID, pStatus, pType, pBody
-   local tData, tHead, tCrlf
+   local tData, tHead, tCrlf, tKeep
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
+   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
    put qsHttpExtraHeaders() after tHead
-   put ("Connection: close" & tCrlf & tCrlf) after tHead
-   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
+   if tKeep then
+      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
+      qsCwWriteContinue pSocketID, (textEncode(tHead, "UTF-8") & tData)
+   else
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
+   end if
 end qsCwSendText
 
 command qsCwSendRedirect pSocketID, pLocation
-   local tHead, tCrlf
+   local tHead, tCrlf, tKeep
    put (numToChar(13) & numToChar(10)) into tCrlf
+   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 301 Moved Permanently" & tCrlf & "Location: " & pLocation & tCrlf & \
-      "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
-   qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+      "Content-Length: 0" & tCrlf) into tHead
+   if tKeep then
+      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
+      qsCwWriteContinue pSocketID, textEncode(tHead, "UTF-8")
+   else
+      put ("Connection: close" & tCrlf & tCrlf) after tHead
+      qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
+   end if
 end qsCwSendRedirect
 
 command qsCwWriteClose pSocketID, pBytes
@@ -4302,6 +4376,70 @@ end qsCwWriteClose
 command qsCwWroteClose pSocketID
    qsCwClose pSocketID
 end qsCwWroteClose
+
+-- Keep-alive write: after the response flushes, DO NOT close - advance to the next
+-- request on the same connection.
+command qsCwWriteContinue pSocketID, pBytes
+   write pBytes to socket pSocketID with message "qsCwWroteContinue"
+   if the result is not empty then
+      qsCwClose pSocketID
+   end if
+end qsCwWriteContinue
+
+command qsCwWroteContinue pSocketID
+   qsCwNext pSocketID
+end qsCwWroteContinue
+
+-- One response is fully sent on a kept-alive connection: drop the request we just
+-- answered from the buffer (preserving any pipelined bytes for the next one), bump the
+-- per-connection request count against the cap, then serve or await the next request.
+command qsCwNext pSocketID
+   local tLen, tBuf
+   put qsHttpReqLength(sCwReq[pSocketID]) into tLen
+   if tLen <= 0 then
+      qsCwClose pSocketID          -- cannot frame what we just served; do not risk a hang
+      exit qsCwNext
+   end if
+   put sCwReq[pSocketID] into tBuf
+   delete byte 1 to tLen of tBuf
+   put tBuf into sCwReq[pSocketID]
+   add 1 to sCwReqCount[pSocketID]
+   put "false" into sCwServed[pSocketID]
+   put the milliseconds into sCwDeadline[pSocketID]
+   if sCwReqCount[pSocketID] >= kCwMaxKeepAlive then
+      qsCwClose pSocketID          -- connection hit its request cap; close politely
+      exit qsCwNext
+   end if
+   qsCwDrain pSocketID
+end qsCwNext
+
+-- Serve a request already buffered behind the one we just answered (HTTP pipelining),
+-- else re-arm the read for the next request's bytes.
+command qsCwDrain pSocketID
+   if qsHttpReqComplete(sCwReq[pSocketID]) then
+      put "true" into sCwServed[pSocketID]
+      qsCwServe pSocketID
+   else
+      read from socket pSocketID with message "qsCwData"
+   end if
+end qsCwDrain
+
+-- Close a kept-alive connection that has gone idle past kCwIdleTimeout. Re-arms itself
+-- while the connection is still alive but not yet idle; a no-op once cleaned/closed.
+command qsCwWatchdog pSocketID
+   if sCwServed[pSocketID] is empty then
+      exit qsCwWatchdog            -- already cleaned up
+   end if
+   if not (pSocketID is among the lines of the openSockets) then
+      qsCwClean pSocketID
+      exit qsCwWatchdog
+   end if
+   if (the milliseconds - sCwDeadline[pSocketID]) >= kCwIdleTimeout then
+      qsCwClose pSocketID
+      exit qsCwWatchdog
+   end if
+   send ("qsCwWatchdog " & pSocketID) to me in kCwIdleTimeout milliseconds
+end qsCwWatchdog
 
 command qsCwClose pSocketID
    qsCwSafeClose pSocketID
@@ -4326,6 +4464,9 @@ command qsCwClean pSocketID
    delete variable sCwTxPos[pSocketID]
    delete variable sCwTxRemaining[pSocketID]
    delete variable sCwTxName[pSocketID]
+   delete variable sCwKeep[pSocketID]
+   delete variable sCwReqCount[pSocketID]
+   delete variable sCwDeadline[pSocketID]
 end qsCwClean
 
 -- Stack-level socket messages. Act only on OUR clearweb sockets; pass anything else
