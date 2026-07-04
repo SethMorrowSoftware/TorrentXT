@@ -163,6 +163,80 @@ def fs_icon(name, is_dir):
     return "file"
 
 
+# ---- qsFileSizeSeek: O(log n) file-size probe (newquickshare) ----------------
+# Instead of reading a whole file to size it (a UI-freezing, disk-doubling full read),
+# find EOF by exponential-then-binary search over `seek to N; read 1`. readable(N) means
+# "a byte exists at 0-based offset N" (N < size); the size is the smallest non-readable
+# offset. Returns None (-> fall back to the linear count) if it exceeds the 8 GiB serve
+# cap. This mirrors qsFileSizeSeek's control flow EXACTLY so the algorithm is pinned; the
+# only on-engine unknown (seek-past-EOF returning empty) is guarded by the fallback.
+
+def file_size_probe(size, cap=8589934592):
+    def readable(n):
+        return n < size
+    if not readable(0):
+        return 0                                  # empty file
+    lo, hi = 0, 1
+    while True:
+        if hi > cap:
+            return None                           # too big / no EOF: caller falls back
+        if not readable(hi):
+            break                                 # hi is an upper bound (not readable)
+        lo, hi = hi, hi * 2
+    while (hi - lo) > 1:
+        mid = (lo + hi) // 2
+        if readable(mid):
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+# ---- qsSafeFilename: Content-Disposition filename sanitiser ------------------
+# Printable ASCII only, minus quote and backslash, so the name is safe inside a
+# quoted-string without RFC 5987 encoding. Empty -> "download". Mirrors qsSafeFilename.
+
+def safe_filename(name):
+    out = "".join(c for c in name if 32 <= ord(c) <= 126 and c not in '"\\')
+    return out if out else "download"
+
+
+# ---- qsRateShort / qsEtaShort: compact Transfers-row stats -------------------
+# Compact data-rate ("1.2M/s") and ETA ("1h2m") strings that fit the narrow progress
+# column. Mirror qsRateShort / qsEtaShort. _round1 reproduces LiveCode's
+# `the round of (v*10)/10` (round half away from zero, number formatted with no .0).
+
+def _round1(v):
+    import math
+    x = v * 10.0
+    r = (math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)) / 10.0
+    return "%g" % r
+
+
+def rate_short(bps):
+    if isinstance(bps, bool) or not isinstance(bps, (int, float)) or bps <= 0:
+        return "0B/s"
+    units = ["B", "K", "M", "G", "T"]
+    v, u = float(bps), 0
+    while v >= 1024 and u < len(units) - 1:
+        v /= 1024
+        u += 1
+    return _round1(v) + units[u] + "/s"
+
+
+def eta_short(secs):
+    if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs < 0:
+        return ""
+    s = int(secs)                                  # trunc toward zero (LiveCode trunc)
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    if s < 86400:
+        return "%dh%dm" % (s // 3600, (s % 3600) // 60)
+    return ">1d"
+
+
 # ---- fsHtmlEscape: & first, then the rest -----------------------------------
 
 def html_escape(text):
@@ -210,6 +284,19 @@ def http_req_complete(data):
     body_start = he + 4                           # 1-based, just past CRLFCRLF
     have = len(data) - body_start + 1
     return have >= cl
+
+
+def http_req_length(data):
+    """Mirror qsHttpReqLength: exact byte length of ONE complete request at the front of
+    `data` = head-with-CRLFCRLF (headEnd + 3 bytes) + Content-Length body. 0 if the head
+    is not yet complete. Keep-alive trims this many bytes to leave any pipelined bytes."""
+    he = http_header_end(data)
+    if he == 0:
+        return 0
+    cl = _content_length(data[:he - 1])
+    if cl is None or cl < 0:
+        cl = 0
+    return he + 3 + cl
 
 
 def json_escape(s):
@@ -452,6 +539,27 @@ def main():
     check("post non-integer CL -> no body", http_req_complete(
         b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), True)
 
+    # -- keep-alive framing: qsHttpReqLength trims exactly one request, leaving pipelined
+    #    bytes intact and complete for the next round (headEnd + 3 + Content-Length) --
+    check("reqlen GET exact", http_req_length(get_full), len(get_full))
+    check("reqlen GET incomplete head", http_req_length(b"GET / HTTP/1.1\r\nHost: x\r\n"), 0)
+    check("reqlen POST with body", http_req_length(post_hdr + b"hello"), len(post_hdr) + 5)
+    # a pipelined pair: trimming the first length leaves EXACTLY the second request
+    pair = get_full + post_hdr + b"hello"
+    n = http_req_length(pair)
+    check("reqlen pipelined GET length", n, len(get_full))
+    check("reqlen pipelined remainder intact", pair[n:], post_hdr + b"hello")
+    check("reqlen pipelined remainder complete", http_req_complete(pair[n:]), True)
+    # trimming a POST(+body) leaves the trailing pipelined GET
+    pair2 = post_hdr + b"hello" + get_full
+    n2 = http_req_length(pair2)
+    check("reqlen POST length includes body", n2, len(post_hdr) + 5)
+    check("reqlen POST remainder is next GET", pair2[n2:], get_full)
+    # non-integer Content-Length frames as no body (matches http_req_complete)
+    check("reqlen non-integer CL -> head only", http_req_length(
+        b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"),
+        http_header_end(b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n") + 3)
+
     # -- JSON value escaping (for the /_qs/info route) --
     check("json plain", json_escape("hello"), "hello")
     check("json quote", json_escape('a"b'), 'a\\"b')
@@ -505,6 +613,40 @@ def main():
     ]:
         check("fs_icon(%r)" % name, fs_icon(name, is_dir), want)
 
+    # -- file-size seek probe: must return the exact size for every shape --
+    for s in [0, 1, 2, 3, 4, 7, 8, 255, 256, 257, 1000, 4095, 4096, 65535, 65536,
+              1000000, 2 ** 30, 8589934592]:      # last = exactly the 8 GiB cap
+        check("file_size_probe(%d)" % s, file_size_probe(s), s)
+    # a file larger than the cap gives up (caller falls back to the linear count)
+    check("file_size_probe over-cap", file_size_probe(8589934592 + 1), None)
+
+    # -- Content-Disposition filename sanitising --
+    for name, want in [
+        ("report.pdf", "report.pdf"),
+        ("my file.txt", "my file.txt"),           # spaces are fine
+        ('a"b.txt', "ab.txt"),                     # drop the quote
+        ("back\\slash", "backslash"),             # drop the backslash
+        ("nau\x00gh\tty", "naughty"),             # drop control bytes
+        ("café.png", "caf.png"),             # drop non-ASCII (no RFC 5987 needed)
+        ("", "download"),                          # nothing left -> a default
+        ("\x01\x02", "download"),
+    ]:
+        check("safe_filename(%r)" % name, safe_filename(name), want)
+
+    # -- compact transfer-row rate + ETA formatting --
+    for bps, want in [
+        (0, "0B/s"), (-5, "0B/s"), (512, "512B/s"), (1024, "1K/s"),
+        (1536, "1.5K/s"), (1048576, "1M/s"), (1300000, "1.2M/s"),
+        (1073741824, "1G/s"), (2000, "2K/s"),
+    ]:
+        check("rate_short(%d)" % bps, rate_short(bps), want)
+    for secs, want in [
+        (-1, ""), (0, "0s"), (45, "45s"), (59, "59s"), (60, "1m"), (125, "2m"),
+        (3599, "59m"), (3600, "1h0m"), (3725, "1h2m"), (86399, "23h59m"),
+        (86400, ">1d"), (200000, ">1d"), (44.9, "44s"),
+    ]:
+        check("eta_short(%r)" % secs, eta_short(secs), want)
+
     # -- editor LAN-first gate (only local peers may reach the editor) --
     for conn, want in [
         ("cw:192.168.1.5:52000", True),           # home LAN
@@ -546,8 +688,9 @@ def main():
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
-          "HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape, "
-          "editor confinement, LAN-first gate, query parse all match)")
+          "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
+          "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
+          "probe, filename sanitise, rate + ETA format all match)")
     return 0
 
 
