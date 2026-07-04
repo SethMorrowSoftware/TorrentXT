@@ -286,19 +286,6 @@ def http_req_complete(data):
     return have >= cl
 
 
-def http_req_length(data):
-    """Mirror qsHttpReqLength: exact byte length of ONE complete request at the front of
-    `data` = head-with-CRLFCRLF (headEnd + 3 bytes) + Content-Length body. 0 if the head
-    is not yet complete. Keep-alive trims this many bytes to leave any pipelined bytes."""
-    he = http_header_end(data)
-    if he == 0:
-        return 0
-    cl = _content_length(data[:he - 1])
-    if cl is None or cl < 0:
-        cl = 0
-    return he + 3 + cl
-
-
 def json_escape(s):
     """Mirror qsJsonEscape: backslash first, then quote, CR, LF, tab."""
     out = s.replace("\\", "\\\\")
@@ -539,27 +526,6 @@ def main():
     check("post non-integer CL -> no body", http_req_complete(
         b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), True)
 
-    # -- keep-alive framing: qsHttpReqLength trims exactly one request, leaving pipelined
-    #    bytes intact and complete for the next round (headEnd + 3 + Content-Length) --
-    check("reqlen GET exact", http_req_length(get_full), len(get_full))
-    check("reqlen GET incomplete head", http_req_length(b"GET / HTTP/1.1\r\nHost: x\r\n"), 0)
-    check("reqlen POST with body", http_req_length(post_hdr + b"hello"), len(post_hdr) + 5)
-    # a pipelined pair: trimming the first length leaves EXACTLY the second request
-    pair = get_full + post_hdr + b"hello"
-    n = http_req_length(pair)
-    check("reqlen pipelined GET length", n, len(get_full))
-    check("reqlen pipelined remainder intact", pair[n:], post_hdr + b"hello")
-    check("reqlen pipelined remainder complete", http_req_complete(pair[n:]), True)
-    # trimming a POST(+body) leaves the trailing pipelined GET
-    pair2 = post_hdr + b"hello" + get_full
-    n2 = http_req_length(pair2)
-    check("reqlen POST length includes body", n2, len(post_hdr) + 5)
-    check("reqlen POST remainder is next GET", pair2[n2:], get_full)
-    # non-integer Content-Length frames as no body (matches http_req_complete)
-    check("reqlen non-integer CL -> head only", http_req_length(
-        b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"),
-        http_header_end(b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n") + 3)
-
     # -- JSON value escaping (for the /_qs/info route) --
     check("json plain", json_escape("hello"), "hello")
     check("json quote", json_escape('a"b'), 'a\\"b')
@@ -688,9 +654,9 @@ def main():
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
-          "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
-          "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
-          "probe, filename sanitise, rate + ETA format all match)")
+          "HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape, "
+          "editor confinement, LAN-first gate, query parse, size probe, "
+          "filename sanitise, rate + ETA format all match)")
     return 0
 
 

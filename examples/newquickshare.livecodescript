@@ -150,11 +150,6 @@ local sCwTxPath         -- array: socket -> disk path of the file being streamed
 local sCwTxPos          -- array: socket -> next byte offset to read (0-based; honours a Range)
 local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
 local sCwTxName         -- array: socket -> the file's leaf name (for the log)
--- HTTP keep-alive (persistent connections) for the small buffered TEXT responses only;
--- a streamed file still closes its connection (bounding the risk to the framed path).
-local sCwKeep           -- array: socket -> "true" if THIS response may keep the connection open
-local sCwReqCount       -- array: socket -> requests already served on this connection (cap)
-local sCwDeadline       -- array: socket -> the milliseconds of the last activity (idle watchdog)
 
 -- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -187,8 +182,6 @@ constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (a
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
 constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (head + body) > 256 KB
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
-constant kCwMaxKeepAlive = 100         -- max requests served on one kept-alive connection
-constant kCwIdleTimeout = 30000        -- ms an idle kept-alive connection is held open, then closed
 constant kEditTokenBytes = 24          -- live-editor session token: 24 random bytes (192 bits)
 constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to prove a login
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
@@ -250,7 +243,7 @@ on dragDrop
    if tFiles is empty then
       -- NEVER swallow a drop silently: OS file-drop delivery is occasionally flaky,
       -- so say so and point at the always-reliable click fallback.
-      qsLog "That drop did not register any file - drag again (a little slower), or click the drop area to choose a file or folder instead."
+      qsLog "That drop did not register - drag delivery can be unreliable from a file window. Use the Choose a file / Choose a folder buttons instead (they always work)."
       exit dragDrop
    end if
    -- one item at a time keeps the demo simple; the first dropped item wins
@@ -260,7 +253,13 @@ end dragDrop
 on mouseUp
    switch the short name of the target
       case "qsDrop"
-         qsBrowseFile
+         qsChooseFile      -- clicking the drag zone is a shortcut to the file picker
+         break
+      case "qsChooseFile"
+         qsChooseFile
+         break
+      case "qsChooseFolder"
+         qsChooseFolder
          break
       case "qsCopy"
          qsCopyCode
@@ -334,7 +333,7 @@ command qsBuild
 
    -- =============== LEFT: SEND ===============
    qsPanel "qsSendPanel", "20,62,620,584"
-   qsHdr "qsSendHdr", "1     Send a file", "36,72,320,96"
+   qsHdr "qsSendHdr", "1     Send a file or folder", "36,72,420,96"
    qsLabel "qsMethodCap", "How do you want to share it?", "36,106,420,124", 11
    set the textStyle of field "qsMethodCap" to "bold"
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
@@ -354,8 +353,10 @@ command qsBuild
    -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
    qsLabel "qsSendPassCap", "Encrypt (optional):", "36,180,176,198", 11
    qsField "qsSendPass", "184,176,604,202", false
-   -- the drop area (also a click-to-choose button)
-   qsField "qsDrop", "36,214,604,320", true
+   -- the drag zone (drag delivery is OS/source-dependent - it can be unreliable from a
+   -- file-manager window, so the two explicit picker buttons below are the always-works
+   -- path, and a click on the zone itself opens the file picker as a shortcut)
+   qsField "qsDrop", "36,214,604,296", true
    set the opaque of field "qsDrop" to true
    set the backgroundColor of field "qsDrop" to "245,247,250"
    set the borderWidth of field "qsDrop" to 1
@@ -364,7 +365,12 @@ command qsBuild
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file or folder here" & return & "... or click to choose. A folder becomes a browsable page (or a hosted web app).")
+   set the text of field "qsDrop" to (return & "Drag a file or folder here" & return & "(from your desktop or a file window) - or use the buttons below.")
+   -- always-reliable pickers: separate file / folder choosers open the native dialog
+   -- directly (no guessing), so sharing a FOLDER is one obvious click even when a drag
+   -- will not register.
+   qsButton "qsChooseFile", "Choose a file...", "36,302,316,328"
+   qsButton "qsChooseFolder", "Choose a folder...", "324,302,604,328"
    -- the resulting code / link, with a Copy button, then a plain-English status line
    qsHdr "qsCodeCap", "Share this with your friend", "36,330,400,352"
    qsField "qsCode", "36,354,516,388", true
@@ -541,7 +547,9 @@ end qsList
 
 command qsAddTips
    set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
-   set the tooltip of field "qsDrop" to "Drag a file here, or click to choose one, to share it."
+   set the tooltip of field "qsDrop" to "Drag a file or folder here from your desktop or a file window. If a drag will not register (it can be unreliable from a file window), use the Choose buttons below - they always work."
+   set the tooltip of button "qsChooseFile" to "Open a dialog to pick a file to share, using the method selected above. Always works, even when a drag will not register."
+   set the tooltip of button "qsChooseFolder" to "Open a dialog to pick a FOLDER to share. Over a web link or Tor it becomes a browsable page; as a share code the whole folder is sent. Always works, even when a drag will not register."
    set the tooltip of field "qsCode" to "Your file's share code. Click Copy and send it to your friend."
    set the tooltip of button "qsCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
@@ -817,28 +825,26 @@ command qsShareFile pPath
    end if
 end qsShareFile
 
--- Click-to-choose fallback for the drop area. Offers BOTH a file and a folder picker
--- (OS folder drops are the flakiest to deliver, and a folder is the natural way to web-
--- share several files), so a user is never stuck when a drag does not register. The
--- chosen item runs the SAME qsShareFile path as a drop, honouring the selected method.
-command qsBrowseFile
-   local tChoice, tPath
-   answer "What would you like to share?" with "Cancel" or "A folder" or "A file"
-   put it into tChoice
-   if tChoice is "A file" then
-      answer file "Choose a file to share:"
-      put it into tPath
-   else if tChoice is "A folder" then
-      answer folder "Choose a folder to share:"
-      put it into tPath
-   else
-      exit qsBrowseFile
+-- Always-reliable pickers behind the two "Choose..." buttons (and a click on the drag
+-- zone). Separate file and folder choosers open the native dialog DIRECTLY - no "file or
+-- folder?" prompt to wade through - so a user is never stuck when an OS drag will not
+-- register (drag delivery is engine/source-dependent). Both run the SAME qsShareFile
+-- path as a drop, honouring the currently selected share method.
+command qsChooseFile
+   answer file "Choose a file to share:"
+   if it is empty then
+      exit qsChooseFile
    end if
-   if tPath is empty then
-      exit qsBrowseFile
+   qsShareFile it
+end qsChooseFile
+
+command qsChooseFolder
+   answer folder "Choose a folder to share:"
+   if it is empty then
+      exit qsChooseFolder
    end if
-   qsShareFile tPath
-end qsBrowseFile
+   qsShareFile it
+end qsChooseFolder
 
 command qsCopyCode
    if field "qsCode" is empty then
@@ -2636,25 +2642,6 @@ function qsHttpReqComplete pData
    return (tHave >= tContentLen)
 end qsHttpReqComplete
 
--- The exact byte length of ONE complete request at the front of pData: the head (up to
--- and including the terminating CRLFCRLF, i.e. tHeadEnd + 3 bytes) plus its
--- Content-Length body. Used by keep-alive to trim the request just served and leave any
--- pipelined bytes intact for the next one. Returns 0 if the head is not yet complete (a
--- caller must never trim on 0). Pinned by keepalive_req_length() in the golden.
-function qsHttpReqLength pData
-   local tHeadEnd, tHeaders, tLen
-   put qsHttpHeaderEnd(pData) into tHeadEnd
-   if tHeadEnd is 0 then
-      return 0
-   end if
-   put qsHttpParseHead(byte 1 to (tHeadEnd - 1) of pData) into tHeaders
-   put tHeaders["content-length"] into tLen
-   if tLen is not an integer or tLen < 0 then
-      put 0 into tLen
-   end if
-   return tHeadEnd + 3 + tLen
-end qsHttpReqLength
-
 -- Parse the head block (request line + header lines, ASCII) into an array: __method /
 -- __path / __query, plus lowercased header names -> values. Save/restore delimiters.
 function qsHttpParseHead pHeadBytes
@@ -2665,7 +2652,6 @@ function qsHttpParseHead pHeadBytes
    set the lineDelimiter to (numToChar(13) & numToChar(10))
    put line 1 of tText into tReqLine
    put toUpper(word 1 of tReqLine) into tOut["__method"]
-   put word 3 of tReqLine into tOut["__version"]   -- e.g. HTTP/1.1 (keep-alive default)
    put word 2 of tReqLine into tResource
    set the itemDelimiter to "?"
    put item 1 of tResource into tOut["__path"]
@@ -4084,15 +4070,7 @@ command qsCwAccept pSocketID
    end if
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
-   put "false" into sCwKeep[pSocketID]
-   put 0 into sCwReqCount[pSocketID]
-   put the milliseconds into sCwDeadline[pSocketID]
    read from socket pSocketID with message "qsCwData"
-   -- idle watchdog: closes a connection that stalls (never sends, or a kept-alive
-   -- connection that goes quiet), so a slow-loris or an abandoned keep-alive cannot
-   -- pile up sockets. Re-armed while the connection makes progress (qsCwData/qsCwWrote
-   -- refresh sCwDeadline).
-   send ("qsCwWatchdog " & pSocketID) to me in kCwIdleTimeout milliseconds
 end qsCwAccept
 
 command qsCwData pSocketID, pData
@@ -4102,7 +4080,6 @@ command qsCwData pSocketID, pData
    if sCwServed[pSocketID] is "true" then
       exit qsCwData            -- already answering; ignore trailing bytes
    end if
-   put the milliseconds into sCwDeadline[pSocketID]   -- recv activity: not idle
    put pData after sCwReq[pSocketID]
    if the number of bytes in sCwReq[pSocketID] > kFsMaxReq then
       put "true" into sCwServed[pSocketID]
@@ -4124,24 +4101,6 @@ command qsCwServe pSocketID
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
    put tHeaders["__path"] into tRaw
-   -- decide keep-alive for THIS request. We can only frame a request that ends at its
-   -- Content-Length; a chunked body is unframeable, so refuse it (and close, so its
-   -- trailing bytes can never be mis-read as the next request). HTTP/1.1 defaults to
-   -- keep-alive unless "Connection: close"; HTTP/1.0 needs an explicit "keep-alive".
-   put "false" into sCwKeep[pSocketID]
-   if tHeaders["transfer-encoding"] contains "chunked" then
-      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Chunked request bodies are not supported."
-      exit qsCwServe
-   end if
-   if tHeaders["__version"] is "HTTP/1.1" then
-      if toLower(tHeaders["connection"]) is not "close" then
-         put "true" into sCwKeep[pSocketID]
-      end if
-   else
-      if toLower(tHeaders["connection"]) is "keep-alive" then
-         put "true" into sCwKeep[pSocketID]
-      end if
-   end if
    put urlDecode(tRaw) into tPath
    replace "\" with "/" in tPath
    if tPath contains ".." then
@@ -4316,7 +4275,6 @@ command qsCwWrote pSocketID
    if sCwTxPath[pSocketID] is empty then
       exit qsCwWrote           -- already finished/cleaned
    end if
-   put the milliseconds into sCwDeadline[pSocketID]   -- send progress: not idle
    qsCwPump pSocketID
 end qsCwWrote
 
@@ -4325,45 +4283,26 @@ command qsCwFinish pSocketID
    qsCwClose pSocketID
 end qsCwFinish
 
--- Small text/redirect responses: fully buffered, with an exact Content-Length, so they
--- are the ONLY responses that may keep the connection alive (a streamed file always
--- closes - see qsCwServeFile). qsCwWantsKeep decides per response; on keep-alive we
--- write with a "continue" completion (qsCwNext), else the terminal "close" completion.
--- We always write BEFORE closing (a raw socket can drop unsent bytes if closed at once).
-function qsCwWantsKeep pSocketID
-   return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < kCwMaxKeepAlive)
-end qsCwWantsKeep
-
+-- Small text/redirect responses: write, then close only AFTER the write flushes (a
+-- raw socket may drop unsent bytes if closed immediately, so we close in the
+-- write-completion handler).
 command qsCwSendText pSocketID, pStatus, pType, pBody
-   local tData, tHead, tCrlf, tKeep
+   local tData, tHead, tCrlf
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
-   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
    put qsHttpExtraHeaders() after tHead
-   if tKeep then
-      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
-      qsCwWriteContinue pSocketID, (textEncode(tHead, "UTF-8") & tData)
-   else
-      put ("Connection: close" & tCrlf & tCrlf) after tHead
-      qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
-   end if
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
+   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
 end qsCwSendText
 
 command qsCwSendRedirect pSocketID, pLocation
-   local tHead, tCrlf, tKeep
+   local tHead, tCrlf
    put (numToChar(13) & numToChar(10)) into tCrlf
-   put qsCwWantsKeep(pSocketID) into tKeep
    put ("HTTP/1.1 301 Moved Permanently" & tCrlf & "Location: " & pLocation & tCrlf & \
-      "Content-Length: 0" & tCrlf) into tHead
-   if tKeep then
-      put ("Connection: keep-alive" & tCrlf & tCrlf) after tHead
-      qsCwWriteContinue pSocketID, textEncode(tHead, "UTF-8")
-   else
-      put ("Connection: close" & tCrlf & tCrlf) after tHead
-      qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
-   end if
+      "Content-Length: 0" & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+   qsCwWriteClose pSocketID, textEncode(tHead, "UTF-8")
 end qsCwSendRedirect
 
 command qsCwWriteClose pSocketID, pBytes
@@ -4376,70 +4315,6 @@ end qsCwWriteClose
 command qsCwWroteClose pSocketID
    qsCwClose pSocketID
 end qsCwWroteClose
-
--- Keep-alive write: after the response flushes, DO NOT close - advance to the next
--- request on the same connection.
-command qsCwWriteContinue pSocketID, pBytes
-   write pBytes to socket pSocketID with message "qsCwWroteContinue"
-   if the result is not empty then
-      qsCwClose pSocketID
-   end if
-end qsCwWriteContinue
-
-command qsCwWroteContinue pSocketID
-   qsCwNext pSocketID
-end qsCwWroteContinue
-
--- One response is fully sent on a kept-alive connection: drop the request we just
--- answered from the buffer (preserving any pipelined bytes for the next one), bump the
--- per-connection request count against the cap, then serve or await the next request.
-command qsCwNext pSocketID
-   local tLen, tBuf
-   put qsHttpReqLength(sCwReq[pSocketID]) into tLen
-   if tLen <= 0 then
-      qsCwClose pSocketID          -- cannot frame what we just served; do not risk a hang
-      exit qsCwNext
-   end if
-   put sCwReq[pSocketID] into tBuf
-   delete byte 1 to tLen of tBuf
-   put tBuf into sCwReq[pSocketID]
-   add 1 to sCwReqCount[pSocketID]
-   put "false" into sCwServed[pSocketID]
-   put the milliseconds into sCwDeadline[pSocketID]
-   if sCwReqCount[pSocketID] >= kCwMaxKeepAlive then
-      qsCwClose pSocketID          -- connection hit its request cap; close politely
-      exit qsCwNext
-   end if
-   qsCwDrain pSocketID
-end qsCwNext
-
--- Serve a request already buffered behind the one we just answered (HTTP pipelining),
--- else re-arm the read for the next request's bytes.
-command qsCwDrain pSocketID
-   if qsHttpReqComplete(sCwReq[pSocketID]) then
-      put "true" into sCwServed[pSocketID]
-      qsCwServe pSocketID
-   else
-      read from socket pSocketID with message "qsCwData"
-   end if
-end qsCwDrain
-
--- Close a kept-alive connection that has gone idle past kCwIdleTimeout. Re-arms itself
--- while the connection is still alive but not yet idle; a no-op once cleaned/closed.
-command qsCwWatchdog pSocketID
-   if sCwServed[pSocketID] is empty then
-      exit qsCwWatchdog            -- already cleaned up
-   end if
-   if not (pSocketID is among the lines of the openSockets) then
-      qsCwClean pSocketID
-      exit qsCwWatchdog
-   end if
-   if (the milliseconds - sCwDeadline[pSocketID]) >= kCwIdleTimeout then
-      qsCwClose pSocketID
-      exit qsCwWatchdog
-   end if
-   send ("qsCwWatchdog " & pSocketID) to me in kCwIdleTimeout milliseconds
-end qsCwWatchdog
 
 command qsCwClose pSocketID
    qsCwSafeClose pSocketID
@@ -4464,9 +4339,6 @@ command qsCwClean pSocketID
    delete variable sCwTxPos[pSocketID]
    delete variable sCwTxRemaining[pSocketID]
    delete variable sCwTxName[pSocketID]
-   delete variable sCwKeep[pSocketID]
-   delete variable sCwReqCount[pSocketID]
-   delete variable sCwDeadline[pSocketID]
 end qsCwClean
 
 -- Stack-level socket messages. Act only on OUR clearweb sockets; pass anything else
