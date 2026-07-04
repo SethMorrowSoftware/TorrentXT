@@ -48,6 +48,17 @@ local sPendingKey       -- array: info-hash -> 32-byte file key, for a download 
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
 local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned on close)
+-- "My Shares" management: the swarm already holds ANY number of concurrent code
+-- shares (each btAddTorrentFile lands in the session table); the only limit was the
+-- single qsCode field, so an older share's code was lost the moment a newer one
+-- replaced it. sShareCodeByHandle keeps every live code share's code against its
+-- torrent handle, so the Transfers list can re-copy or stop each one individually.
+local sShareCodeByHandle -- array: torrent handle -> the share code we minted for it
+-- The Transfers list is the one actionable surface: each visible row (a download, a
+-- code seed, a Tor stream, a web/folder page) is tagged with a stable identity so a
+-- selection survives the 2-4 Hz repaint and Stop/Copy act on the right item.
+local sXferRow          -- array: list line number -> "type|key" identity for that row
+local sXferSel          -- the currently selected row identity ("type|key"), or empty
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -130,6 +141,7 @@ local sCwMapId          -- the btMapPort mapping id (0 = none/no UPnP)
 local sCwMapped         -- "true" once a portMapped event confirms the router opened it
 local sCwExtIp          -- the discovered public IP (from the externalIp event), or empty
 local sCwLanIp          -- the best-effort LAN IP for the local link
+local sCwLink           -- the primary browser link (for per-row Copy in My Shares)
 -- per-connection state, keyed by the LiveCode socket id
 local sCwReq            -- array: socket -> accumulated inbound HTTP request bytes
 local sCwServed         -- array: socket -> "true" once we have begun answering it
@@ -259,6 +271,15 @@ on mouseUp
       case "qsWebCopy"
          qsCopyWebLink
          break
+      case "qsXfers"
+         qsXferClick
+         break
+      case "qsXferCopy"
+         qsCopySelected
+         break
+      case "qsXferStop"
+         qsStopSelected
+         break
       default
          pass mouseUp
    end switch
@@ -369,18 +390,25 @@ command qsBuild
    qsButton "qsGet", "Download", "956,126,1064,158"
    qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "656,170,1064,188", 10
    qsField "qsRecvPass", "656,190,1064,216", false
-   -- =============== RIGHT: TRANSFERS ===============
+   -- =============== RIGHT: TRANSFERS & SHARES ===============
+   -- One actionable list of everything live: downloads, code seeds, and Tor/web pages.
+   -- Click a row to select it, then Copy code (re-fetch that share's code) or Stop it.
+   -- Multiple code shares run at once - each is its own selectable, stoppable row.
    qsPanel "qsXferPanel", "640,234,1080,470"
-   qsHdr "qsXferSec", "Transfers", "656,244,940,268"
+   qsHdr "qsXferSec", "Transfers & shares", "656,244,940,268"
    qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "656,274,1064,290", 9
    set the tabStops of field "qsXferHead" to "230,340"
    set the textFont of field "qsXferHead" to "Courier"
    set the textSize of field "qsXferHead" to 9
    set the foregroundColor of field "qsXferHead" to "138,144,154"
-   qsList "qsXfers", "656,294,1064,458", false
+   qsList "qsXfers", "656,294,1064,430", false
    set the tabStops of field "qsXfers" to "230,340"
    set the textFont of field "qsXfers" to "Courier"
    set the textSize of field "qsXfers" to 10
+   -- per-row management: pick a row, then act on THAT share/transfer
+   qsCap "qsXferHint", "Select a row to manage it:", "656,438,876,458"
+   qsButton "qsXferCopy", "Copy code", "884,435,976,461"
+   qsButton "qsXferStop", "Stop", "984,435,1064,461"
    -- =============== RIGHT: ACTIVITY ===============
    qsPanel "qsActPanel", "640,480,1080,614"
    qsHdr "qsActSec", "Activity", "656,490,940,512"
@@ -503,7 +531,9 @@ command qsAddTips
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your newQuickShare folder."
-   set the tooltip of field "qsXfers" to "Files you are sending and receiving, with live progress."
+   set the tooltip of field "qsXfers" to "Everything live: downloads, the files you are sharing by code (each is its own row - you can run many at once), and any Tor or web page. Click a row to select it, then Copy code or Stop."
+   set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again."
+   set the tooltip of button "qsXferStop" to "Stop the selected item: stop sharing a file (peers can no longer download it), or cancel a download in progress. Your original files are never deleted."
    set the tooltip of button "qsMethodCode" to "The classic way: a normal peer-to-peer BitTorrent share. Give your friend the code; the transfer resumes if interrupted. Your IP is visible to peers."
    set the tooltip of button "qsMethodTor" to "Send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER to serve it as a browsable Tor web page - open the link in Tor Browser."
    set the tooltip of button "qsMethodWeb" to "Serve the file or folder over the plain web: the recipient just opens a link in any browser, no app needed. The router port is opened automatically (UPnP) and the link carries a secret token. Fast, but your IP is visible and the download is not encrypted - use Tor for privacy."
@@ -597,6 +627,12 @@ command qsStop
    end repeat
    put empty into sTempEnc
    put empty into sOnionXfers
+   -- reset the My Shares bookkeeping too: torrent handle values restart at a fixed
+   -- number for a fresh session, so a stale handle->code entry left here would make a
+   -- reopened session's first download look like a seed with someone else's code.
+   put empty into sShareCodeByHandle
+   put empty into sXferRow
+   put empty into sXferSel
 end qsStop
 
 command qsPollOnce
@@ -716,6 +752,7 @@ command qsShareFile pPath
          exit qsShareFile
       end if
       put tHash into sShareCode
+      put tHash into sShareCodeByHandle[tH]   -- retain THIS share's code (My Shares)
       set the text of field "qsCode" to tHash
       set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " (not encrypted) - keep this window open so your friend can download.")
       qsLog "Got a code for" && quote & tName & quote & ". Click Copy and send it to your friend."
@@ -757,6 +794,7 @@ command qsShareFile pPath
       put tName into sXferName[toLower(tHash)]    -- show the REAL name locally
       put tEncPath into sTempEnc[toLower(tHash)]  -- clean up on close
       put qsMakeCode(tHash, tName, tSalt, tVerifier) into sShareCode
+      put sShareCode into sShareCodeByHandle[tH]   -- retain THIS share's code (My Shares)
       set the text of field "qsCode" to sShareCode
       set the text of field "qsSharing" to ("Sharing " & quote & tName & quote & " ENCRYPTED - send the code AND tell your friend the passphrase separately.")
       qsLog "Encrypted" && quote & tName & quote & ". Send the code (Copy) AND the passphrase - your friend needs both."
@@ -881,15 +919,24 @@ end qsGetFile
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
-   local tIH, tDisp, tDir, tK, tE, tProg, tRemain
+   local tIH, tDisp, tDir, tK, tE, tProg, tRemain, tSelLine, tPrevLine
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
+   end if
+   -- snapshot the user's current selection BY IDENTITY before we rebuild the map, so
+   -- the highlight follows the same transfer even as rows reorder or the list is
+   -- retyped wholesale each pass. Reads the live listBehavior hilite (set the instant
+   -- the user clicked), so it does not depend on a mouseUp reaching us.
+   put the hilitedLines of field "qsXfers" into tPrevLine
+   if tPrevLine is a number and tPrevLine > 0 and sXferRow[tPrevLine] is not empty then
+      put sXferRow[tPrevLine] into sXferSel
    end if
    put btTorrentCount(sSession) into tCount
    put "" into tRows
    put 0 into tDown
    put 0 into tUp
    put 0 into tLineNum
+   put empty into sXferRow   -- rebuild the row -> identity map each pass (rows reorder)
    repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is 0 then
@@ -897,6 +944,7 @@ command qsRefreshXfers
       end if
       put btTorrentStatus(tH) into tS
       add 1 to tLineNum
+      put ("torrent|" & tH) into sXferRow[tLineNum]   -- this row -> its torrent handle
       put (the round of (tS["progress"] * 1000) / 10) into tPct
       -- show the REAL name for an encrypted transfer (the swarm sees the .enc
       -- name); mark it "(locked)" so it is obvious it is end-to-end encrypted.
@@ -931,6 +979,8 @@ command qsRefreshXfers
    -- append anonymous (Tor) transfers; they have NO torrent handle, so the torrent
    -- loop above never sees them. Same "name TAB dir TAB bar" row format.
    repeat for each key tK in sOnionXfers
+      add 1 to tLineNum
+      put ("onion|" & tK) into sXferRow[tLineNum]   -- this row -> its onion stream
       put sOnionXfers[tK] into tE
       put tE["dir"] & " via Tor" into tDir
       if tE["enc"] is "true" then
@@ -946,17 +996,18 @@ command qsRefreshXfers
          put (the round of (tE["got"] / tE["total"] * 1000) / 10) into tPct
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & tPct & "%  " & qsBytes(tE["got"]) & return after tRows
       end if
-      add 1 to tLineNum
    end repeat
    -- a folder web share has no torrent and no per-file transfer rows; show one status
    -- line so the Transfers panel is not misleadingly empty while it is serving.
    if sActiveShare["kind"] is "folder" and sActiveShare["revealed"] is "true" then
-      put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
       add 1 to tLineNum
+      put "torweb|" into sXferRow[tLineNum]        -- the one Tor folder web page
+      put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
    end if
    if sCwActive is "true" then
-      put qsTrunc(sCwName, 26) & tab & "direct web" & tab & "serving (open the link)" & return after tRows
       add 1 to tLineNum
+      put "web|" into sXferRow[tLineNum]           -- the one clearweb share
+      put qsTrunc(sCwName, 26) & tab & "direct web" & tab & "serving (open the link)" & return after tRows
    end if
    if the last char of tRows is return then
       delete the last char of tRows
@@ -966,6 +1017,29 @@ command qsRefreshXfers
    end if
    lock screen
    set the text of field "qsXfers" to tRows
+   -- keep the user's selection pinned to the SAME item across this repaint: rows
+   -- reorder (the torrent enumeration is not stable) and a plain hilitedLine would
+   -- drift to a different transfer. Re-find the selected identity by value; if the
+   -- item has ended (no row carries it), drop the selection.
+   if sXferSel is not empty then
+      put 0 into tSelLine
+      repeat for each key tK in sXferRow
+         if sXferRow[tK] is sXferSel then
+            put tK into tSelLine
+            exit repeat
+         end if
+      end repeat
+      if tSelLine > 0 then
+         set the hilitedLines of field "qsXfers" to tSelLine
+      else
+         -- the selected item ended: drop BOTH the tracked identity and the field's
+         -- lingering highlight. Retyping the list text does not reset the hilite, so a
+         -- stale highlight would be re-read next pass and re-bound to whatever unrelated
+         -- transfer now sits on that line number (a wrong Stop/Copy target).
+         put empty into sXferSel
+         set the hilitedLines of field "qsXfers" to empty
+      end if
+   end if
    unlock screen
    put btDhtState(sSession) into tD
    put tD["nodes"] into tNodes
@@ -976,6 +1050,251 @@ command qsRefreshXfers
    end if
    put tStat & "        sending " & (qsBytes(tUp) & "/s") & "    receiving " & (qsBytes(tDown) & "/s") into field "qsStatus"
 end qsRefreshXfers
+
+-- ---- My Shares: per-row selection, copy, and stop --------------------------
+-- The Transfers list is the single actionable surface. Each row was tagged with a
+-- stable "type|key" identity in qsRefreshXfers (sXferRow); these handlers resolve the
+-- selected row and act on exactly that item, so any number of concurrent code shares
+-- (plus the single Tor and single web share) can be managed independently.
+
+-- Record the clicked row's identity immediately (belt-and-suspenders with the
+-- top-of-refresh snapshot, so the selection is captured even before the next repaint).
+command qsXferClick
+   local tLine
+   put the hilitedLines of field "qsXfers" into tLine
+   if tLine is a number and tLine > 0 and sXferRow[tLine] is not empty then
+      put sXferRow[tLine] into sXferSel
+   end if
+end qsXferClick
+
+-- Resolve the identity the user has selected RIGHT NOW: prefer the live hilite mapped
+-- through the current row map (valid between repaints), else the persisted selection.
+function qsSelectedIdentity
+   local tLine
+   put the hilitedLines of field "qsXfers" into tLine
+   if tLine is a number and tLine > 0 and sXferRow[tLine] is not empty then
+      return sXferRow[tLine]
+   end if
+   return sXferSel
+end qsSelectedIdentity
+
+command qsCopySelected
+   local tId, tType, tKey, tCode, tSavedID
+   put qsSelectedIdentity() into tId
+   if tId is empty then
+      qsLog "Click a row in Transfers & shares first, then Copy code."
+      exit qsCopySelected
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "|"
+   put item 1 of tId into tType
+   put item 2 of tId into tKey
+   set the itemDelimiter to tSavedID
+   switch tType
+      case "torrent"
+         put sShareCodeByHandle[tKey] into tCode
+         if tCode is empty then
+            qsLog "That row is a download you are receiving, not a share you created - there is no code to copy."
+            exit qsCopySelected
+         end if
+         break
+      case "onion"
+         -- a receiving onion row is a download, not a share: it has no code to hand out
+         if sOnionXfers[tKey]["dir"] is "receiving" then
+            qsLog "That row is a Tor download you are receiving, not a share - there is no code to copy."
+            exit qsCopySelected
+         end if
+         put sActiveShare["code"] into tCode
+         break
+      case "torweb"
+         put sActiveShare["code"] into tCode
+         break
+      case "web"
+         put sCwLink into tCode
+         break
+      default
+         put empty into tCode
+   end switch
+   if tCode is empty then
+      qsLog "There is no code to copy for that row yet."
+      exit qsCopySelected
+   end if
+   set the clipboardData["text"] to tCode
+   qsLog "Copied that share's code to the clipboard. Send it to your friend."
+end qsCopySelected
+
+command qsStopSelected
+   local tId, tType, tKey, tSavedID
+   put qsSelectedIdentity() into tId
+   if tId is empty then
+      qsLog "Click a row in Transfers & shares first, then Stop."
+      exit qsStopSelected
+   end if
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "|"
+   put item 1 of tId into tType
+   put item 2 of tId into tKey
+   set the itemDelimiter to tSavedID
+   switch tType
+      case "torrent"
+         qsStopTorrentRow tKey
+         break
+      case "onion"
+         -- an onion row is EITHER an incoming download (cancel just that stream) or the
+         -- outgoing share's live send (stop the whole share). sActiveShare is the send
+         -- side only, so a receiving row must NOT route there or it would kill an
+         -- unrelated outgoing share and leave the download running.
+         if sOnionXfers[tKey]["dir"] is "receiving" then
+            if sOnionXfers[tKey]["state"] is "done" or sOnionXfers[tKey]["state"] is "error" then
+               qsLog "That Tor download has already finished or stopped."
+            else
+               qsOnionRecvAbort tKey, "Tor download cancelled."
+            end if
+         else
+            qsOnionStopShare
+         end if
+         break
+      case "torweb"
+         qsOnionStopShare
+         break
+      case "web"
+         qsStopWebShare
+         break
+      default
+         qsLog "That row cannot be stopped."
+   end switch
+   -- reflect the change at once (the row disappears / the panel updates)
+   qsRefreshXfers
+end qsStopSelected
+
+-- Stop ONE torrent row: a code seed (peers can no longer fetch it) or a download in
+-- progress (cancel it). Never deletes the user's own files. Cleans the per-hash and
+-- per-handle bookkeeping so nothing leaks, and clears the left-panel code field only
+-- if it still shows THIS share's now-dead code.
+command qsStopTorrentRow pHandle
+   local tS, tHash, tIsSeed, tComplete, tName, tPrompt, tRc, tEnc, tErr, tCode
+   put btTorrentStatus(pHandle) into tS
+   if tS is empty then
+      qsLog "That item has already ended."
+      exit qsStopTorrentRow
+   end if
+   put toLower(tS["infoHashV1"]) into tHash
+   put sShareCodeByHandle[pHandle] into tCode      -- non-empty => a share we created
+   put (tCode is not empty) into tIsSeed
+   -- a RECEIVED file that has finished keeps seeding to the swarm; it is complete, so it
+   -- must not be described as a cancellable "partial download".
+   put (tS["progress"] is a number and tS["progress"] >= 1) into tComplete
+   if tHash is not empty and sXferName[tHash] is not empty then
+      put sXferName[tHash] into tName
+   else
+      put tS["name"] into tName
+   end if
+   if tName is empty then
+      put "this item" into tName
+   end if
+   if tIsSeed then
+      put ("Stop sharing " & quote & tName & quote & "?" & return & return & \
+         "Peers will no longer be able to download it with its code. Your original file is NOT deleted.") into tPrompt
+   else if tComplete then
+      put ("Stop seeding " & quote & tName & quote & "?" & return & return & \
+         "The complete file stays in your download folder; you just stop sharing it back to the swarm.") into tPrompt
+   else
+      put ("Cancel the download of " & quote & tName & quote & "?" & return & return & \
+         "Any partial file already saved stays in your download folder for you to remove.") into tPrompt
+   end if
+   answer tPrompt with "Keep going" or "Stop"
+   if it is not "Stop" then
+      exit qsStopTorrentRow
+   end if
+   -- keep files: pDeleteFiles is false so a seed never deletes the user's original and
+   -- a cancelled download leaves its partial for the user to decide on
+   put btRemoveTorrent(sSession, pHandle, false) into tRc
+   delete variable sShareCodeByHandle[pHandle]
+   if tHash is not empty then
+      put sTempEnc[tHash] into tEnc
+      if tEnc is not empty then
+         try
+            if there is a file tEnc then
+               delete file tEnc          -- our own ciphertext temp, safe to remove
+            end if
+         catch tErr
+         end try
+      end if
+      delete variable sTempEnc[tHash]
+      delete variable sXferName[tHash]
+      delete variable sPendingKey[tHash]
+      delete variable sPendingName[tHash]
+   end if
+   put empty into sXferSel
+   if tCode is not empty and the text of field "qsCode" is tCode then
+      set the text of field "qsCode" to ""
+      set the text of field "qsSharing" to ""
+   end if
+   if tIsSeed then
+      qsLog "Stopped sharing " & quote & tName & quote & "."
+   else if tComplete then
+      qsLog "Stopped seeding " & quote & tName & quote & "."
+   else
+      qsLog "Cancelled the download of " & quote & tName & quote & "."
+   end if
+end qsStopTorrentRow
+
+-- Stop the single live Tor share (file OR folder web page). Mirrors the replace-previous
+-- teardown in qsStartOnionShare: abort any live transfer first (so the file handle is
+-- closed before we delete the .enc), remove the service, delete our temp, reset state.
+command qsOnionStopShare
+   local tErr, tCode
+   if sActiveShare["service"] is empty then
+      qsLog "There is no Tor share to stop."
+      exit qsOnionStopShare
+   end if
+   answer ("Stop this Tor share?" & return & return & \
+      "The private address stops working immediately, and any transfer in progress is cut off.") with "Keep going" or "Stop"
+   if it is not "Stop" then
+      exit qsOnionStopShare
+   end if
+   put sActiveShare["code"] into tCode
+   if sActiveShare["stream"] is not empty then
+      qsOnionServeAbort sActiveShare["stream"]
+   end if
+   try
+      oxRemoveService sActiveShare["service"]   -- also closes any folder-server streams
+   catch tErr
+   end try
+   if sActiveShare["encTmp"] is not empty then
+      try
+         if there is a file sActiveShare["encTmp"] then
+            delete file sActiveShare["encTmp"]
+         end if
+      catch tErr
+      end try
+   end if
+   put empty into sActiveShare
+   put empty into sXferSel
+   if tCode is not empty and the text of field "qsCode" is tCode then
+      set the text of field "qsCode" to ""
+      set the text of field "qsWebLink" to ""
+      set the text of field "qsSharing" to ""
+   end if
+   qsLog "Tor share stopped."
+end qsOnionStopShare
+
+-- Stop the single live web (clearweb) share. qsStopClearweb does the socket + port-map
+-- teardown and (now) guards its own field clearing, so a coexisting code share's code
+-- in the left panel survives.
+command qsStopWebShare
+   if not sCwActive then
+      qsLog "There is no web share to stop."
+      exit qsStopWebShare
+   end if
+   answer ("Stop this web share?" & return & return & \
+      "The link stops working immediately and the router port is released.") with "Keep going" or "Stop"
+   if it is not "Stop" then
+      exit qsStopWebShare
+   end if
+   put empty into sXferSel
+   qsStopClearweb
+end qsStopWebShare
 
 command qsHandleEvent pEvent
    switch pEvent["name"]
@@ -1361,6 +1680,7 @@ command qsOnionServicePublished pInfo
       put tOnion into sActiveShare["onion"]
       put "true" into sActiveShare["revealed"]
       put ("http://" & tOnion & "/") into sShareCode
+      put sShareCode into sActiveShare["code"]   -- per-row Copy (My Shares)
       set the text of field "qsCode" to ("http://" & tOnion & "/")
       set the text of field "qsWebLink" to ("http://" & tOnion & "/")
       set the text of field "qsSharing" to ("Serving the folder " & quote & sActiveShare["name"] & quote & " over Tor - both IPs hidden. Open the link in Tor Browser to browse and download; keep this window open.")
@@ -1369,6 +1689,7 @@ command qsOnionServicePublished pInfo
    end if
    put qsMakeTorCode(tOnion, sActiveShare["name"], sActiveShare["salt"], sActiveShare["verify"]) into tCode
    put tCode into sShareCode
+   put tCode into sActiveShare["code"]   -- per-row Copy (My Shares)
    put tOnion into sActiveShare["onion"]
    set the text of field "qsCode" to tCode
    put "true" into sActiveShare["revealed"]
@@ -3672,9 +3993,15 @@ command qsStopClearweb
    put empty into sCwToken
    put empty into sCwRoot
    put empty into sCwFilePath
-   set the text of field "qsCode" to ""
+   -- clear the left-panel link only if it still shows THIS web share: a code share
+   -- created afterwards may own the field now (concurrent shares), and wiping it would
+   -- lose that share's code from view.
+   if sCwLink is not empty and the text of field "qsCode" is sCwLink then
+      set the text of field "qsCode" to ""
+      set the text of field "qsSharing" to ""
+   end if
    set the text of field "qsWebLink" to ""
-   set the text of field "qsSharing" to ""
+   put empty into sCwLink
    qsLog "Web share stopped."
 end qsStopClearweb
 
@@ -4056,12 +4383,15 @@ command qsCwShowLinks
    if tWan is not empty then
       set the text of field "qsCode" to tWan
       set the text of field "qsWebLink" to tLan
+      put tWan into sCwLink
    else if tLan is not empty then
       set the text of field "qsCode" to tLan
       set the text of field "qsWebLink" to tLan
+      put tLan into sCwLink
    else
       set the text of field "qsCode" to ("http://YOUR-IP:" & sCwPort & tPath)
       set the text of field "qsWebLink" to "(could not detect your IP; use the local link or Tor)"
+      put ("http://YOUR-IP:" & sCwPort & tPath) into sCwLink
    end if
    qsCwStatusText
 end qsCwShowLinks
