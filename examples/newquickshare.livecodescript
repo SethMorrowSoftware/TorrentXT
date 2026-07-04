@@ -637,6 +637,10 @@ command qsStart
    else
       qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
+   -- repaint the method-driven UI now that sCanEncrypt + the method flags are known:
+   -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
+   -- without this the encrypt row would sit hidden + falsely captioned "install cryptoXT".
+   qsSyncMethod
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -4150,6 +4154,7 @@ command qsCwAccept pSocketID
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
    put "false" into sCwKeep[pSocketID]
+   put "" into sCwMethod[pSocketID]        -- no method parsed yet (qsCwServe sets it)
    put 0 into sCwReqCount[pSocketID]
    put the milliseconds into sCwDeadline[pSocketID]
    read from socket pSocketID with message "qsCwData"
@@ -4403,7 +4408,10 @@ end qsCwFinish
 -- write with a "continue" completion (qsCwNext), else the terminal "close" completion.
 -- We always write BEFORE closing (a raw socket can drop unsent bytes if closed at once).
 function qsCwWantsKeep pSocketID
-   return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < kCwMaxKeepAlive)
+   -- "< cap - 1": the response that will be the LAST one allowed must advertise close,
+   -- so we never send "keep-alive" and then close the socket under a pipelined next
+   -- request. Still serves exactly kCwMaxKeepAlive requests per connection.
+   return (sCwKeep[pSocketID] is "true" and sCwReqCount[pSocketID] < (kCwMaxKeepAlive - 1))
 end qsCwWantsKeep
 
 command qsCwSendText pSocketID, pStatus, pType, pBody
@@ -4489,6 +4497,9 @@ command qsCwNext pSocketID
    put tBuf into sCwReq[pSocketID]
    add 1 to sCwReqCount[pSocketID]
    put "false" into sCwServed[pSocketID]
+   -- next request's method is not parsed yet: a 413 fired before qsCwServe must not
+   -- inherit this request's method and wrongly suppress its body as if it were a HEAD.
+   put "" into sCwMethod[pSocketID]
    put the milliseconds into sCwDeadline[pSocketID]
    if sCwReqCount[pSocketID] >= kCwMaxKeepAlive then
       qsCwClose pSocketID          -- connection hit its request cap; close politely
