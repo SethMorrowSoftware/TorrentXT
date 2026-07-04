@@ -1472,11 +1472,80 @@ function qsMakeTorCode pOnion, pName, pSalt, pVerifier
       qsB64(pSalt) & ":" & qsB64(pVerifier)
 end qsMakeTorCode
 
--- Byte size of a file WITHOUT loading it whole into memory. OpenXTalk does not
--- support 'the detailedFiles', so we open the file and count in bounded 4 MiB
--- chunks: O(file size) I/O but O(1) memory. Used for the header totalLen and the
--- large-file warning (both small-file cases in practice). Empty if unreadable.
+-- Byte size of a file WITHOUT loading it whole into memory. OpenXTalk does not support
+-- 'the detailedFiles', so historically we read the whole file to count it - O(file size)
+-- I/O that also FROZE the UI thread and DOUBLED the disk reads for every download (size
+-- pass + send pass). Now we find the size with an O(log n) SEEK PROBE (a handful of
+-- single-byte reads), and only fall back to the old linear count if the probe cannot
+-- determine it. Empty return = unreadable. Pinned by file_size_probe() in the golden.
 function qsFileSize pPath
+   local tSize
+   put qsFileSizeSeek(pPath) into tSize
+   if tSize is not empty then
+      return tSize
+   end if
+   return qsFileSizeRead(pPath)
+end qsFileSize
+
+-- The fast path: locate EOF by exponential-then-binary search over `seek to N; read 1`.
+-- readable(N) = a byte exists at 0-based offset N (i.e. N < size); the file size is the
+-- smallest N that is NOT readable. Returns the size, or empty to signal "fall back" (a
+-- read/seek error, or a size beyond the 8 GiB ceiling we serve - a runaway guard against
+-- an engine that never reports EOF). All seek/read work is wrapped so a misbehaving
+-- engine degrades to the always-correct linear count rather than a wrong Content-Length.
+function qsFileSizeSeek pPath
+   local tLo, tHi, tMid, tErr, tCap
+   put 8589934592 into tCap                 -- kOnionMaxTotal: 8 GiB serve ceiling
+   open file pPath for binary read
+   if the result is not empty then
+      return empty
+   end if
+   try
+      seek to 0 in file pPath
+      read from file pPath for 1
+      if it is empty then                   -- empty file
+         close file pPath
+         return 0
+      end if
+      put 0 into tLo                         -- offset tLo is readable
+      put 1 into tHi
+      repeat
+         if tHi > tCap then                  -- too big / no EOF reported: give up, fall back
+            close file pPath
+            return empty
+         end if
+         seek to tHi in file pPath
+         read from file pPath for 1
+         if it is empty then
+            exit repeat                      -- tHi is NOT readable: an upper bound
+         end if
+         put tHi into tLo
+         put (tHi * 2) into tHi
+      end repeat
+      repeat while (tHi - tLo) > 1           -- narrow to size = smallest non-readable offset
+         put (tLo + tHi) div 2 into tMid
+         seek to tMid in file pPath
+         read from file pPath for 1
+         if it is empty then
+            put tMid into tHi
+         else
+            put tMid into tLo
+         end if
+      end repeat
+      close file pPath
+      return tHi
+   catch tErr
+      try
+         close file pPath
+      catch tErr
+      end try
+      return empty
+   end try
+end qsFileSizeSeek
+
+-- The fallback: read the whole file in bounded 4 MiB chunks (O(file size) I/O, O(1)
+-- memory). Always correct; used only when the seek probe bows out.
+function qsFileSizeRead pPath
    local tSize
    put 0 into tSize
    open file pPath for binary read
@@ -1492,7 +1561,7 @@ function qsFileSize pPath
    end repeat
    close file pPath
    return tSize
-end qsFileSize
+end qsFileSizeRead
 
 -- A pseudo-random high loopback port for OnionXT to bind its internal listener to.
 -- A collision surfaces as an oxCreateService error string, and the caller reports it.
@@ -2003,7 +2072,9 @@ command qsOnionHttpText pStream, pStatus, pType, pBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
-      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+      "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
+   put qsHttpExtraHeaders() after tHead
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
    oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
    oxCloseStream pStream
    qsOnionServeCleanup pStream
@@ -2811,6 +2882,50 @@ command qsFsServePath pStream, pHeaders
    end if
 end qsFsServePath
 
+-- Response headers added to EVERYTHING we serve (both transports), as CRLF-terminated
+-- lines: identify the server, forbid MIME sniffing (safer when hosting untrusted-looking
+-- files), and - because the folder can be edited live - tell the browser to revalidate
+-- rather than serve a stale cached copy.
+function qsHttpExtraHeaders
+   local tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   return ("Server: newQuickShare" & tCrlf & "X-Content-Type-Options: nosniff" & tCrlf & \
+      "Cache-Control: no-cache" & tCrlf)
+end qsHttpExtraHeaders
+
+-- A filename safe to drop into a Content-Disposition quoted-string: printable ASCII
+-- only, no quote/backslash/control byte (so we never need RFC 5987 encoding). Empty in
+-- -> "download".
+function qsSafeFilename pName
+   local tOut, tCh, tN
+   put "" into tOut
+   repeat for each char tCh in pName
+      put charToNum(tCh) into tN
+      if tN >= 32 and tN <= 126 and tCh is not quote and tCh is not "\" then
+         put tCh after tOut
+      end if
+   end repeat
+   if tOut is empty then
+      return "download"
+   end if
+   return tOut
+end qsSafeFilename
+
+-- Content-Disposition so a saved file keeps its REAL name (not the URL token): "inline"
+-- by default (a browser still renders html/img/pdf in place), upgraded to "attachment"
+-- (force a download) when the request carries ?dl. CRLF-terminated. Transport-neutral.
+function qsHttpDisposition pForMime, pHeaders
+   local tName, tKind, tCrlf
+   put (numToChar(13) & numToChar(10)) into tCrlf
+   put qsSafeFilename(qsFsLeaf(pForMime)) into tName
+   if qsQueryParam(pHeaders["__query"], "dl") is not empty then
+      put "attachment" into tKind
+   else
+      put "inline" into tKind
+   end if
+   return ("Content-Disposition: " & tKind & "; filename=" & quote & tName & quote & tCrlf)
+end qsHttpDisposition
+
 -- Serve a file: size it, honour a Range, write the HTTP head, then arm the pump. The
 -- file is NEVER read whole into memory.
 command qsFsServeFile pStream, pDisk, pForMime, pHeaders
@@ -2849,6 +2964,8 @@ command qsFsServeFile pStream, pDisk, pForMime, pHeaders
    if tStatus begins with "206" then
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
+   put qsHttpExtraHeaders() after tHead
+   put qsHttpDisposition(pForMime, pHeaders) after tHead
    put ("Connection: close" & tCrlf & tCrlf) after tHead
    oxWrite pStream, textEncode(tHead, "UTF-8")
    if the result is not empty then
@@ -2925,7 +3042,9 @@ command qsFsSendText pStream, pStatus, pType, pBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
-      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+      "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
+   put qsHttpExtraHeaders() after tHead
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
    oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
    oxCloseStream pStream
    qsFsCleanup pStream
@@ -2986,6 +3105,9 @@ function qsFsListing pDiskFolder, pUrlPath
    put the files into tFiles
    put the folders into tFolders
    set the defaultFolder to tSaved
+   -- present entries in a stable, case-insensitive A-Z order (the OS order is arbitrary)
+   sort lines of tFolders ascending text by toLower(each)
+   sort lines of tFiles ascending text by toLower(each)
    put "" into tRows
    put 0 into tCount
    if pUrlPath is not "/" then
@@ -3618,6 +3740,8 @@ command qsCwServeFile pSocketID, pDisk, pForMime, pHeaders
    if tStatus begins with "206" then
       put ("Content-Range: bytes " & tStart & "-" & tEnd & "/" & tSize & tCrlf) after tHead
    end if
+   put qsHttpExtraHeaders() after tHead
+   put qsHttpDisposition(pForMime, pHeaders) after tHead
    put ("Connection: close" & tCrlf & tCrlf) after tHead
    write textEncode(tHead, "UTF-8") to socket pSocketID
    if the result is not empty then
@@ -3701,7 +3825,9 @@ command qsCwSendText pSocketID, pStatus, pType, pBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
-      "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
+      "Content-Length: " & (the number of bytes in tData) & tCrlf) into tHead
+   put qsHttpExtraHeaders() after tHead
+   put ("Connection: close" & tCrlf & tCrlf) after tHead
    qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
 end qsCwSendText
 

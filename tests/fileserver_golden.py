@@ -163,6 +163,44 @@ def fs_icon(name, is_dir):
     return "file"
 
 
+# ---- qsFileSizeSeek: O(log n) file-size probe (newquickshare) ----------------
+# Instead of reading a whole file to size it (a UI-freezing, disk-doubling full read),
+# find EOF by exponential-then-binary search over `seek to N; read 1`. readable(N) means
+# "a byte exists at 0-based offset N" (N < size); the size is the smallest non-readable
+# offset. Returns None (-> fall back to the linear count) if it exceeds the 8 GiB serve
+# cap. This mirrors qsFileSizeSeek's control flow EXACTLY so the algorithm is pinned; the
+# only on-engine unknown (seek-past-EOF returning empty) is guarded by the fallback.
+
+def file_size_probe(size, cap=8589934592):
+    def readable(n):
+        return n < size
+    if not readable(0):
+        return 0                                  # empty file
+    lo, hi = 0, 1
+    while True:
+        if hi > cap:
+            return None                           # too big / no EOF: caller falls back
+        if not readable(hi):
+            break                                 # hi is an upper bound (not readable)
+        lo, hi = hi, hi * 2
+    while (hi - lo) > 1:
+        mid = (lo + hi) // 2
+        if readable(mid):
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+# ---- qsSafeFilename: Content-Disposition filename sanitiser ------------------
+# Printable ASCII only, minus quote and backslash, so the name is safe inside a
+# quoted-string without RFC 5987 encoding. Empty -> "download". Mirrors qsSafeFilename.
+
+def safe_filename(name):
+    out = "".join(c for c in name if 32 <= ord(c) <= 126 and c not in '"\\')
+    return out if out else "download"
+
+
 # ---- fsHtmlEscape: & first, then the rest -----------------------------------
 
 def html_escape(text):
@@ -505,6 +543,26 @@ def main():
     ]:
         check("fs_icon(%r)" % name, fs_icon(name, is_dir), want)
 
+    # -- file-size seek probe: must return the exact size for every shape --
+    for s in [0, 1, 2, 3, 4, 7, 8, 255, 256, 257, 1000, 4095, 4096, 65535, 65536,
+              1000000, 2 ** 30, 8589934592]:      # last = exactly the 8 GiB cap
+        check("file_size_probe(%d)" % s, file_size_probe(s), s)
+    # a file larger than the cap gives up (caller falls back to the linear count)
+    check("file_size_probe over-cap", file_size_probe(8589934592 + 1), None)
+
+    # -- Content-Disposition filename sanitising --
+    for name, want in [
+        ("report.pdf", "report.pdf"),
+        ("my file.txt", "my file.txt"),           # spaces are fine
+        ('a"b.txt', "ab.txt"),                     # drop the quote
+        ("back\\slash", "backslash"),             # drop the backslash
+        ("nau\x00gh\tty", "naughty"),             # drop control bytes
+        ("café.png", "caf.png"),             # drop non-ASCII (no RFC 5987 needed)
+        ("", "download"),                          # nothing left -> a default
+        ("\x01\x02", "download"),
+    ]:
+        check("safe_filename(%r)" % name, safe_filename(name), want)
+
     # -- editor LAN-first gate (only local peers may reach the editor) --
     for conn, want in [
         ("cw:192.168.1.5:52000", True),           # home LAN
@@ -547,7 +605,8 @@ def main():
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
           "HTML escape, capability gate, SPA fallback, HTTP framing, JSON escape, "
-          "editor confinement, LAN-first gate, query parse all match)")
+          "editor confinement, LAN-first gate, query parse, size probe, "
+          "filename sanitise all match)")
     return 0
 
 
