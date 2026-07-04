@@ -97,6 +97,61 @@ internet link and tells you the single port to **forward manually**; if you are 
 internet link isn't possible at all and it points you to Tor. The local-network link
 always works regardless.
 
+**Host a web app.** Any of the folder-serving modes (Tor or direct web link) is a real
+static web host. If the folder has an **`index.html`**, it is served as a website's home
+page; other files (`css`, `js`, `wasm`, ES modules, fonts, images, source maps, ...) are
+served with correct MIME types, with **HTTP Range** so media streams and seeks. A
+**single-page app** works automatically: an unresolved path that looks like a client-side
+route (no file extension) falls back to `index.html` so the app's own router takes over,
+while a genuinely missing asset still returns 404. Two things to know:
+- The **Tor `.onion`** path is the best home for an app: it serves at the root, and Tor
+  Browser treats an onion as a **secure context**, so features that need HTTPS (service
+  workers, some Web APIs) work. Plain `http://` over the direct web link is *not* a secure
+  context, so those features are blocked there.
+- Over the **direct web link** the app lives under `http://<ip>:<port>/<token>/`, so build
+  it with **relative** asset paths (or a matching base) - absolute paths like `/app.js`
+  resolve above the token and 404. Over Tor (served at the root) absolute paths are fine.
+
+**Give it a backend.** The server also does **dynamic routes**, so a hosted app can call
+back into your stack instead of being purely static. A built-in demo route answers
+`GET /_qs/info` with live share metadata as JSON - visit
+`http://<address>/_qs/info` (or, on the direct web link, `.../<token>/_qs/info`). Add your
+own in the stack script:
+
+```
+qsHttpRoute "POST", "/api/echo", "myEcho"      -- register (any method; POST bodies work)
+...
+command myEcho pConn, pRequest                  -- pRequest has __method/__path/__query/__body + headers
+   qsHttpReply pConn, 200, "application/json; charset=utf-8", ("{" & quote & "you-sent" & quote & ":" & pRequest["__body"] & "}")
+end myEcho
+```
+
+A handler **must call `qsHttpReply` exactly once** - that sends the response and closes
+the connection; a route that returns without replying leaves the request hanging until
+the browser gives up. Routes run on the one UI thread, so keep a handler **light**
+(return quickly); for real data a handler can read/write files or use the engine's
+SQLite. This is a small backend for a self-hosted appliance, not a high-traffic server.
+
+**Edit it live from a browser.** Tick **Enable web editing** and set an **edit
+password**, and the web-shared *folder* becomes editable from a browser: open the shared
+link with **`/_edit`** on the end (e.g. `http://<ip>:<port>/<token>/_edit`) to get a tiny
+built-in editor - a file list, a text pane, and Save. This is deliberately locked down:
+- **LAN-only, always.** The editor answers **only devices on your own local network** -
+  it decides from the browser's TCP address (which a remote client cannot forge), not any
+  header. **Internet and Tor visitors can view the site but can never reach the editor**,
+  even while the port is open to the world for the public link. Carrier-NAT (100.64/10)
+  addresses are treated as *remote*, not LAN.
+- **Password-gated.** The password is run through **Argon2id** (via **cryptoXT** /
+  `org.openxtalk.library.sodium`); a correct login mints a random session token the
+  browser sends back on every save. Without cryptoXT the editor cannot be enabled.
+- **Off by default**, and confined: every write is resolved by `qsEditSafePath`, which
+  refuses anything that could escape the served folder (any `..`, drive/`scheme:` colon,
+  or control byte), so a save can only ever land **inside the shared folder**.
+- It edits **text/code** files up to ~256 KB (a browser textarea, not a binary editor).
+
+The LAN-only rule and the write-path confinement are pinned by adversarial vectors in
+`tests/fileserver_golden.py` (`edit_is_local`, `edit_safe_path`).
+
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local
 `.torrent` path, or a 40-hex info-hash into the Add box (or drag one onto the
