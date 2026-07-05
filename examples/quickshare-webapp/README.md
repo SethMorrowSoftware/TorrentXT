@@ -1,4 +1,4 @@
-# TorrentXT Web App Demo
+# No Cloud Quick Share Web App Demo
 
 A small, self-contained **single-page app** meant to be hosted straight out of a folder
 by the **Quick Share** demo (`../torrent-quickshare.livecodescript`) - over **Tor** or a

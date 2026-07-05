@@ -1,5 +1,5 @@
 {
-  "app": "TorrentXT Web App Demo",
+  "app": "No Cloud Quick Share Web App Demo",
   "tagline": "A single-page app served from a shared folder - over Tor or a direct web link.",
   "gallery": [
     { "file": "assets/art-01.svg", "title": "Aurora",   "note": "linear + radial gradients" },

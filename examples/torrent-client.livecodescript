@@ -93,13 +93,20 @@ constant kClrRowErr = "176,58,46"       -- errored
 -- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
 -- kUiVersion rebuild) never flashes an unstyled or mis-sized window; the
 -- session then starts in openStack once the window is up. tcPrefLoad must run
--- first (tcBuildUI reads the remembered save path / cap / height).
+-- first (tcBuildUI reads the remembered save path / cap / height). The pair is
+-- ALSO run first in openStack (belt and suspenders): OXT sends openStack - but
+-- NOT preOpenStack - when the stack SCRIPT is (re)compiled (the paste-into-
+-- stack-script flow), so building only here would arm the refresh loop against
+-- a UI that was never built. Both are idempotent, so preOpenStack builds it
+-- flash-free and openStack's calls no-op.
 on preOpenStack
    tcPrefLoad
    tcBuildUI
 end preOpenStack
 
 on openStack
+   tcPrefLoad
+   tcBuildUI
    tcEnsureSession
 end openStack
 
@@ -1272,6 +1279,11 @@ command tcRefreshOnce
    local tColors, tErr
    local tSeed, tDl, tPause, tCheck, tAllUp, tAllDown, tRatio, tSummary2
    if sSession is 0 or sSession is empty then
+      exit tcRefreshOnce
+   end if
+   -- defensive: never touch the table before the UI is built (a stale refresh
+   -- tick could otherwise arrive between session start and build - see openStack)
+   if there is no field "tcTorrents" then
       exit tcRefreshOnce
    end if
    -- collapse the whole rebuild (text + per-line colors + hilite + totals) into

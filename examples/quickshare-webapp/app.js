@@ -1,4 +1,4 @@
-/* TorrentXT Web App Demo - a tiny dependency-free single-page app.
+/* No Cloud Quick Share Web App Demo - a tiny dependency-free single-page app.
  *
  * The whole point is to exercise what the QuickShare host can do:
  *   - many static asset types with correct MIME (svg, png, wav, css, js, json, webmanifest)
@@ -66,7 +66,7 @@
     } else if (info && info.mode === 'clearweb') {
       el.textContent = 'Served over the web'; el.className = 'badge web';
     } else if (info) {
-      el.textContent = 'Served by TorrentXT'; el.className = 'badge web';
+      el.textContent = 'Served by No Cloud Quick Share'; el.className = 'badge web';
     } else {
       el.textContent = 'Static preview'; el.className = 'badge';
     }
@@ -78,7 +78,7 @@
       '<section class="hero">' +
         '<h1>It works &mdash; from a folder you shared.</h1>' +
         '<p>This whole single-page app is being served straight out of a shared folder by ' +
-        'TorrentXT Quick Share. Same files, whether it reached you over Tor or a direct web link.</p>' +
+        'No Cloud Quick Share. Same files, whether it reached you over Tor or a direct web link.</p>' +
         '<div class="pills">' +
           '<span class="pill">Static assets</span><span class="pill">Correct MIME</span>' +
           '<span class="pill">HTTP Range</span><span class="pill">SPA routing</span>' +
@@ -150,7 +150,7 @@
           stat.innerHTML = '<span class="ok">200 OK</span>' + (ms ? ' in ' + ms + ' ms' : '');
         });
       }).catch(function (e) {
-        out.textContent = 'This route answers only when the folder is served by TorrentXT Quick Share ' +
+        out.textContent = 'This route answers only when the folder is served by No Cloud Quick Share ' +
           '(not in a plain static preview).\n\n' + e;
         stat.innerHTML = '<span class="no">unavailable here</span>';
       });
