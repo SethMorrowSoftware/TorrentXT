@@ -12,7 +12,7 @@ session automatically. No helper stacks, no manual layout.
 | `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. Optionally send anonymously over Tor, serve a **folder** as a browsable `.onion` page, or hand out a **direct web link** any browser can open (with automatic router port-opening). | Only for the optional passphrase lock |
 | `newquickshare.livecodescript` | The **same** Quick Share, re-skinned + a better web server: a wider, shorter, **720p-friendly** two-column dashboard. The **send flow is dead-simple and self-explanatory** - a sensible default method is pre-picked ("change anytime"), explicit **Choose a file / Choose a folder** buttons (drag delivery is OS-flaky), and the panel only shows what applies to the chosen method: encryption is hidden with a plain reason on a Web link (a browser can't decrypt), and advanced options appear only for Tor / Web. The right-hand list is an actionable **Transfers & shares** surface: run **many code shares at once**, select any row to **Copy** its code again or **Stop** it (stop sharing, or cancel a download). Plus HTTP serving polish - an O(log n) file-size probe, real filenames on save (`Content-Disposition`, `?dl` forces a download), `nosniff` + `Cache-Control` headers, alphabetised listings, and bounded **HTTP keep-alive** on the small text responses (persistent connections for folder browsing / hosted web apps; big downloads still close). Hardened serving: dotfiles (`.git`, `.env`) are never listed or served on a folder share, a connection cap + per-connection watchdogs bound abuse, and unframeable requests (chunked / conflicting `Content-Length`) are refused. Quality-of-life: a share code sitting on the clipboard pre-fills Receive when the window opens or refocuses, the drop zone narrates the chosen method and the picked file, a **Suggest** button mints a strong passphrase from the CSPRNG, the Transfers list color-codes row states with a live peers/rates/ratio detail strip for the selected row, a peerless download coaches "the sender must keep their window open" instead of sitting at 0%, and **Open folder** jumps to the downloads. | Only for the optional passphrase lock |
 | `torrent-client.livecodescript` | A full multi-torrent client: add magnets / `.torrent` files / URLs, seed a folder, and manage many torrents with a live Files / Peers / Trackers / Log inspector. | No |
-| `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). | Only for private (passphrase) channels |
+| `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). Shares newquickshare's polished design system (rounded cards, flat inputs, platform monospace, metrics-proof labels) plus clipboard card-detect, Enter-to-act, click-to-copy, and standalone readiness. | Only for private (passphrase) channels |
 | `torrent-rp1-chat.livecodescript` | A two-machine **messaging** demo: two peers meet on a shared "room" id and chat directly over the `rp1` peer-wire extension, with no tracker, no server, and no file transfer at all. | No |
 | `torrent-helpers.livecodescript` | A building block, NOT a demo: a poll dispatcher so your own app can drive TorrentXT with plain event handlers. See the last section. | No |
 
@@ -177,7 +177,12 @@ they can Download peer to peer. You can run several channels. Set a **passphrase
 (needs cryptoXT) to make a channel private: the file list AND the files are
 encrypted, and only followers you give the passphrase to can read anything. Your
 identity, channels, and subscriptions persist automatically, and **Lock Identity**
-seals that saved state with a passphrase.
+seals that saved state with a passphrase. The UI shares newquickshare's design
+system - rounded cards, flat inputs, platform monospace, metrics-proof labels -
+and its quality-of-life touches: a channel card on the clipboard pre-fills the
+Follow box when the window opens or refocuses, Enter acts in every input box,
+the address/code boxes are click-to-copy with a "Copied!" flash, and it is
+standalone-ready (self-building UI, clean shutdown on Cmd-Q).
 
 ### rp1 Chat (`torrent-rp1-chat.livecodescript`)
 A different paradigm from the file-transfer demos: **live messaging**, no files. It
