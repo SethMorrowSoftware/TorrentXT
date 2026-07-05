@@ -1,4 +1,4 @@
-/* TorrentXT Web App Demo - one self-contained stylesheet (no external fonts/assets,
+/* No Cloud Quick Share Web App Demo - one self-contained stylesheet (no external fonts/assets,
    so it works offline, over Tor, and under a strict CSP). Light + dark via the
    prefers-color-scheme media query, driven by CSS custom properties. */
 :root {

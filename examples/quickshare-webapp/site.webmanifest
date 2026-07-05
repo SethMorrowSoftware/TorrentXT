@@ -1,7 +1,7 @@
 {
-  "name": "TorrentXT Web App Demo",
-  "short_name": "TorrentXT",
-  "description": "A single-page demo hosted by TorrentXT Quick Share over Tor or a direct web link.",
+  "name": "No Cloud Quick Share Web App Demo",
+  "short_name": "Quick Share",
+  "description": "A single-page demo hosted by No Cloud Quick Share over Tor or a direct web link.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
