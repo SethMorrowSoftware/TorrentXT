@@ -142,12 +142,19 @@ constant kPrefMagic = "BTXPREF1"
 -- ---- lifecycle ---------------------------------------------------------------
 -- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
 -- kUiVersion rebuild) never flashes an unstyled or mis-sized window; prefs
--- hydrate and the session starts in openStack once the window is up.
+-- hydrate and the session starts in openStack once the window is up. chBuild is
+-- ALSO called first in openStack (belt and suspenders): OXT sends openStack -
+-- but NOT preOpenStack - when the stack SCRIPT is (re)compiled (the paste-into-
+-- stack-script flow), so building only here would arm the loops (and run
+-- chPrefLoad's UI updates) against a UI that was never built. chBuild is
+-- idempotent, so preOpenStack builds it flash-free and openStack's call no-ops.
 on preOpenStack
    chBuild
 end preOpenStack
 
 on openStack
+   chBuild         -- no-op if preOpenStack already built it; the guaranteed build
+                   -- on a stack-script recompile (openStack fires, preOpenStack does not)
    chPrefLoad      -- hydrate saved state (and unlock if sealed) BEFORE chStart reads it
    chStart
 end openStack
@@ -1644,6 +1651,11 @@ command chRefreshTransfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht
    local tColors, tErr, tSelH, tSelLine, tSource, tDispName, tIH
    if sSession is 0 or sSession is empty then
+      exit chRefreshTransfers
+   end if
+   -- defensive: never touch the table before the UI is built (a stale refresh
+   -- tick could otherwise arrive between session start and build - see openStack)
+   if there is no field "chXfers" then
       exit chRefreshTransfers
    end if
    -- remember which transfer is selected (by handle) so the 1 s repaint keeps it

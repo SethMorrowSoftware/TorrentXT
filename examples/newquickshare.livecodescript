@@ -296,7 +296,12 @@ constant kClrPillOkText = "22,101,52"
 -- ---- lifecycle ---------------------------------------------------------------
 -- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
 -- kQsUiVersion rebuild) never flashes an unstyled or mis-sized window; the
--- session then starts in openStack once the window is up.
+-- session then starts in openStack once the window is up. qsBuild is ALSO the
+-- first thing qsStart does (belt and suspenders): OXT sends openStack - but NOT
+-- preOpenStack - when the stack SCRIPT is (re)compiled (the paste-into-stack-
+-- script flow in HOW TO USE), so building only in preOpenStack would start the
+-- poll/refresh loops against a UI that was never built. qsBuild is idempotent,
+-- so preOpenStack builds it flash-free and qsStart's call is then a no-op.
 on preOpenStack
    qsBuild
 end preOpenStack
@@ -992,6 +997,11 @@ end qsAddTips
 
 -- ---- session + loops ---------------------------------------------------------
 command qsStart
+   -- guarantee the UI exists before the loops touch it. On a real open
+   -- preOpenStack already built it (this no-ops); on a stack-script recompile
+   -- (openStack fires, preOpenStack does not) THIS is what builds it, so the
+   -- poll/refresh loops never run against missing fields.
+   qsBuild
    btStartSession
    put the result into sSession
    if sSession is 0 or sSession is empty then
@@ -1512,6 +1522,11 @@ command qsRefreshXfers
    local tNow, tPeers, tStalled, tClr, tLive, tSelStat, tId, tSelType, tSelKey
    local tInfo, tRatio, tSavedID
    if sSession is 0 or sSession is empty then
+      exit qsRefreshXfers
+   end if
+   -- defensive: never touch the list before the UI is built (a stale refresh
+   -- tick could otherwise arrive between session start and build - see qsStart)
+   if there is no field "qsXfers" then
       exit qsRefreshXfers
    end if
    put the milliseconds into tNow   -- one clock read per pass (the perf playbook)
