@@ -736,16 +736,19 @@ command qsLabel pName, pText, pRect, pSize
    put pText into field pName
    -- OXT pass 1 taught us never to GUESS font metrics: hand-sized label rects
    -- (and a single-number `set the margins to 0`, which OXT ignored) clipped the
-   -- bottom of every line on Windows. Ask the engine instead: grow the field to
-   -- its own formattedHeight (top edge pinned), so a label can never be shorter
-   -- than the text it holds, whatever the platform's line height and margins.
-   -- Empty labels (qsSharing, the status strip) keep their given rect: they
-   -- receive text later and must hold a fixed multi-line/strip height.
+   -- bottom of every line on Windows. Ask the engine instead. GROW-ONLY: enlarge
+   -- to formattedHeight when the text needs more room (top pinned), but never
+   -- shrink - so a deliberately tall label keeps its height, AND if
+   -- formattedHeight is unavailable before the window is shown (build runs in
+   -- preOpenStack) the comparison fails safe and the label keeps its rect
+   -- instead of collapsing to zero. Empty labels are skipped (text comes later).
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      set the height of field pName to the formattedHeight of field pName
-      set the top of field pName to tTop
+      if the formattedHeight of field pName > the height of field pName then
+         set the height of field pName to the formattedHeight of field pName
+         set the top of field pName to tTop
+      end if
    end if
 end qsLabel
 

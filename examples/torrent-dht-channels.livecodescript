@@ -490,28 +490,34 @@ command chMakeLabel pName, pText, pRect, pSize
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
-   -- never GUESS font metrics (the newquickshare OXT lesson): grow a non-empty
-   -- label to its own formattedHeight, top pinned, so text is never clipped on
-   -- any platform. Empty labels keep their rect (they receive text later).
+   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
+   -- to formattedHeight when the text needs more room (top pinned), never shrink -
+   -- so a deliberately tall label keeps its height, and if formattedHeight is
+   -- unavailable before the window is shown (build is in preOpenStack) the
+   -- comparison fails safe (the label keeps its rect, never collapses to zero).
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      set the height of field pName to the formattedHeight of field pName
-      set the top of field pName to tTop
+      if the formattedHeight of field pName > the height of field pName then
+         set the height of field pName to the formattedHeight of field pName
+         set the top of field pName to tTop
+      end if
    end if
 end chMakeLabel
 
 -- A flat, bold section header with a hairline divider under it (replaces the
 -- old opaque gray band). Sits ON a card. pRect is the header's text row.
 command chSection pName, pText, pRect
-   local tL, tT, tR, tB
+   local tL, tR, tB
    chMakeLabel pName, pText, pRect, 11
    set the textStyle of field pName to "bold"
    set the foregroundColor of field pName to kClrInk
    set the itemDelimiter to comma
    put item 1 of pRect into tL
    put item 3 of pRect into tR
-   put item 4 of pRect into tB
+   -- place the divider below the label's ACTUAL bottom (grow-only may have made
+   -- the header taller than pRect), so a grown header never sits on its own line
+   put the bottom of field pName into tB
    chGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
    set the style of graphic (pName & "Line") to "rectangle"
    set the filled of graphic (pName & "Line") to true

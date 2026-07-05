@@ -496,15 +496,20 @@ command tcMakeLabel pName, pText, pRect, pSize
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
-   -- never GUESS font metrics (the newquickshare OXT lesson): grow a non-empty
-   -- label to its own formattedHeight, top pinned, so text is never clipped on
-   -- any platform. Labels that tcRelayout later re-rects (detail, totals,
-   -- headers) are fine - relayout sets their final rect after build.
+   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
+   -- to formattedHeight when the text needs more room (top pinned), never shrink -
+   -- so the opaque header/status bars keep their designed height, and if
+   -- formattedHeight is unavailable before the window is shown (build is in
+   -- preOpenStack) the comparison fails safe (no collapse to zero height).
+   -- Labels that tcRelayout later re-rects (detail, totals, headers) are fine -
+   -- relayout sets their final rect after build.
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      set the height of field pName to the formattedHeight of field pName
-      set the top of field pName to tTop
+      if the formattedHeight of field pName > the height of field pName then
+         set the height of field pName to the formattedHeight of field pName
+         set the top of field pName to tTop
+      end if
    end if
 end tcMakeLabel
 
