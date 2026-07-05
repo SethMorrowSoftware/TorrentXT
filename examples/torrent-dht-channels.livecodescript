@@ -50,6 +50,16 @@ script "dhtChannelsApp"
 -- (org.openxtalk.library.sodium) to be installed alongside this. Public channels
 -- and all non-encryption features work without it.
 --
+-- SAVING AS A STANDALONE: standalone-ready - the UI self-builds in preOpenStack
+-- every launch (nothing needs to persist in the stackfile), and quitting is
+-- caught by shutdownRequest so the DHT routing table + prefs are saved and the
+-- session shuts down cleanly even on Cmd-Q / Dock quit. In the builder: include
+-- org.openxtalk.library.torrent (required) and org.openxtalk.library.sodium
+-- (cryptoXT - OPTIONAL, only for private channels + identity lock; the app fails
+-- closed with a clear message when it is absent). Identity, channels, and
+-- subscriptions persist to a small per-user file (NOT the stackfile), so they
+-- survive across runs and as a packaged app.
+--
 -- Click any transfer to see the files inside it with a live per-file progress
 -- bar (btFileList); the transfers table shows inline progress bars too. Pause,
 -- Resume, Remove (keep or delete files), or Open Folder act on the selected
@@ -87,6 +97,10 @@ local sFeedKey          -- array: feed-list line -> channel pubkey
 local sFeedMag          -- array: feed-list line -> magnet
 local sFeedTitle        -- array: feed-list line -> release title
 local sXferHandle       -- array: transfers-list line -> torrent handle
+-- Clipboard auto-detect (the newquickshare pattern): when the window opens or
+-- refocuses and the clipboard holds a channel card / bare address, the Follow
+-- box is pre-filled (never overwriting user input; one offer per value).
+local sClipSuggested    -- the last clipboard text already offered (or dismissed)
 
 local sFeedEnc          -- array: feed-list line -> "enc" if that release is encrypted
 local sFeedOrigName     -- array: feed-list line -> original filename (encrypted release)
@@ -95,18 +109,45 @@ local sPendingName      -- array: info-hash -> original filename, for a download
 local sXferName         -- array: info-hash -> real name to SHOW locally for an
                         --   encrypted transfer (the swarm only ever sees the .enc)
 
+-- The user-facing release version: shown in the OS title bar and the startup
+-- log line, so a bug report always says which build it came from.
+constant kChAppVersion = "1.0.0"
+
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-ui-2025-07"
+constant kUiVersion = "channels-ui-2027-01"
+
+-- ---- UI design tokens ----------------------------------------------------------
+-- The same palette newquickshare settled on after its OXT passes, so the two
+-- demos read as one family. Neutral grays carry the chrome; one accent blue
+-- carries brand + interaction. All literal RGB strings - OXT constants must be
+-- literal and declared before first use.
+constant kClrPage = "240,242,246"       -- window background
+constant kClrCard = "255,255,255"       -- card fill (and input fill)
+constant kClrCardLine = "225,229,236"   -- hairline card border / dividers
+constant kClrBand = "44,90,160"         -- header band (brand blue)
+constant kClrBandText = "255,255,255"   -- title on the band
+constant kClrInk = "28,34,46"           -- primary text
+constant kClrInkSoft = "95,104,118"     -- secondary text / status lines
+constant kClrInkMute = "138,146,158"    -- captions, hints, empty states
+constant kClrFieldLine = "203,210,222"  -- entry-field border
+constant kClrCodeBg = "244,246,250"     -- code/key output fill
+constant kClrCodeLine = "210,217,229"   -- code/key output border
 -- prefs file header: an 8-byte magic, then a 1-byte mode ("P" plain / "E" sealed).
 -- A SEALED file is [magic]["E"][salt 16][sxSecretBox], the same 16-byte-salt +
 -- Argon2id convention cryptoXT's own file-encrypt demo uses.
 constant kPrefMagic = "BTXPREF1"
 
 -- ---- lifecycle ---------------------------------------------------------------
-on openStack
+-- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
+-- kUiVersion rebuild) never flashes an unstyled or mis-sized window; prefs
+-- hydrate and the session starts in openStack once the window is up.
+on preOpenStack
    chBuild
+end preOpenStack
+
+on openStack
    chPrefLoad      -- hydrate saved state (and unlock if sealed) BEFORE chStart reads it
    chStart
 end openStack
@@ -114,6 +155,21 @@ end openStack
 on closeStack
    chStop
 end closeStack
+
+-- A standalone quits via shutdownRequest (Cmd-Q / Alt-F4 / Dock quit) WITHOUT
+-- a guaranteed closeStack first - and chStop is where the DHT routing table
+-- and prefs are saved and the session shuts down cleanly. chStop is idempotent,
+-- so arriving here after closeStack already ran is a safe no-op.
+on shutdownRequest
+   chStop
+   pass shutdownRequest
+end shutdownRequest
+
+on resumeStack
+   -- the window came back to the front: a channel card may be on the clipboard
+   chClipboardSuggest
+   pass resumeStack
+end resumeStack
 
 on mouseUp
    switch the short name of the target
@@ -125,6 +181,12 @@ on mouseUp
          break
       case "chCopyKey"
          chCopyKey
+         break
+      case "chMyKey"
+         chCopyKey         -- the address box itself is click-to-copy
+         break
+      case "chPinCode"
+         chPinCopy         -- the drop-code box is click-to-copy too
          break
       case "chNewChan"
          chNewChannel
@@ -210,6 +272,46 @@ on menuPick pItem
    end if
 end menuPick
 
+-- Return/Enter in the single-line inputs ACTS instead of inserting a newline
+-- (paste -> Enter, done - the newquickshare pattern).
+on returnInField
+   switch the short name of the target
+      case "chFollowKey"
+         chFollow
+         break
+      case "chMagnetField"
+         chAddMagnetManual
+         break
+      case "chFetchCode"
+         chFetchCode
+         break
+      case "chPinText"
+         chPin
+         break
+      default
+         pass returnInField
+   end switch
+end returnInField
+
+on enterInField
+   switch the short name of the target
+      case "chFollowKey"
+         chFollow
+         break
+      case "chMagnetField"
+         chAddMagnetManual
+         break
+      case "chFetchCode"
+         chFetchCode
+         break
+      case "chPinText"
+         chPin
+         break
+      default
+         pass enterInField
+   end switch
+end enterInField
+
 -- ---- self-building UI (idempotent) -------------------------------------------
 command chBuild
    -- Rebuild when the UI version changes (not just "is it built?"). Otherwise a
@@ -221,40 +323,59 @@ command chBuild
    end if
    chClearGeneratedUI
    lock screen
-   -- two columns so the whole app fits a 720p (1280x720) screen
+   -- two columns so the whole app fits a 720p (1280x720) screen; the chrome
+   -- (band, rounded cards, hairline dividers) is the newquickshare design
+   -- system, OXT-pass-proven there, so the two demos read as one family
    set the width of this stack to 1180
    set the height of this stack to 648
-   set the backgroundColor of this card to "237,239,243"
-   set the title of this stack to "TorrentXT - Decentralized Channels"
-   chMakeLabel "chTitle", "  Decentralized Channels - share files with no server", "0,0,1180,30", 14
-   set the opaque of field "chTitle" to true
-   set the backgroundColor of field "chTitle" to "44,90,160"
-   set the foregroundColor of field "chTitle" to "255,255,255"
+   -- fixed-size dashboard: the layout is hand-placed, a free resize would tear it
+   set the resizable of this stack to false
+   set the backgroundColor of this card to kClrPage
+   set the title of this stack to ("TorrentXT - Decentralized Channels " & kChAppVersion)
+   -- title band: a plain filled graphic + an auto-sized label centered on its
+   -- midline by MEASURED height (never guess font metrics - the OXT lesson)
+   chGfx "chTitleBg", "0,0,1180,32"
+   set the style of graphic "chTitleBg" to "rectangle"
+   set the filled of graphic "chTitleBg" to true
+   set the backgroundColor of graphic "chTitleBg" to kClrBand
+   set the lineSize of graphic "chTitleBg" to 0
+   chMakeLabel "chTitle", "Decentralized Channels - share files with no server", "12,2,720,30", 13
+   set the foregroundColor of field "chTitle" to kClrBandText
    set the textStyle of field "chTitle" to "bold"
-   chMakeButton "chHelp", "?  What is this?", "1000,4,1164,26"
+   set the top of field "chTitle" to (16 - ((the height of field "chTitle") div 2))
+   chMakeButton "chHelp", "?  What is this?", "1000,4,1164,28"
    -- lock/unlock the saved identity with a passphrase (label tracks state)
-   chMakeButton "chLock", "Lock Identity...", "820,4,994,26"
+   chMakeButton "chLock", "Lock Identity...", "820,4,994,28"
+   -- the three cards, created BEFORE the controls that sit on them (z-order):
+   -- left = your channels + follows; right = transfers; bottom = drop + log
+   chPanel "chCardLeft", "8,34,586,486"
+   chPanel "chCardRight", "588,34,1172,486"
+   chPanel "chCardBottom", "8,490,1172,646"
    -- ===== LEFT COLUMN (x 16..580): your channel + channels you follow =====
    chSection "chSecMine", "1.  Your channels - publish files under a channel of your own", "16,38,580,58"
    -- channel picker: switch the active channel, or make / delete one
    chMakeLabel "chPickCap", "Active channel:", "16,63,116,81", 10
+   set the foregroundColor of field "chPickCap" to kClrInkSoft
    chMakeButton "chChannelMenu", "", "118,62,346,84"
    set the style of button "chChannelMenu" to "menu"
    set the menuMode of button "chChannelMenu" to "option"
    chMakeButton "chNewChan", "New Channel", "352,62,452,84"
    chMakeButton "chDelChan", "Delete", "458,62,552,84"
    chMakeLabel "chMyKeyLabel", "This channel's address - Copy it so people can follow THIS channel and get its files:", "16,88,580,104", 10
+   set the foregroundColor of field "chMyKeyLabel" to kClrInkSoft
    chMakeField "chMyKey", "16,106,360,130", true
    chMakeButton "chCopyKey", "Copy", "368,106,452,130"
    chMakeButton "chRename", "Rename", "458,106,552,130"
    chMakeButton "chPublish", "Publish a File...", "16,136,250,158"
    chMakeButton "chPrivacy", "Privacy...", "256,136,372,158"
    chMakeLabel "chNowPub", "Not publishing yet.", "378,140,580,158", 9
+   set the foregroundColor of field "chNowPub" to kClrInkSoft
    chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,168,580,188"
    chMakeField "chFollowKey", "16,192,400,216", false
    chMakeButton "chFollow", "Follow", "408,192,492,216"
    chMakeButton "chRefresh", "Refresh", "498,192,580,216"
    chMakeLabel "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,220,580,244", 9
+   set the foregroundColor of field "chFeedCaption" to kClrInkMute
    chMakeLabel "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by", "16,248,580,266", 10
    chMakeList "chSubs", "16,268,580,452", false
    chMakeButton "chDownload", "Download", "16,458,180,482"
@@ -262,6 +383,9 @@ command chBuild
    chMakeButton "chUnfollow", "Unfollow", "308,458,448,482"
    set the tabStops of field "chSubsHeader" to "150,430"
    set the tabStops of field "chSubs" to "150,430"
+   set the textFont of field "chSubsHeader" to chMonoFont()
+   set the textFont of field "chSubs" to chMonoFont()
+   set the foregroundColor of field "chSubsHeader" to kClrInkMute
    -- a light selection colour so the dark/coloured row text stays readable
    set the hiliteColor of field "chSubs" to "208,226,245"
    -- ===== RIGHT COLUMN (x 596..1164): transfers + selected-transfer detail =====
@@ -273,10 +397,11 @@ command chBuild
    set the tabStops of field "chXfers" to "84,236,338,460"
    -- a light selection colour so the colour-coded row text stays readable
    set the hiliteColor of field "chXfers" to "208,226,245"
-   set the textFont of field "chXferHeader" to "Courier"
-   set the textFont of field "chXfers" to "Courier"
+   set the textFont of field "chXferHeader" to chMonoFont()
+   set the textFont of field "chXfers" to chMonoFont()
    set the textSize of field "chXferHeader" to 10
    set the textSize of field "chXfers" to 10
+   set the foregroundColor of field "chXferHeader" to kClrInkMute
    -- add any magnet link or info-hash directly, not only channel releases
    chMakeField "chMagnetField", "596,244,948,266", false
    chMakeButton "chAddMagnet", "Add Magnet", "954,244,1080,266"
@@ -286,17 +411,20 @@ command chBuild
    chMakeButton "chRemoveXfer", "Remove", "796,272,902,294"
    chMakeButton "chOpenFolder", "Open Folder", "908,272,1054,294"
    chMakeLabel "chTotals", "", "596,300,1164,318", 10
+   set the foregroundColor of field "chTotals" to kClrInkSoft
    -- 3b. Contents of the selected transfer (live per-file progress via btFileList)
    chMakeLabel "chFilesCaption", "Click a transfer above to see the files inside it (double-click opens its folder).", "596,324,1164,340", 9
+   set the foregroundColor of field "chFilesCaption" to kClrInkMute
    chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,344,1164,362", 10
    chMakeList "chFiles", "596,364,1164,470", true
    set the tabStops of field "chFilesHeader" to "340,440"
    set the tabStops of field "chFiles" to "340,440"
-   set the textFont of field "chFilesHeader" to "Courier"
-   set the textFont of field "chFiles" to "Courier"
+   set the textFont of field "chFilesHeader" to chMonoFont()
+   set the textFont of field "chFiles" to chMonoFont()
    set the textSize of field "chFilesHeader" to 10
    set the textSize of field "chFiles" to 10
-   set the text of field "chFiles" to "   Click a transfer above to see its files and per-file progress."
+   set the foregroundColor of field "chFilesHeader" to kClrInkMute
+   set the text of field "chFiles" to "Click a transfer above to see its files and per-file progress."
    -- ===== FULL-WIDTH BOTTOM: quick drop + log =====
    chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,488,1164,508"
    chMakeField "chPinText", "16,512,440,534", false
@@ -307,11 +435,24 @@ command chBuild
    chMakeButton "chFetchBtn", "Fetch", "448,538,530,560"
    chMakeField "chDropResult", "538,538,910,560", true
    chMakeList "chLog", "16,564,1164,640", true
-   set the textFont of field "chMyKey" to "Courier"
-   set the textFont of field "chFollowKey" to "Courier"
-   set the textFont of field "chPinCode" to "Courier"
-   set the textFont of field "chFetchCode" to "Courier"
-   set the textFont of field "chMagnetField" to "Courier"
+   set the textFont of field "chLog" to chMonoFont()
+   set the textSize of field "chLog" to 9
+   set the foregroundColor of field "chLog" to kClrInkSoft
+   set the textFont of field "chMyKey" to chMonoFont()
+   set the textFont of field "chFollowKey" to chMonoFont()
+   set the textFont of field "chPinCode" to chMonoFont()
+   set the textFont of field "chFetchCode" to chMonoFont()
+   set the textFont of field "chMagnetField" to chMonoFont()
+   -- the read-only output boxes (address, drop-code, drop-result) get the quiet
+   -- code-box fill so they read as "copyable output", not editable input
+   set the backgroundColor of field "chMyKey" to kClrCodeBg
+   set the borderColor of field "chMyKey" to kClrCodeLine
+   set the backgroundColor of field "chPinCode" to kClrCodeBg
+   set the borderColor of field "chPinCode" to kClrCodeLine
+   set the backgroundColor of field "chDropResult" to kClrCodeBg
+   set the borderColor of field "chDropResult" to kClrCodeLine
+   set the dontWrap of field "chMyKey" to true
+   set the dontWrap of field "chPinCode" to true
    set the textSize of field "chMyKey" to 9
    set the textSize of field "chFollowKey" to 9
    set the textSize of field "chMagnetField" to 9
@@ -336,6 +477,7 @@ command chClearGeneratedUI
 end chClearGeneratedUI
 
 command chMakeLabel pName, pText, pRect, pSize
+   local tTop
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -344,16 +486,43 @@ command chMakeLabel pName, pText, pRect, pSize
    set the lockText of field pName to true
    set the borderWidth of field pName to 0
    set the opaque of field pName to false
+   set the threeD of field pName to false
    set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kClrInk
    put pText into field pName
+   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
+   -- to formattedHeight when the text needs more room (top pinned), never shrink -
+   -- so a deliberately tall label keeps its height, and if formattedHeight is
+   -- unavailable before the window is shown (build is in preOpenStack) the
+   -- comparison fails safe (the label keeps its rect, never collapses to zero).
+   if pText is not empty then
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      if the formattedHeight of field pName > the height of field pName then
+         set the height of field pName to the formattedHeight of field pName
+         set the top of field pName to tTop
+      end if
+   end if
 end chMakeLabel
 
+-- A flat, bold section header with a hairline divider under it (replaces the
+-- old opaque gray band). Sits ON a card. pRect is the header's text row.
 command chSection pName, pText, pRect
-   chMakeLabel pName, ("  " & pText), pRect, 11
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to "210,216,226"
-   set the foregroundColor of field pName to "30,40,60"
+   local tL, tR, tB
+   chMakeLabel pName, pText, pRect, 11
    set the textStyle of field pName to "bold"
+   set the foregroundColor of field pName to kClrInk
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 3 of pRect into tR
+   -- place the divider below the label's ACTUAL bottom (grow-only may have made
+   -- the header taller than pRect), so a grown header never sits on its own line
+   put the bottom of field pName into tB
+   chGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
+   set the style of graphic (pName & "Line") to "rectangle"
+   set the filled of graphic (pName & "Line") to true
+   set the backgroundColor of graphic (pName & "Line") to kClrCardLine
+   set the lineSize of graphic (pName & "Line") to 0
 end chSection
 
 command chMakeField pName, pRect, pLocked
@@ -364,6 +533,13 @@ command chMakeField pName, pRect, pLocked
    set the rect of field pName to pRect
    set the lockText of field pName to pLocked
    set the traversalOn of field pName to (not pLocked)
+   -- flat "modern input" chrome instead of the engine's sunken-3D default
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kClrFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kClrCard
+   set the margins of field pName to "6,6,6,6"
 end chMakeField
 
 command chMakeButton pName, pLabel, pRect
@@ -383,12 +559,85 @@ command chMakeList pName, pRect, pIsLog
    set the rect of field pName to pRect
    set the lockText of field pName to true
    set the vScrollbar of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kClrCardLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kClrCard
    if pIsLog then
       set the listBehavior of field pName to false
    else
       set the listBehavior of field pName to true
    end if
 end chMakeList
+
+-- Create-or-reuse a named graphic (the chrome layer: cards, dividers, the band).
+-- Created BEFORE the controls that sit on it, so it stays behind them in z-order.
+command chGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end chGfx
+
+-- A dashboard card: rounded, hairline-bordered, softly shadowed, behind a group.
+command chPanel pName, pRect
+   chGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kClrCard
+   set the lineSize of graphic pName to 1
+   set the foregroundColor of graphic pName to kClrCardLine
+   set the borderColor of graphic pName to kClrCardLine
+   -- soft drop shadow is a pure enhancement; an engine without it just skips it
+   local tShadow, tErr
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end chPanel
+
+-- The platform's own terminal face for keys / codes / the tables. A missing
+-- face substitutes the engine default - a soft, safe failure.
+function chMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end chMonoFont
+
+-- Flash a Copy button's label to "Copied!" for a beat, then restore it, so the
+-- feedback lands AT the pointer, not only in the far-away log.
+command chCopyFlash pBtn
+   if there is no button pBtn then
+      exit chCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("chCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end chCopyFlash
+
+command chCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit chCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end chCopyFlashReset
 
 -- a hover hint on every control, so the app explains itself
 command chAddTips
@@ -476,12 +725,73 @@ command chStart
    if not sCanEncrypt then
       chLog "Note: cryptoXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
    end if
-   chLog "Session ready. DHT bootstrapping - give it a few seconds of peers before publishing or following."
+   chLog "Decentralized Channels " & kChAppVersion & " ready. DHT bootstrapping - give it a few seconds of peers before publishing or following."
    put "true" into sPolling
+   -- a channel card may already be on the clipboard (copied from a chat)
+   chClipboardSuggest
    send "chPollOnce" to me in 0 milliseconds
    send "chDashOnce" to me in 800 milliseconds
    send "chChannelTick" to me in 5000 milliseconds
 end chStart
+
+-- ---- clipboard auto-detect (the copy -> open -> Follow flow) -----------------
+-- Does this text LOOK like something the Follow box accepts? A "Name | key"
+-- channel card, or a bare 64-hex ed25519 public key.
+function chLooksLikeCard pText
+   local tKey, tI, tSavedID
+   put pText into tKey
+   if pText contains "|" then
+      put the itemDelimiter into tSavedID
+      set the itemDelimiter to "|"
+      put chTrim(the last item of pText) into tKey
+      set the itemDelimiter to tSavedID
+   end if
+   if the number of chars of tKey is not 64 then
+      return false
+   end if
+   put toLower(tKey) into tKey
+   repeat with tI = 1 to 64
+      if char tI of tKey is not in "0123456789abcdef" then
+         return false
+      end if
+   end repeat
+   return true
+end chLooksLikeCard
+
+-- If the clipboard holds a channel card / bare key and the Follow box is empty,
+-- pre-fill it so following collapses to copy -> open -> Follow. Runs at start
+-- and on resumeStack. Polite: never overwrites user input, offers each value
+-- once, and skips a card for a channel WE own (following yourself is nonsense).
+-- The clipboard read is try-guarded (it can fail transiently on Windows).
+command chClipboardSuggest
+   local tClip, tErr, tI
+   if there is no field "chFollowKey" then
+      exit chClipboardSuggest
+   end if
+   put "" into tClip
+   try
+      put chTrim(the clipboardData["text"]) into tClip
+   catch tErr
+      exit chClipboardSuggest
+   end try
+   if tClip is empty or tClip is sClipSuggested then
+      exit chClipboardSuggest
+   end if
+   put tClip into sClipSuggested   -- one offer per value, even if declined
+   if not chLooksLikeCard(tClip) then
+      exit chClipboardSuggest
+   end if
+   -- skip the ACTIVE channel's own card (following yourself is nonsense); a
+   -- non-active own channel is harmless if it slips through (just your own feed)
+   if sPub is not empty and tClip contains sPub then
+      exit chClipboardSuggest
+   end if
+   if chTrim(field "chFollowKey") is not empty then
+      exit chClipboardSuggest
+   end if
+   put tClip into field "chFollowKey"
+   chLog "Found a channel address on your clipboard - check it, then click Follow."
+end chClipboardSuggest
 
 -- Load every channel you own (or migrate an old single-channel save / make a
 -- first one), then activate one. Channels persist in the stack property
@@ -1090,6 +1400,7 @@ command chCopyKey
       put tName & " | " & sPub into tCard
    end if
    set the clipboardData["text"] to tCard
+   chCopyFlash "chCopyKey"
    chLog "Copied your channel card (name + address) - paste it into someone's Follow box."
 end chCopyKey
 
@@ -1241,6 +1552,7 @@ command chCopySelectedMagnet
       exit chCopySelectedMagnet
    end if
    set the clipboardData["text"] to tMag
+   chCopyFlash "chCopyMag"
    chLog "Copied the magnet to the clipboard."
 end chCopySelectedMagnet
 
@@ -1395,7 +1707,7 @@ command chRefreshTransfers
    if tLineNum is 0 then
       -- friendly empty state instead of a blank table
       set the text of field "chXfers" to \
-         "   Nothing transferring yet. Publish a file above, or Download a release from a channel you follow."
+         "Nothing transferring yet. Publish a file above, or Download a release from a channel you follow."
       try
          set the foregroundColor of line 1 of field "chXfers" to "130,130,130"
       catch tErr
@@ -1677,6 +1989,7 @@ command chPinCopy
       exit chPinCopy
    end if
    set the clipboardData["text"] to field "chPinCode"
+   chCopyFlash "chPinCopy"
    chLog "Copied the drop code to the clipboard."
 end chPinCopy
 

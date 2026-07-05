@@ -9,6 +9,15 @@ script "torrentClient"
 -- UI and starts a TorrentXT session automatically. Needs only the loaded
 -- org.openxtalk.library.torrent library - no helper stack, no manual UI.
 --
+-- SAVING AS A STANDALONE: standalone-ready - the UI self-builds in preOpenStack
+-- every launch (nothing needs to persist in the stackfile), and quitting is
+-- caught by shutdownRequest so the session shuts down cleanly and settings are
+-- saved even on Cmd-Q / Dock quit. In the builder include ONLY
+-- org.openxtalk.library.torrent (no optional extensions here - this client has
+-- no encryption features). The remembered save path, upload cap, and window
+-- height persist to a small per-user prefs file (NOT the stackfile), so they
+-- survive across runs and as a packaged app.
+--
 -- Layout (modern-client style, fits inside a 720p screen): a smart Add row, a
 -- single compact toolbar of actions, the torrent table, a one-line detail strip,
 -- and a bottom PANEL with Files / Peers / Trackers / Log tabs, over a status bar.
@@ -37,25 +46,82 @@ local sLineHandles      -- array: table line number -> torrent handle (per refre
 local sPolling          -- "true" while the loops are armed
 local sPanelTab         -- active bottom-panel tab: "files"/"peers"/"trackers"/"log"
 local sSeqOn            -- array: torrent handle -> "true" while sequential is on
+-- Clipboard auto-detect: an addable link (magnet / .torrent URL / info-hash) on
+-- the clipboard pre-fills the Add box at open + on refocus. Each value is
+-- offered exactly once so a declined suggestion never nags.
+local sClipSuggested    -- the last clipboard text already offered (or dismissed)
+
+-- The user-facing release version: shown in the OS title bar and the startup
+-- log line, so a bug report always says which build it came from.
+constant kTcAppVersion = "1.0.0"
 
 -- Bump when the generated UI changes; tcBuildUI rebuilds the controls on a
 -- mismatch so updating the script in a SAVED stack picks up the new layout
 -- instead of keeping the old controls (and dead buttons) around.
-constant kUiVersion = "client-ui-2026-07"
+constant kUiVersion = "client-ui-2027-01"
 -- prefs file header: 8-byte magic + 1-byte mode. The client keeps no secrets, so
 -- it only ever writes mode "P" (plain); the format matches the channels demo.
 constant kPrefMagic = "BTXPREF1"
 
+-- ---- UI design tokens ----------------------------------------------------------
+-- The palette newquickshare's OXT passes settled on, shared across all three
+-- demos so they read as one family. This client is resizable and table-dense,
+-- so it keeps its flowing single-column layout (no fixed cards) but adopts the
+-- same colors, flat inputs, and platform monospace. Literal RGB strings only
+-- (OXT constants must be literal + declared before first use).
+constant kClrPage = "240,242,246"       -- window background
+constant kClrCard = "255,255,255"       -- input fill
+constant kClrBand = "44,90,160"         -- header band (brand blue)
+constant kClrBandText = "255,255,255"   -- title on the band
+constant kClrBandSub = "199,216,241"    -- subtitle on the band
+constant kClrInk = "28,34,46"           -- primary text
+constant kClrInkSoft = "95,104,118"     -- secondary text / detail strip
+constant kClrInkMute = "138,146,158"    -- captions, hints
+constant kClrFieldLine = "203,210,222"  -- entry-field border
+constant kClrListLine = "225,229,236"   -- list / table border
+constant kClrHeadBg = "233,236,242"     -- table + inspector column-header fill
+constant kClrHeadInk = "70,80,96"       -- column-header text
+constant kClrStatusBg = "233,236,242"   -- status bar fill
+-- table row state colors (aligned across the family: accent blue = active)
+constant kClrRowSeed = "23,128,63"      -- seeding / finished
+constant kClrRowDown = "43,108,196"     -- downloading (the shared accent)
+constant kClrRowWait = "150,110,40"     -- checking / queued / connecting
+constant kClrRowIdle = "120,128,140"    -- paused / idle
+constant kClrRowErr = "176,58,46"       -- errored
+
 -- ---- lifecycle ---------------------------------------------------------------
-on openStack
-   tcPrefLoad      -- hydrate saved settings BEFORE tcBuildUI reads them
+-- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
+-- kUiVersion rebuild) never flashes an unstyled or mis-sized window; the
+-- session then starts in openStack once the window is up. tcPrefLoad must run
+-- first (tcBuildUI reads the remembered save path / cap / height).
+on preOpenStack
+   tcPrefLoad
    tcBuildUI
+end preOpenStack
+
+on openStack
    tcEnsureSession
 end openStack
 
 on closeStack
    tcShutdown
 end closeStack
+
+-- A standalone quits via shutdownRequest (Cmd-Q / Alt-F4 / Dock quit) WITHOUT
+-- a guaranteed closeStack first - and tcShutdown is where the session is stopped
+-- (pause -> flush resume data -> join threads) and settings are saved. It is
+-- idempotent, so arriving here after closeStack already ran is a safe no-op.
+on shutdownRequest
+   tcShutdown
+   pass shutdownRequest
+end shutdownRequest
+
+on resumeStack
+   -- the window came back to the front: a magnet / info-hash may be waiting on
+   -- the clipboard (the common "copy a magnet, switch to the client" flow)
+   tcClipboardSuggest
+   pass resumeStack
+end resumeStack
 
 -- the window is vertically resizable; reflow the table/log and remember the size
 on resizeStack
@@ -247,8 +313,8 @@ command tcBuildUI
    end if
    tcClearGeneratedUI
    lock screen
-   set the backgroundColor of this card to "237,239,243"
-   set the title of this stack to "TorrentXT Client"
+   set the backgroundColor of this card to kClrPage
+   set the title of this stack to ("TorrentXT Client " & kTcAppVersion)
    set the width of this stack to 860
    -- vertically resizable: lock the width, remember the user's height across runs,
    -- and let the table + the bottom panel share the extra vertical space (see
@@ -261,25 +327,33 @@ command tcBuildUI
    else
       set the height of this stack to 648
    end if
-   -- a slim brand title bar
-   tcMakeLabel "tcTitle", "  TorrentXT Client", "0,0,860,28", 15
-   set the opaque of field "tcTitle" to true
-   set the backgroundColor of field "tcTitle" to "44,90,160"
-   set the foregroundColor of field "tcTitle" to "255,255,255"
+   -- a slim brand title band (a plain filled graphic + auto-sized labels centered
+   -- on its midline by MEASURED height - never guess font metrics)
+   tcGfx "tcTitleBg", "0,0,860,28"
+   set the style of graphic "tcTitleBg" to "rectangle"
+   set the filled of graphic "tcTitleBg" to true
+   set the backgroundColor of graphic "tcTitleBg" to kClrBand
+   set the lineSize of graphic "tcTitleBg" to 0
+   tcMakeLabel "tcTitle", "TorrentXT Client", "12,2,440,26", 14
+   set the foregroundColor of field "tcTitle" to kClrBandText
    set the textStyle of field "tcTitle" to "bold"
-   tcMakeLabel "tcSubtitle", "BitTorrent for OpenXTalk - powered by libtorrent  ", "440,6,840,24", 10
-   set the foregroundColor of field "tcSubtitle" to "208,221,240"
+   set the top of field "tcTitle" to (14 - ((the height of field "tcTitle") div 2))
+   tcMakeLabel "tcSubtitle", "BitTorrent for OpenXTalk - powered by libtorrent", "440,2,844,26", 10
+   set the foregroundColor of field "tcSubtitle" to kClrBandSub
    set the textAlign of field "tcSubtitle" to "right"
+   set the top of field "tcSubtitle" to (14 - ((the height of field "tcSubtitle") div 2))
    -- add row: the smart input + the two add buttons
    tcMakeField "tcInput", "16,32,560,54", false
    tcMakeButton "tcAdd", "Add", "568,32,650,54"
    tcMakeButton "tcAddFile", "Open .torrent", "658,32,844,54"
    -- save + seed row, with the global upload cap tucked on the right
    tcMakeLabel "tcSaveLabel", "Save to:", "16,60,62,78", 10
+   set the foregroundColor of field "tcSaveLabel" to kClrInkSoft
    tcMakeField "tcSavePath", "66,58,392,80", false
    tcMakeButton "tcBrowse", "Browse...", "396,58,468,80"
    tcMakeButton "tcSeed", "Create + Seed", "472,58,604,80"
    tcMakeLabel "tcLimitLabel", "Up KB/s:", "616,60,684,78", 10
+   set the foregroundColor of field "tcLimitLabel" to kClrInkSoft
    tcMakeField "tcUpLimit", "688,58,740,80", false
    tcMakeButton "tcApplyLimit", "Apply", "744,58,816,80"
    -- a single compact toolbar of per-torrent + session actions (modern-client
@@ -304,9 +378,10 @@ command tcBuildUI
    set the tabStops of field "tcHeader" to "26,250,350,510,590,670,720"
    set the tabStops of field "tcTorrents" to "26,250,350,510,590,670,720"
    -- a fixed-width font lets the inline progress bars and the right-hand byte
-   -- columns line up cleanly; OXT falls back gracefully if Courier is absent.
-   set the textFont of field "tcHeader" to "Courier"
-   set the textFont of field "tcTorrents" to "Courier"
+   -- columns line up cleanly; the platform mono face (Menlo/Consolas/DejaVu)
+   -- looks native, and OXT substitutes a default if it is absent.
+   set the textFont of field "tcHeader" to tcMonoFont()
+   set the textFont of field "tcTorrents" to tcMonoFont()
    set the textSize of field "tcHeader" to 11
    set the textSize of field "tcTorrents" to 11
    -- a pale selection color keeps the state-colored row text legible when a row
@@ -314,11 +389,12 @@ command tcBuildUI
    set the hiliteColor of field "tcTorrents" to "200,221,242"
    -- a styled header bar frames the table
    set the opaque of field "tcHeader" to true
-   set the backgroundColor of field "tcHeader" to "216,221,230"
-   set the foregroundColor of field "tcHeader" to "28,38,58"
+   set the backgroundColor of field "tcHeader" to kClrHeadBg
+   set the foregroundColor of field "tcHeader" to kClrHeadInk
    set the textStyle of field "tcHeader" to "bold"
    -- detail strip for the selected torrent (just under the table)
    tcMakeLabel "tcDetail", "Select a torrent to see its details.", "16,364,844,382", 10
+   set the foregroundColor of field "tcDetail" to kClrInkSoft
    -- ---- bottom panel: Files / Peers / Trackers / Log + per-torrent actions ----
    -- a tab row, a column header, and one of two stacked fields shown per tab (the
    -- inspector list, or the event log). tcRelayout positions all of these; the
@@ -334,23 +410,26 @@ command tcBuildUI
    tcMakeLabel "tcInspectHdr", \
       "Name" & tab & "Size" & tab & "Progress" & tab & "Priority", "16,412,844,430", 10
    set the opaque of field "tcInspectHdr" to true
-   set the backgroundColor of field "tcInspectHdr" to "216,221,230"
-   set the foregroundColor of field "tcInspectHdr" to "28,38,58"
+   set the backgroundColor of field "tcInspectHdr" to kClrHeadBg
+   set the foregroundColor of field "tcInspectHdr" to kClrHeadInk
    set the textStyle of field "tcInspectHdr" to "bold"
-   set the textFont of field "tcInspectHdr" to "Courier"
+   set the textFont of field "tcInspectHdr" to tcMonoFont()
    set the textSize of field "tcInspectHdr" to 11
    -- the inspector list and the event log share the SAME region; tcSetTab shows
    -- one and hides the other, so the Log reads as just another tab.
    tcMakeList "tcInspect", "16,432,844,560", false
-   set the textFont of field "tcInspect" to "Courier"
+   set the textFont of field "tcInspect" to tcMonoFont()
    set the textSize of field "tcInspect" to 11
    set the hiliteColor of field "tcInspect" to "200,221,242"
    tcMakeList "tcLog", "16,432,844,560", true
+   set the textFont of field "tcLog" to tcMonoFont()
    set the textSize of field "tcLog" to 10
+   set the foregroundColor of field "tcLog" to kClrInkSoft
    -- session status bar pinned along the bottom edge
    tcMakeLabel "tcTotals", "", "16,566,844,586", 10
    set the opaque of field "tcTotals" to true
-   set the backgroundColor of field "tcTotals" to "224,228,235"
+   set the backgroundColor of field "tcTotals" to kClrStatusBg
+   set the foregroundColor of field "tcTotals" to kClrInk
    set the textStyle of field "tcTotals" to "bold"
    -- defaults (restore the remembered save path + upload cap if present)
    if the uSavePath of this stack is not empty then
@@ -398,12 +477,13 @@ command tcBuildUI
    set the uUiVersion of this stack to kUiVersion
    tcRelayout
    unlock screen
-   tcLogMsg "Client built. Add takes a magnet, a .torrent path, an http(s) .torrent URL, or a 40-hex info-hash."
+   tcLogMsg "TorrentXT Client " & kTcAppVersion & " built. Add takes a magnet, a .torrent path, an http(s) .torrent URL, or a 40-hex info-hash."
    tcLogMsg "Duplicates are detected. Double-click a row to open its folder. Create + Seed a folder to seed."
    tcLogMsg "Pick a torrent, then use the Files / Peers / Trackers tabs below. Drag a .torrent or magnet onto the window to add it."
 end tcBuildUI
 
 command tcMakeLabel pName, pText, pRect, pSize
+   local tTop
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -412,8 +492,25 @@ command tcMakeLabel pName, pText, pRect, pSize
    set the lockText of field pName to true
    set the borderWidth of field pName to 0
    set the opaque of field pName to false
+   set the threeD of field pName to false
    set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kClrInk
    put pText into field pName
+   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
+   -- to formattedHeight when the text needs more room (top pinned), never shrink -
+   -- so the opaque header/status bars keep their designed height, and if
+   -- formattedHeight is unavailable before the window is shown (build is in
+   -- preOpenStack) the comparison fails safe (no collapse to zero height).
+   -- Labels that tcRelayout later re-rects (detail, totals, headers) are fine -
+   -- relayout sets their final rect after build.
+   if pText is not empty then
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      if the formattedHeight of field pName > the height of field pName then
+         set the height of field pName to the formattedHeight of field pName
+         set the top of field pName to tTop
+      end if
+   end if
 end tcMakeLabel
 
 command tcMakeField pName, pRect, pLocked
@@ -424,6 +521,13 @@ command tcMakeField pName, pRect, pLocked
    set the rect of field pName to pRect
    set the lockText of field pName to pLocked
    set the traversalOn of field pName to (not pLocked)
+   -- flat "modern input" chrome instead of the engine's sunken-3D default
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kClrFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kClrCard
+   set the margins of field pName to "6,4,6,4"
 end tcMakeField
 
 command tcMakeButton pName, pLabel, pRect
@@ -443,12 +547,62 @@ command tcMakeList pName, pRect, pIsLog
    set the rect of field pName to pRect
    set the lockText of field pName to true
    set the vScrollbar of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kClrListLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kClrCard
    if pIsLog then
       set the listBehavior of field pName to false
    else
       set the listBehavior of field pName to true
    end if
 end tcMakeList
+
+-- Create-or-reuse a named graphic (the chrome layer: the title band). Created
+-- BEFORE the controls that sit on it, so it stays behind them in z-order.
+command tcGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "rectangle"
+   set the antialiased of graphic pName to true
+end tcGfx
+
+-- The platform's own terminal face for the tables / log. A missing face
+-- substitutes the engine default - a soft, safe failure.
+function tcMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end tcMonoFont
+
+-- Flash a button's label to "Copied!" for a beat, then restore it, so the
+-- feedback lands AT the pointer, not only in the far-away log.
+command tcCopyFlash pBtn
+   if there is no button pBtn then
+      exit tcCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("tcCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end tcCopyFlash
+
+command tcCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit tcCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end tcCopyFlashReset
 
 -- Reflow the two resizable list regions (the torrent table and the bottom panel)
 -- plus the detail strip, tab row, panel header, and status bar for the current
@@ -535,6 +689,8 @@ command tcEnsureSession
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    tcLogMsg "Session ready (handle" && sSession & "). DHT/LSD on, routers seeded."
    put "true" into sPolling
+   -- an addable magnet / info-hash may already be on the clipboard
+   tcClipboardSuggest
    send "tcPollOnce" to me in 0 milliseconds
    send "tcRefreshLoop" to me in 600 milliseconds
 end tcEnsureSession
@@ -618,6 +774,61 @@ function tcHaveSession
    end if
    return true
 end tcHaveSession
+
+-- ---- clipboard auto-detect (the copy-a-magnet -> switch-to-client flow) -------
+-- Does this text LOOK like something the Add box accepts? A magnet: link, an
+-- http(s) .torrent URL, or a bare 40/64-hex info-hash. (A local .torrent PATH is
+-- deliberately excluded - a random path on the clipboard is not a torrent intent.)
+function tcLooksAddable pText
+   local tHex, tI
+   if pText begins with "magnet:" then
+      return true
+   end if
+   if (pText begins with "http://" or pText begins with "https://") \
+         and pText ends with ".torrent" then
+      return true
+   end if
+   if the number of chars of pText is 40 or the number of chars of pText is 64 then
+      put toLower(pText) into tHex
+      repeat with tI = 1 to the number of chars of tHex
+         if char tI of tHex is not in "0123456789abcdef" then
+            return false
+         end if
+      end repeat
+      return true
+   end if
+   return false
+end tcLooksAddable
+
+-- If the clipboard holds an addable item and the Add box is empty, pre-fill it
+-- (never auto-add - the user still clicks Add / presses Enter, and duplicate
+-- detection runs then). Runs at open and on resumeStack. Polite: never
+-- overwrites what you typed, and offers each clipboard value only once. The
+-- read is try-guarded (the clipboard can fail transiently on Windows).
+command tcClipboardSuggest
+   local tClip, tErr
+   if there is no field "tcInput" then
+      exit tcClipboardSuggest
+   end if
+   put "" into tClip
+   try
+      put tcTrim(the clipboardData["text"]) into tClip
+   catch tErr
+      exit tcClipboardSuggest
+   end try
+   if tClip is empty or tClip is sClipSuggested then
+      exit tcClipboardSuggest
+   end if
+   put tClip into sClipSuggested   -- one offer per value, even if declined
+   if not tcLooksAddable(tClip) then
+      exit tcClipboardSuggest
+   end if
+   if tcTrim(field "tcInput") is not empty then
+      exit tcClipboardSuggest
+   end if
+   put tClip into field "tcInput"
+   tcLogMsg "Found an addable link on your clipboard - it is in the Add box; click Add (or press Enter) to start it."
+end tcClipboardSuggest
 
 -- ---- add (smart input + duplicate detection) ---------------------------------
 -- The one Add field accepts whatever you paste: a magnet: link, an http(s) URL
@@ -929,6 +1140,7 @@ command tcCopyMagnet
       put tMag & "&dn=" & urlEncode(tName) into tMag
    end if
    set the clipboardData["text"] to tMag
+   tcCopyFlash "tcCopyMagnet"
    tcLogMsg "Copied magnet to clipboard:" && tMag
 end tcCopyMagnet
 
@@ -1118,8 +1330,8 @@ command tcRefreshOnce
    set the text of field "tcTorrents" to tRows
    if tLineNum is 0 then
       set the text of field "tcTorrents" to \
-         "   No torrents yet - paste a magnet or .torrent above, or Create + Seed a folder."
-      set the foregroundColor of line 1 of field "tcTorrents" to "130,130,130"
+         "No torrents yet - paste a magnet or .torrent above, or Create + Seed a folder."
+      set the foregroundColor of line 1 of field "tcTorrents" to kClrInkMute
    end if
    if tSelLine is not empty then
       set the hilitedLines of field "tcTorrents" to tSelLine
@@ -1223,6 +1435,12 @@ command tcClearGeneratedUI
          delete button tI of this card
       end if
    end repeat
+   -- the title band is a graphic since client-ui-2027-01
+   repeat with tI = the number of graphics of this card down to 1
+      if the short name of graphic tI of this card begins with "tc" then
+         delete graphic tI of this card
+      end if
+   end repeat
    unlock screen
 end tcClearGeneratedUI
 
@@ -1290,8 +1508,8 @@ command tcUpdatePanel
    end if
    put tcSelectedHandle() into tH
    if tH is 0 then
-      set the text of field "tcInspect" to "   Select a torrent above to inspect its files, peers, and trackers."
-      set the foregroundColor of line 1 of field "tcInspect" to "130,130,130"
+      set the text of field "tcInspect" to "Select a torrent above to inspect its files, peers, and trackers."
+      set the foregroundColor of line 1 of field "tcInspect" to kClrInkMute
       exit tcUpdatePanel
    end if
    put item 1 of (the hilitedLines of field "tcInspect") into tKeepLine
@@ -1309,7 +1527,7 @@ command tcUpdatePanel
                (the round of (tRow["progress"] * 100)) & "%" & return after tOut
          end repeat
          if tLine is 0 then
-            put "   No peers connected yet (still finding the swarm)." into tOut
+            put "No peers connected yet (still finding the swarm)." into tOut
          end if
          break
       case "trackers"
@@ -1324,7 +1542,7 @@ command tcUpdatePanel
             put tcTrunc(tRow["url"], 62) & tab & tRow["tier"] & tab & tStatus & return after tOut
          end repeat
          if tLine is 0 then
-            put "   No trackers - this torrent relies on DHT / PEX / LSD." into tOut
+            put "No trackers - this torrent relies on DHT / PEX / LSD." into tOut
          end if
          break
       default          -- "files"
@@ -1340,13 +1558,13 @@ command tcUpdatePanel
                tcProgressBar(tPct) & tab & tcPrioText(tRow["priority"]) & return after tOut
             -- grey out skipped files, green completed ones; default otherwise
             if tRow["priority"] is 0 then
-               put "150,150,150" into tColors[tLine]
+               put kClrInkMute into tColors[tLine]
             else if tPct >= 100 then
-               put "0,140,70" into tColors[tLine]
+               put kClrRowSeed into tColors[tLine]
             end if
          end repeat
          if tLine is 0 then
-            put "   No file list yet (metadata still pending)." into tOut
+            put "No file list yet (metadata still pending)." into tOut
          end if
          break
    end switch
@@ -1514,20 +1732,20 @@ end tcProgressBar
 -- with any error overriding everything to red. Mirrors tcStateName's numbering.
 function tcStateColor pState, pError
    if pError is not empty then
-      return "200,40,40"
+      return kClrRowErr
    end if
    switch pState
       case 4
       case 5
-         return "0,140,70"
+         return kClrRowSeed
       case 3
-         return "30,90,200"
+         return kClrRowDown
       case 1
       case 2
       case 7
-         return "190,130,0"
+         return kClrRowWait
       default
-         return "110,110,110"
+         return kClrRowIdle
    end switch
 end tcStateColor
 
