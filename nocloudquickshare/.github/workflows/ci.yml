@@ -1,0 +1,25 @@
+name: static gates
+
+# No Cloud Quick Share is a pure OpenXTalk/xTalk app (one stack script + a static
+# web app) that depends on PREBUILT OpenXTalk extensions - there is no native code
+# to compile here. OXT is a GUI runtime with no headless way to compile or run a
+# .livecodescript, so CI runs the two things that ARE machine-checkable: the
+# script linter and the pure-logic golden. Runtime behaviour still needs a manual
+# OXT pass (see CONTRIBUTING.md / CLAUDE.md).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Lint the stack script (smart quotes, block/handler balance, prefixes, constants)
+        run: python3 tools/check-livecodescript.py
+      - name: Golden test for the pure-logic helpers (range/mime/framing/escape/confinement)
+        run: python3 tests/fileserver_golden.py

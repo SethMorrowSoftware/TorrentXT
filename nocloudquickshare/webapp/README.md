@@ -1,19 +1,19 @@
 # No Cloud Quick Share Web App Demo
 
 A small, self-contained **single-page app** meant to be hosted straight out of a folder
-by the **Quick Share** demo (`../torrent-quickshare.livecodescript`) - over **Tor** or a
-**direct web link**. It exists to show off, in one place, everything the built-in web
-host can do.
+by **No Cloud Quick Share** (`../src/nocloudquickshare.livecodescript`) - over **Tor** or
+a **direct web link**. It exists to show off, in one place, everything the built-in web
+host can do. See `../docs/webapp.md` for the full contributor guide.
 
 ## Host it
 
-1. Open `torrent-quickshare.livecodescript` in OpenXTalk and run it.
-2. Drag **this `quickshare-webapp` folder** onto the drop area.
+1. Open `nocloudquickshare.livecodescript` in OpenXTalk and run it.
+2. Drag **this `webapp` folder** onto the drop area.
 3. Share it:
    - **Over Tor** - the app is served at the onion root (`http://<addr>.onion/`). Tor
      Browser treats a `.onion` as a **secure context**, so the service-worker check on
      the About page lights up.
-   - **Over a web link** - tick **Share via web link**; the app lives under
+   - **Over a web link** - pick the **Web link** method; the app lives under
      `http://<ip>:<port>/<token>/`. Open it in any browser.
 4. (Optional) tick **Enable web editing**, set a password, and open the link with
    `/_edit` on the end to edit these files from a browser on your LAN.

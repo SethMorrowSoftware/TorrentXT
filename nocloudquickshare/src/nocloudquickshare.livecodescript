@@ -1,13 +1,15 @@
 script "No Cloud Quick Share"
 
--- newquickshare.livecodescript - a REVAMPED Quick Share (see torrent-quickshare for
--- the original). Same engine and features; a wider, shorter, self-explanatory UI that
--- fits a 720p screen: a two-column dashboard with a plain-English 3-way "how to share"
--- choice (Share code / Private-Tor / Web link) on the left and Receive / Transfers /
--- Activity on the right. Drag a file onto the window, get a short code, send the code
--- to a friend; they paste it in and the file transfers straight from your machine to
--- theirs. No server, no upload, no size limit - it is plain peer-to-peer BitTorrent
--- with the DHT finding the peers, wrapped in a one-card stack.
+-- nocloudquickshare.livecodescript - No Cloud Quick Share: peer-to-peer file
+-- sharing with no server, no account, and no size limit, in a single OpenXTalk
+-- stack. A wider, shorter, self-explanatory UI that fits a 720p screen: a
+-- two-column dashboard with a plain-English 3-way "how to share" choice
+-- (Share code / Private-Tor / Web link) on the left and Receive / Transfers /
+-- Activity on the right. Drag a file onto the window, get a short code, send the
+-- code to a friend; they paste it in and the file transfers straight from your
+-- machine to theirs. No server, no upload, no size limit - it is plain
+-- peer-to-peer BitTorrent with the DHT finding the peers, wrapped in a one-card
+-- stack. Built on the TorrentXT / cryptoXT / OnionXT OpenXTalk extensions.
 --
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI and starts a
@@ -202,7 +204,7 @@ constant kQsVerify = "BTXQSVERIFY"
 -- (both IPs hidden) and NO torrent is created. Requires the OnionXT extension +
 -- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
 -- ABI; verified statically here, needs an on-engine OXT pass with a running Tor
--- daemon (the project convention). See docs/ONIONXT-INTEGRATION-PLAN.md.
+-- daemon (the project convention - see CLAUDE.md and docs/what-it-hides.md).
 constant kTorCodePrefix = "BTXTOR1:"   -- marks an anonymous (Tor) share code
 constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync + go request
 constant kOnionVer = 1                 -- stream protocol version
@@ -2340,8 +2342,8 @@ end qsMaybeDecryptFinished
 -- an anonymous transfer creates no torrent and makes no DHT call (the mutual-
 -- exclusion invariant). Every ox* handler is OnionXT's published ABI; this is
 -- verified statically (tools/check-livecodescript.py) and NEEDS an on-engine OXT
--- pass with a running Tor daemon before any runtime claim. See
--- docs/ONIONXT-INTEGRATION-PLAN.md and its VERIFY register (section 12.3).
+-- pass with a running Tor daemon before any runtime claim (see CLAUDE.md, the
+-- "VERIFY on the OXT pass" discipline).
 
 -- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both
 -- must be present for any anonymous transfer (even a plaintext one). A guarded
