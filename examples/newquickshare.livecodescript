@@ -197,8 +197,18 @@ constant kOnionVPort = 80              -- the onion service's advertised virtual
 constant kOnionChunk = 65536           -- 64 KiB: max payload bytes in one data frame
 constant kFlagEnc = 1                  -- header flags bit0: payload is a cryptoXT .enc
 constant kOnionPumpTick = 15           -- ms between send-pump frames (never a tight loop)
-constant kOnionSendTimeout = 30000     -- ms idle watchdog, sender
-constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slow)
+-- Tor-side idle watchdogs. Generous on purpose: circuit rebuilds and relay
+-- congestion routinely stall a healthy Tor stream for 30-60+ seconds, and an
+-- abort on the anon path is EXPENSIVE - a BTXO transfer has no resume, so a
+-- watchdog that fires during an ordinary stall restarts the whole file. These
+-- also pace the folder-server reap of dead/silent connections (qsFsWatchdog),
+-- so raising them holds junk connections a little longer - the right trade
+-- for an onion service, where the user-visible cost of a false abort is far
+-- higher than the cost of a parked stream. (The clearweb kCwIdleTimeout below
+-- stays short: closing an idle keep-alive is a normal HTTP event a browser
+-- recovers from transparently.)
+constant kOnionSendTimeout = 90000     -- ms idle watchdog, sender + folder server
+constant kOnionRecvTimeout = 120000    -- ms idle watchdog, receiver (waits on the whole Tor path)
 constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to upload
 constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
 constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
@@ -206,6 +216,9 @@ constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (he
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
 constant kCwMaxKeepAlive = 100         -- max requests served on one kept-alive connection
 constant kCwIdleTimeout = 30000        -- ms an idle kept-alive connection is held open, then closed
+                                       -- (kept SHORT deliberately, unlike the Tor watchdogs above:
+                                       -- a browser reopens a closed keep-alive transparently, and
+                                       -- an in-flight stream/write is never reaped - see qsCwWatchdog)
 constant kCwMaxConns = 32              -- concurrent clearweb connections (state + a watchdog
                                        -- timer are per-socket, and UPnP exposes the port to the
                                        -- internet - a connect flood must not grow them unboundedly;
