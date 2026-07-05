@@ -121,6 +121,10 @@ local sFsTxDeadline     -- array: stream -> the milliseconds of the last activit
 -- transports; on the direct web link a route sits under the token, e.g.
 -- http://<ip>:<port>/<token>/_qs/info.
 local sHttpRoutes       -- array: "METHOD /path" -> handler name in this script
+-- qsHttpHeaderEnd's scanner choice, probed ONCE on first use: "fast" when the
+-- engine's byteOffset proves it handles a multi-byte needle on a known vector,
+-- else "loop" (the original interpreted scan). See qsHttpHeaderEnd.
+local sHdrScanMode
 -- The optional live WEB EDITOR (Phase C). Turns the served folder read-WRITE from a
 -- browser, so it is deliberately locked down: OFF by default; a cryptoXT (Argon2id)
 -- edit password; a random per-login session token; and - the hard rule - editing is
@@ -202,6 +206,15 @@ constant kFsMaxReq = 262144            -- web server: refuse an HTTP request (he
 constant kCwTokenBytes = 16            -- clearweb capability token: 16 random bytes (128 bits)
 constant kCwMaxKeepAlive = 100         -- max requests served on one kept-alive connection
 constant kCwIdleTimeout = 30000        -- ms an idle kept-alive connection is held open, then closed
+constant kCwMaxConns = 32              -- concurrent clearweb connections (state + a watchdog
+                                       -- timer are per-socket, and UPnP exposes the port to the
+                                       -- internet - a connect flood must not grow them unboundedly;
+                                       -- a browser uses ~6 connections, so 32 is generous)
+constant kCwChunk = 262144             -- 256 KiB clearweb file slice: the socket pump is paced by
+                                       -- write-completions through the message queue, so bigger
+                                       -- slices = fewer round-trips = faster LAN transfers, at a
+                                       -- bounded 256 KiB per-connection buffer (Tor keeps the
+                                       -- smaller kOnionChunk - its bottleneck is the network)
 constant kEditTokenBytes = 24          -- live-editor session token: 24 random bytes (192 bits)
 constant kEditVerify = "BTXEDIT1"      -- plaintext sealed under the edit key to prove a login
 constant kEditMaxDepth = 32            -- editor file listing: recursion depth ceiling (anti-loop)
@@ -3326,10 +3339,33 @@ end qsFsHandle
 -- if the head is not fully received yet. Byte discipline (no char/line on binary),
 -- mirroring OnionXT's proven onion-httpd.
 function qsHttpHeaderEnd pData
-   local tN, tI, tB1, tB2, tB3, tB4
+   local tN, tI, tB1, tB2, tB3, tB4, tTerm, tProbe, tErr
    put the number of bytes in pData into tN
    if tN < 4 then
       return 0
+   end if
+   put (numToByte(13) & numToByte(10) & numToByte(13) & numToByte(10)) into tTerm
+   -- FAST PATH. This function re-runs on EVERY arriving chunk of a request (the
+   -- completeness check), so the interpreted per-byte scan below is O(n^2) per
+   -- connection - against the 256 KB request cap that is an engine-thread stall
+   -- any uploader (or abuser) can trigger. byteOffset is an engine-NATIVE scan.
+   -- It is probed ONCE against a known vector rather than trusted blindly: an
+   -- engine whose byteOffset mishandled a multi-byte needle would silently
+   -- break request framing, which is far worse than being slow.
+   if sHdrScanMode is empty then
+      put "loop" into sHdrScanMode
+      try
+         put byteOffset(tTerm, (numToByte(65) & tTerm & numToByte(66))) into tProbe
+         if tProbe is 2 then
+            put "fast" into sHdrScanMode
+         end if
+      catch tErr
+      end try
+   end if
+   if sHdrScanMode is "fast" then
+      -- same contract as the loop: 1-based index of the first CR, 0 if absent
+      -- (pinned by http_header_end() in the golden)
+      return byteOffset(tTerm, pData)
    end if
    repeat with tI = 1 to tN - 3
       put byteToNum(byte tI of pData) into tB1
@@ -3413,6 +3449,14 @@ function qsHttpParseHead pHeadBytes
          if tName begins with "__" then
             next repeat
          end if
+         -- conflicting duplicate Content-Length headers make the framing
+         -- ambiguous (smuggling's classic lever). We are the only parser here,
+         -- so nothing downstream can disagree with us - but flag it anyway and
+         -- let the serve handlers refuse with a 400 (belt-and-braces).
+         if tName is "content-length" and tOut[tName] is not empty \
+               and tOut[tName] is not tValue then
+            put "true" into tOut["__dupcl"]
+         end if
          put tValue into tOut[tName]
       end if
    end repeat
@@ -3447,6 +3491,41 @@ function qsHttpParse pData
    end if
    return tOut
 end qsHttpParse
+
+-- Round-5 hardening: does any "/"-separated SEGMENT of a decoded path start
+-- with a dot? The static pipelines (listing + serving, BOTH transports) treat
+-- such paths as nonexistent - sharing a website folder must never leak .git,
+-- .env, editor droppings and friends over an anonymous link (the classic
+-- static-host mistake). 404, never 403: hidden means "does not exist". The
+-- LAN-gated, password-gated editor keeps its own rules (qsEditSafePath) and
+-- may legitimately touch dotfiles; this guard is only for the read paths.
+-- Mirrored by has_dot_segment() in tests/fileserver_golden.py.
+function qsHasDotSegment pPath
+   local tSeg, tSavedID
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   repeat for each item tSeg in pPath
+      if tSeg is not empty and char 1 of tSeg is "." then
+         set the itemDelimiter to tSavedID
+         return true
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   return false
+end qsHasDotSegment
+
+-- Control bytes (<32) in a DECODED path could smuggle CR/LF/NUL toward the OS
+-- or the log. qsEditSafePath already refuses them on the editor's write path;
+-- this brings the static READ path up to the same bar (round-5 symmetry).
+function qsPathHasControl pPath
+   local tCh
+   repeat for each char tCh in pPath
+      if charToNum(tCh) < 32 then
+         return true
+      end if
+   end repeat
+   return false
+end qsPathHasControl
 
 -- Register a dynamic route: pHandler is a command in THIS script, called as
 -- pHandler pConn, pRequest (pRequest is the parsed array; reply with qsHttpReply).
@@ -4013,6 +4092,16 @@ command qsFsServePath pStream, pHeaders
       qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
       exit qsFsServePath
    end if
+   if qsPathHasControl(tPath) then
+      qsFsSendText pStream, "400 Bad Request", "text/plain; charset=utf-8", "Bad request."
+      exit qsFsServePath
+   end if
+   -- unframeable request: a chunked body or conflicting Content-Lengths would
+   -- desync body extraction, so refuse before any route sees it (mirrors qsCwServe)
+   if pHeaders["transfer-encoding"] contains "chunked" or pHeaders["__dupcl"] is "true" then
+      qsFsSendText pStream, "400 Bad Request", "text/plain; charset=utf-8", "Unsupported request framing."
+      exit qsFsServePath
+   end if
    qsAccessLog "via Tor", tMethod, tPath
    -- a registered dynamic route answers FIRST (any method, so a POST works); only
    -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
@@ -4029,6 +4118,11 @@ command qsFsServePath pStream, pHeaders
    put sActiveShare["root"] into tRoot
    if tRoot is empty then
       qsFsSendText pStream, "503 Service Unavailable", "text/plain; charset=utf-8", "No folder is being shared."
+      exit qsFsServePath
+   end if
+   -- dotfiles are invisible to the static pipeline (see qsHasDotSegment)
+   if qsHasDotSegment(tPath) then
+      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
       exit qsFsServePath
    end if
    put tRoot & tPath into tDisk
@@ -4268,8 +4362,13 @@ command qsFsAbort pStream
 end qsFsAbort
 
 -- Idle watchdog per connection. No-ops once the connection is done/cleaned.
+-- Keyed on sFsServed: that is "false"/"true" for the WHOLE life of a connection
+-- and only goes empty when qsFsCleanup deletes it. The old sentinel (sFsReq
+-- empty) could not tell "cleaned up" from "connected but silent", so a peer
+-- that opened a stream and never sent a byte was NEVER reaped - the exact
+-- slow-loris hold the watchdog exists to stop (the round-5 deep-dive bug).
 command qsFsWatchdog pStream
-   if sFsReq[pStream] is empty and sFsTxPath[pStream] is empty then
+   if sFsServed[pStream] is empty then
       exit qsFsWatchdog
    end if
    if (the milliseconds - sFsTxDeadline[pStream]) > kOnionSendTimeout then
@@ -4313,6 +4412,9 @@ function qsFsListing pDiskFolder, pUrlPath
       if tName is "." or tName is ".." or tName is empty then
          next repeat
       end if
+      if char 1 of tName is "." then
+         next repeat      -- hidden entries stay hidden (matches the 404 guard)
+      end if
       put "<li class='dir t-dir'><a href='" & qsFsPathEncode(tName) & "/'>" & \
          "<svg class='ic'><use href='#i-dir'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
       add 1 to tCount
@@ -4320,6 +4422,9 @@ function qsFsListing pDiskFolder, pUrlPath
    repeat for each line tName in tFiles
       if tName is empty then
          next repeat
+      end if
+      if char 1 of tName is "." then
+         next repeat      -- hidden entries stay hidden (matches the 404 guard)
       end if
       -- per-file size (cheap now: the O(log n) seek probe, not a full read)
       put qsBytes(qsFileSize(tBase & tName)) into tSz
@@ -4809,6 +4914,13 @@ command qsCwAccept pSocketID
       qsCwSafeClose pSocketID
       exit qsCwAccept
    end if
+   -- bound concurrent connections: per-socket state rides eleven sCw* arrays
+   -- plus a watchdog timer, and UPnP exposes this port to the whole internet -
+   -- refuse at accept beyond the cap so a connect flood cannot grow them.
+   if the number of lines of (the keys of sCwServed) >= kCwMaxConns then
+      qsCwSafeClose pSocketID
+      exit qsCwAccept
+   end if
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
    put "false" into sCwKeep[pSocketID]
@@ -4864,8 +4976,11 @@ command qsCwServe pSocketID
    -- trailing bytes can never be mis-read as the next request). HTTP/1.1 defaults to
    -- keep-alive unless "Connection: close"; HTTP/1.0 needs an explicit "keep-alive".
    put "false" into sCwKeep[pSocketID]
-   if tHeaders["transfer-encoding"] contains "chunked" then
-      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Chunked request bodies are not supported."
+   -- unframeable request: a chunked body OR conflicting Content-Lengths would
+   -- desync keep-alive trimming into bogus requests. Refuse and (sCwKeep is
+   -- still false here) close, so no trailing bytes are ever re-framed.
+   if tHeaders["transfer-encoding"] contains "chunked" or tHeaders["__dupcl"] is "true" then
+      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Unsupported request framing."
       exit qsCwServe
    end if
    if tHeaders["__version"] is "HTTP/1.1" then
@@ -4881,6 +4996,10 @@ command qsCwServe pSocketID
    replace "\" with "/" in tPath
    if tPath contains ".." then
       qsCwSendText pSocketID, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
+      exit qsCwServe
+   end if
+   if qsPathHasControl(tPath) then
+      qsCwSendText pSocketID, "400 Bad Request", "text/plain; charset=utf-8", "Bad request."
       exit qsCwServe
    end if
    qsAccessLog qsCwPeer(pSocketID), tMethod, tPath
@@ -4918,7 +5037,13 @@ command qsCwServe pSocketID
       end if
       exit qsCwServe
    end if
-   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath)
+   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath). Dotfiles
+   -- are invisible here (qsHasDotSegment); the single-FILE share above is exempt
+   -- on purpose - explicitly choosing a dotfile to share is the sharer's intent.
+   if qsHasDotSegment(tRest) then
+      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+      exit qsCwServe
+   end if
    put sCwRoot & tRest into tDisk
    if there is a folder tDisk then
       if the last char of tRest is not "/" then
@@ -5011,7 +5136,7 @@ command qsCwPump pSocketID
    if sCwTxPath[pSocketID] is empty then
       exit qsCwPump
    end if
-   put kOnionChunk into tWant
+   put kCwChunk into tWant
    if sCwTxRemaining[pSocketID] < tWant then
       put sCwTxRemaining[pSocketID] into tWant
    end if
@@ -5406,7 +5531,9 @@ end qsIsPrivateIp
 command qsCwFetchPublicIp
    local tErr
    try
-      load URL "http://api.ipify.org/" with message "qsCwIpReply"
+      -- https: an on-path attacker must not be able to feed us a wrong "public
+      -- IP" for the displayed link. VERIFY (on-engine): OXT's libURL TLS.
+      load URL "https://api.ipify.org/" with message "qsCwIpReply"
    catch tErr
    end try
 end qsCwFetchPublicIp

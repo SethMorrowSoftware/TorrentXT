@@ -107,6 +107,16 @@ def traversal_ok(raw_path):
     return ".." not in path
 
 
+# ---- qsHasDotSegment: the static-path dotfile guard (round 5) ----------------
+# Any "/"-separated segment starting with "." makes the path invisible to the
+# static pipelines (listing + serving, both transports): a shared website
+# folder must never leak .git / .env over an anonymous link. Mirrors
+# qsHasDotSegment: split on "/", skip empty segments, test the first char.
+
+def has_dot_segment(path):
+    return any(seg.startswith(".") for seg in path.split("/") if seg)
+
+
 # ---- fsMime -----------------------------------------------------------------
 
 _MIME = {
@@ -462,6 +472,21 @@ def main():
         ("/weird..name.txt", False),            # intentionally strict (matches OnionXT)
     ]:
         check("traversal_ok(%r)" % raw, traversal_ok(raw), ok)
+
+    # -- dotfile guard: dot-leading segments are invisible to the static paths --
+    for path, want in [
+        ("/", False),
+        ("", False),
+        ("/file.txt", False),                   # dot INSIDE a name is fine
+        ("/notes.d/file", False),               # ...and inside a folder name
+        ("/a/b.txt", False),
+        ("/.git/config", True),
+        ("/a/.env", True),
+        ("/dir/.hidden/", True),
+        ("/.", True),
+        ("/.well-known/x", True),               # wholesale policy: hidden is hidden
+    ]:
+        check("has_dot_segment(%r)" % path, has_dot_segment(path), want)
 
     # -- MIME mapping (extension is case-insensitive; unknown -> octet-stream) --
     for path, want in [
