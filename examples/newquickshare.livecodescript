@@ -60,6 +60,17 @@ local sShareCodeByHandle -- array: torrent handle -> the share code we minted fo
 local sXferRow          -- array: list line number -> "type|key" identity for that row
 local sXferSel          -- the currently selected row identity ("type|key"), or empty
 local sLastXferRows     -- last text set into the qsXfers list (only retype it on a change)
+-- Clipboard auto-detect: when the window opens or comes to the front and the
+-- clipboard holds something code-shaped, the Receive box is pre-filled (never
+-- overwriting user input). Each clipboard value is offered exactly ONCE, so a
+-- declined suggestion never nags on every focus change.
+local sClipSuggested    -- the last clipboard text already offered (or dismissed)
+-- Stall coaching (round 4): a download sitting at ZERO peers is the worst
+-- novice moment - it reads as "broken" when it usually means "the sender
+-- closed their window". Track when each torrent was first seen peerless so
+-- 45s of that flips its row to plain English and logs the explanation ONCE.
+local sStallSince       -- array: torrent handle -> the milliseconds 0 peers was first seen
+local sStallWarned      -- array: torrent handle -> "true" once the one-time log ran
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -67,7 +78,7 @@ local sLastXferRows     -- last text set into the qsXfers list (only retype it o
 local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once)
 local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
 local sTorSend          -- "true" while the "Send privately over Tor" toggle is armed
-local sWebServe         -- "true" while the "Serve as web download" checkbox is on
+local sWebServe         -- "true" while the "Also offer a Tor Browser download link" checkbox is on
 local sOnionTriedTB     -- "true" once we have retried the Tor Browser control port pair
 local sActiveShare      -- array: the one live anon share (service, path, name, enc, salt, verify, ...)
 local sOnionXfers       -- array: stream handle -> {name,dir,enc,total,got,state} for the transfers view
@@ -205,7 +216,39 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2027-01"
+constant kQsUiVersion = "nqs-ui-2027-05"
+
+-- ---- UI design tokens ----------------------------------------------------------
+-- One palette for every generated control, so the whole surface shifts together
+-- (and a re-theme is a constants edit, not a hunt through qsBuild). Neutral grays
+-- carry the chrome; ONE accent blue carries brand + interaction; the Tor chip gets
+-- three semantic states (unavailable / connecting / ready). All literal RGB
+-- strings - OXT constants must be literal and declared before first use.
+constant kClrPage = "240,242,246"       -- window background
+constant kClrCard = "255,255,255"       -- card fill (and input fill)
+constant kClrCardLine = "225,229,236"   -- hairline card border / dividers
+constant kClrBand = "44,90,160"         -- header band (brand blue)
+constant kClrBandText = "255,255,255"   -- title on the band / badge digits
+constant kClrBandSub = "199,216,241"    -- tagline on the band
+constant kClrInk = "28,34,46"           -- primary text
+constant kClrInkSoft = "95,104,118"     -- secondary text / status lines
+constant kClrInkMute = "138,146,158"    -- captions, hints, empty states
+constant kClrAccent = "43,108,196"      -- accent (step badges, drag-over border)
+constant kClrFieldLine = "203,210,222"  -- entry-field border
+constant kClrCodeBg = "244,246,250"     -- code/link output fill
+constant kClrCodeLine = "210,217,229"   -- code/link output border
+constant kClrDropBg = "247,249,252"     -- drop zone fill, idle
+constant kClrDropHot = "232,241,255"    -- drop zone fill, hover / drag-over
+constant kClrDropLine = "170,182,202"   -- drop zone dashed border, idle
+constant kClrWarn = "150,110,40"        -- small amber hints ("LAN only"; Tor connecting rows)
+constant kClrRowSend = "23,128,63"      -- transfers list: seeding / done / serving rows
+constant kClrRowErr = "176,58,46"       -- transfers list: stopped / errored rows
+constant kClrPillOff = "31,64,116"      -- Tor chip: unavailable (band-toned)
+constant kClrPillOffText = "199,216,241"
+constant kClrPillWait = "250,240,199"   -- Tor chip: bootstrapping
+constant kClrPillWaitText = "133,98,14"
+constant kClrPillOk = "205,240,214"     -- Tor chip: ready
+constant kClrPillOkText = "22,101,52"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -217,6 +260,13 @@ on closeStack
    qsStop
 end closeStack
 
+on resumeStack
+   -- the window came back to the front: a share code may be waiting on the
+   -- clipboard (the classic receive flow is copy in chat -> switch to the app)
+   qsClipboardSuggest
+   pass resumeStack
+end resumeStack
+
 -- ---- OS file drag-and-drop ---------------------------------------------------
 -- These bubble up from whatever control is under the pointer to this stack
 -- script, so a drop anywhere on the window works. Click-to-choose (the drop
@@ -224,9 +274,7 @@ end closeStack
 -- deliver OS file drops.
 on dragEnter
    set the acceptDrop to true
-   if there is a field "qsDrop" then
-      set the backgroundColor of field "qsDrop" to "225,238,255"
-   end if
+   qsDropPaint "hot"
 end dragEnter
 
 on dragMove
@@ -234,16 +282,12 @@ on dragMove
 end dragMove
 
 on dragLeave
-   if there is a field "qsDrop" then
-      set the backgroundColor of field "qsDrop" to "245,247,250"
-   end if
+   qsDropPaint "idle"
 end dragLeave
 
 on dragDrop
    local tFiles
-   if there is a field "qsDrop" then
-      set the backgroundColor of field "qsDrop" to "245,247,250"
-   end if
+   qsDropPaint "idle"
    put the dragData["files"] into tFiles
    if tFiles is empty then
       -- some platforms/drops deliver a lone path as "text" rather than "files"
@@ -273,17 +317,28 @@ on mouseUp
       case "qsCopy"
          qsCopyCode
          break
+      case "qsCode"
+         qsCopyCode        -- the code box itself is click-to-copy (tooltip says so)
+         break
       case "qsGet"
          qsGetFile
          break
+      -- each radio's grey caption is click-through to the same choice, so the
+      -- whole two-line "option" reads (and behaves) as one control
       case "qsMethodCode"
+      case "qsMethodCodeD"
          qsSetMethod "code"
          break
       case "qsMethodTor"
+      case "qsMethodTorD"
          qsSetMethod "tor"
          break
       case "qsMethodWeb"
+      case "qsMethodWebD"
          qsSetMethod "web"
+         break
+      case "qsPassSuggest"
+         qsSuggestPass
          break
       case "qsWebCheck"
          qsToggleWeb
@@ -294,6 +349,9 @@ on mouseUp
       case "qsWebCopy"
          qsCopyWebLink
          break
+      case "qsWebLink"
+         qsCopyWebLink     -- the link box is click-to-copy too
+         break
       case "qsXfers"
          qsXferClick
          break
@@ -303,16 +361,69 @@ on mouseUp
       case "qsXferStop"
          qsStopSelected
          break
+      case "qsXferFolder"
+         qsOpenSaveFolder
+         break
       default
          pass mouseUp
    end switch
 end mouseUp
 
+-- Hover affordance for the drop zone (it doubles as a "choose a file" button, so
+-- it should light up like one). During an OS drag these do not fire - the drag*
+-- handlers above own that state.
+on mouseEnter
+   if the short name of the target is "qsDrop" then
+      qsDropPaint "hover"
+   end if
+   pass mouseEnter
+end mouseEnter
+
+on mouseLeave
+   if the short name of the target is "qsDrop" then
+      qsDropPaint "idle"
+   end if
+   pass mouseLeave
+end mouseLeave
+
+-- Return/Enter in the single-line inputs ACTS instead of inserting a newline: in
+-- either Receive field it clicks Download for you (paste -> Enter, done); in a
+-- passphrase field it is swallowed (a stray newline would silently become part
+-- of the passphrase and the derived keys would never match).
+on returnInField
+   switch the short name of the target
+      case "qsRecvCode"
+      case "qsRecvPass"
+         qsGetFile
+         break
+      case "qsSendPass"
+      case "qsEditPass"
+         break
+      default
+         pass returnInField
+   end switch
+end returnInField
+
+on enterInField
+   switch the short name of the target
+      case "qsRecvCode"
+      case "qsRecvPass"
+         qsGetFile
+         break
+      case "qsSendPass"
+      case "qsEditPass"
+         break
+      default
+         pass enterInField
+   end switch
+end enterInField
+
 -- ---- self-building UI (idempotent; rebuilds on a UI-version bump) ------------
 command qsBuild
    -- a normal re-open with a matching version + the passphrase fields present is
    -- a fast no-op; a script update that changed the layout rebuilds from scratch.
-   if the uUiVersion of this stack is kQsUiVersion and there is a field "qsSendPass" then
+   if the uUiVersion of this stack is kQsUiVersion and there is a field "qsSendPass" \
+         and there is a graphic "qsDropBg" then
       exit qsBuild
    end if
    qsClearGeneratedUI
@@ -320,136 +431,204 @@ command qsBuild
    -- Wide, short, two-column dashboard sized to fit a 720p screen (window 1100x640;
    -- the OS title bar adds ~30px, still well under 720). LEFT = Send (a plain-English
    -- 3-way choice, drop area, output, and a tucked-away More options block); RIGHT =
-   -- Receive, Transfers, and Activity stacked. Panels (opaque locked fields, created
-   -- BEFORE the controls that sit on them) group each step so it reads at a glance.
+   -- Receive, Transfers, and Activity stacked. Cards (rounded, hairline-bordered,
+   -- softly shadowed graphics created BEFORE the controls that sit on them) group
+   -- each step so it reads at a glance. Every color comes from the kClr* tokens
+   -- above; every rect sits on a consistent grid (20px card inset, ~12px between
+   -- groups) - labels get margins 0 so a rect places its text exactly.
    set the width of this stack to 1100
    set the height of this stack to 640
-   set the backgroundColor of this card to "237,239,243"
+   -- fixed-size dashboard: the layout is hand-placed, so a free resize would only
+   -- tear it (VERIFY on-engine: property honoured by the window manager)
+   set the resizable of this stack to false
+   set the backgroundColor of this card to kClrPage
    set the title of this stack to "newQuickShare"
-   -- title band + tagline + live Tor status pill (repainted only by qsOnionPill)
-   qsLabel "qsTitle", "   newQuickShare", "0,0,1100,50", 16
-   set the opaque of field "qsTitle" to true
-   set the backgroundColor of field "qsTitle" to "44,90,160"
-   set the foregroundColor of field "qsTitle" to "255,255,255"
+
+   -- title band (a plain filled graphic) + tagline + live Tor status chip. Each
+   -- band label auto-sizes in qsLabel, then is CENTERED on the band's midline
+   -- (y 28) by its measured height - no font-metric guessing (the pass-1 lesson).
+   qsGfx "qsTitleBg", "0,0,1100,56"
+   set the style of graphic "qsTitleBg" to "rectangle"
+   set the filled of graphic "qsTitleBg" to true
+   set the backgroundColor of graphic "qsTitleBg" to kClrBand
+   set the lineSize of graphic "qsTitleBg" to 0
+   qsLabel "qsTitle", "newQuickShare", "12,4,400,52", 16
+   set the foregroundColor of field "qsTitle" to kClrBandText
    set the textStyle of field "qsTitle" to "bold"
-   qsLabel "qsTagline", "Send & receive files - by code, over Tor, or a web link.", "214,16,780,40", 10
-   set the foregroundColor of field "qsTagline" to "205,221,245"
-   qsLabel "qsTorPill", "Tor: off", "930,13,1080,37", 10
-   set the opaque of field "qsTorPill" to true
-   set the backgroundColor of field "qsTorPill" to "33,72,132"
-   set the foregroundColor of field "qsTorPill" to "220,228,240"
-   set the textAlign of field "qsTorPill" to "right"
+   set the top of field "qsTitle" to (28 - ((the height of field "qsTitle") div 2))
+   qsLabel "qsTagline", "Send & receive files - by code, over Tor, or a web link.", "240,4,830,52", 10
+   set the foregroundColor of field "qsTagline" to kClrBandSub
+   set the top of field "qsTagline" to (28 - ((the height of field "qsTagline") div 2))
+   -- the Tor chip: a rounded pill whose color + text track the daemon state
+   qsGfx "qsTorPillBg", "870,14,1080,42"
+   set the roundRadius of graphic "qsTorPillBg" to 14
+   set the filled of graphic "qsTorPillBg" to true
+   set the backgroundColor of graphic "qsTorPillBg" to kClrPillOff
+   set the lineSize of graphic "qsTorPillBg" to 0
+   qsLabel "qsTorPill", "Tor: off", "878,4,1072,52", 10
+   set the foregroundColor of field "qsTorPill" to kClrPillOffText
+   set the textAlign of field "qsTorPill" to "center"
+   set the top of field "qsTorPill" to (28 - ((the height of field "qsTorPill") div 2))
 
    -- =============== LEFT: SEND ===============
-   qsPanel "qsSendPanel", "20,62,620,584"
-   qsHdr "qsSendHdr", "1     Send a file or folder", "36,72,420,96"
-   -- Signal that a sensible default is already picked (so no up-front decision is demanded),
-   -- and keep the jargon out of the labels (it lives in the grey captions + tooltips).
-   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "36,106,604,124", 11
+   qsPanel "qsSendPanel", "20,72,620,596"
+   qsBadge "qsStep1", "40,90,66,116", "1"
+   qsHdr "qsSendHdr", "Send a file or folder", "76,86,440,114"
+   -- Signal that a sensible default is already picked (so no up-front decision is
+   -- demanded), and keep the jargon out of the labels (it lives in the grey
+   -- captions + tooltips).
+   qsLabel "qsMethodCap", "How to share - Share code suits most people (change anytime):", "40,124,600,144", 10
    set the textStyle of field "qsMethodCap" to "bold"
+   set the foregroundColor of field "qsMethodCap" to kClrInkSoft
    -- The send method: three mutually-exclusive RADIOS (autoHilite off; managed via
-   -- sTorSend/sWebShare by qsSetMethod/qsSyncMethod). Each has a one-line plain caption.
-   qsButton "qsMethodCode", "Share code", "36,126,190,148"
+   -- sTorSend/sWebShare by qsSetMethod/qsSyncMethod), on an equal 3-column grid.
+   -- Each caption is click-through to the same choice (mouseUp cases above).
+   qsButton "qsMethodCode", "Share code", "40,148,220,168"
    set the style of button "qsMethodCode" to "radioButton"
    set the autoHilite of button "qsMethodCode" to false
-   qsCap "qsMethodCodeD", "Resumable. Needs the app.", "56,148,230,166"
-   qsButton "qsMethodTor", "Private - Tor", "236,126,400,148"
+   qsCap "qsMethodCodeD", "Resumable. Needs the app.", "59,170,224,186"
+   qsButton "qsMethodTor", "Private - Tor", "230,148,410,168"
    set the style of button "qsMethodTor" to "radioButton"
    set the autoHilite of button "qsMethodTor" to false
-   qsCap "qsMethodTorD", "Hides both IP addresses.", "256,148,432,166"
-   qsButton "qsMethodWeb", "Web link", "432,126,600,148"
+   qsCap "qsMethodTorD", "Hides both IP addresses.", "249,170,414,186"
+   qsButton "qsMethodWeb", "Web link", "420,148,600,168"
    set the style of button "qsMethodWeb" to "radioButton"
    set the autoHilite of button "qsMethodWeb" to false
-   qsCap "qsMethodWebD", "Any browser. Not encrypted.", "440,148,604,166"
-   -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
-   qsLabel "qsSendPassCap", "Encrypt (optional):", "36,180,176,198", 11
-   qsField "qsSendPass", "184,176,604,202", false
-   -- the drag zone (drag delivery is OS/source-dependent - it can be unreliable from a
-   -- file-manager window, so the two explicit picker buttons below are the always-works
-   -- path, and a click on the zone itself opens the file picker as a shortcut)
-   qsField "qsDrop", "36,214,604,296", true
-   set the opaque of field "qsDrop" to true
-   set the backgroundColor of field "qsDrop" to "245,247,250"
-   set the borderWidth of field "qsDrop" to 1
-   set the threeD of field "qsDrop" to false
-   set the borderColor of field "qsDrop" to "175,185,200"
+   qsCap "qsMethodWebD", "Any browser. Not encrypted.", "439,170,600,186"
+   -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs
+   -- cryptoXT), plus a Suggest button that mints a strong one from the CSPRNG
+   qsLabel "qsSendPassCap", "Encrypt (optional):", "40,193,164,215", 10
+   qsField "qsSendPass", "172,194,516,222", false
+   qsButton "qsPassSuggest", "Suggest", "524,194,600,222"
+   -- the drag zone: the hero action, so it gets the most visual weight - a dashed
+   -- rounded target (qsDropBg) with a transparent click/drop overlay field on top
+   -- (qsDrop keeps the name every existing handler targets). Drag delivery is
+   -- OS/source-dependent - it can be unreliable from a file-manager window - so
+   -- the two explicit picker buttons below are the always-works path, and a click
+   -- on the zone itself opens the file picker as a shortcut.
+   qsGfx "qsDropBg", "40,234,600,330"
+   set the roundRadius of graphic "qsDropBg" to 12
+   set the filled of graphic "qsDropBg" to true
+   set the lineSize of graphic "qsDropBg" to 2
+   set the dashes of graphic "qsDropBg" to "6,4"   -- VERIFY on-engine: dashed outline
+   qsDropPaint "idle"
+   qsField "qsDrop", "40,234,600,330", true
+   set the opaque of field "qsDrop" to false
+   set the borderWidth of field "qsDrop" to 0
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
-   set the foregroundColor of field "qsDrop" to "90,96,105"
-   set the text of field "qsDrop" to (return & "Drag a file or folder here" & return & "(from your desktop or a file window) - or use the buttons below.")
+   set the foregroundColor of field "qsDrop" to kClrInk
+   set the margins of field "qsDrop" to "8,30,8,8"   -- top margin centers the 2 lines
+   -- the zone's two-line message is method-aware, painted by qsDropHint (via the
+   -- qsSyncMethod call below), so a drop always says what it is about to do
    -- always-reliable pickers: separate file / folder choosers open the native dialog
    -- directly (no guessing), so sharing a FOLDER is one obvious click even when a drag
    -- will not register.
-   qsButton "qsChooseFile", "Choose a file...", "36,302,316,328"
-   qsButton "qsChooseFolder", "Choose a folder...", "324,302,604,328"
+   qsButton "qsChooseFile", "Choose a file...", "40,340,314,368"
+   qsButton "qsChooseFolder", "Choose a folder...", "326,340,600,368"
    -- the resulting code / link, with a Copy button, then a plain-English status line
-   qsHdr "qsCodeCap", "Share this with your friend", "36,330,400,352"
-   qsField "qsCode", "36,354,516,388", true
-   set the textFont of field "qsCode" to "Courier"
+   qsLabel "qsCodeCap", "Share this with your friend", "40,382,440,404", 12
+   set the textStyle of field "qsCodeCap" to "bold"
+   qsField "qsCode", "40,410,512,446", true
+   set the textFont of field "qsCode" to qsMonoFont()
    set the textSize of field "qsCode" to 12
-   set the opaque of field "qsCode" to true
-   set the backgroundColor of field "qsCode" to "255,250,225"
-   qsButton "qsCopy", "Copy", "524,354,604,388"
-   qsLabel "qsSharing", "", "36,394,604,432", 10
-   set the textStyle of field "qsSharing" to "bold"
-   -- MORE OPTIONS: the two advanced toggles (web download of a Tor file; LAN editor)
-   qsCap "qsMoreCap", "MORE OPTIONS", "36,442,604,458"
-   qsButton "qsWebCheck", "Also serve a Tor file as a web download", "36,460,440,480"
+   set the margins of field "qsCode" to "8,8,8,8"
+   set the backgroundColor of field "qsCode" to kClrCodeBg
+   set the borderColor of field "qsCode" to kClrCodeLine
+   -- a long locked/Tor code never wraps into an unreadable clipped block: it shows
+   -- one clean line and Copy (or a click) always carries the FULL text
+   set the dontWrap of field "qsCode" to true
+   qsButton "qsCopy", "Copy", "520,410,600,446"
+   qsLabel "qsSharing", "", "40,452,600,506", 10
+   set the foregroundColor of field "qsSharing" to kClrInkSoft
+   put "Nothing is shared yet - pick a method above, then drop a file." into field "qsSharing"
+   -- MORE OPTIONS: a quiet labelled divider; qsSyncMethod reveals + lays out only
+   -- the advanced row(s) that apply to the chosen method (Share code shows none)
+   qsCap "qsMoreCap", "MORE OPTIONS", "40,510,132,528"
+   set the textSize of field "qsMoreCap" to 9
+   set the textStyle of field "qsMoreCap" to "bold"
+   qsGfx "qsMoreLine", "138,520,600,521"
+   set the style of graphic "qsMoreLine" to "rectangle"
+   set the filled of graphic "qsMoreLine" to true
+   set the backgroundColor of graphic "qsMoreLine" to kClrCardLine
+   set the lineSize of graphic "qsMoreLine" to 0
+   qsButton "qsWebCheck", "Also offer a Tor Browser download link", "40,530,520,550"
    set the style of button "qsWebCheck" to "checkbox"
    set the autoHilite of button "qsWebCheck" to false
-   qsField "qsWebLink", "36,484,516,508", true
-   set the textFont of field "qsWebLink" to "Courier"
-   set the textSize of field "qsWebLink" to 9
-   set the opaque of field "qsWebLink" to true
-   set the backgroundColor of field "qsWebLink" to "255,250,225"
-   qsButton "qsWebCopy", "Copy", "524,484,604,508"
-   qsButton "qsEditToggle", "Enable web editing", "36,514,320,534"
+   qsField "qsWebLink", "40,558,512,584", true
+   set the textFont of field "qsWebLink" to qsMonoFont()
+   set the textSize of field "qsWebLink" to 10
+   set the backgroundColor of field "qsWebLink" to kClrCodeBg
+   set the borderColor of field "qsWebLink" to kClrCodeLine
+   set the dontWrap of field "qsWebLink" to true
+   qsButton "qsWebCopy", "Copy", "520,556,600,584"
+   qsButton "qsEditToggle", "Enable web editing", "40,560,304,582"
    set the style of button "qsEditToggle" to "checkbox"
    set the autoHilite of button "qsEditToggle" to false
-   qsLabel "qsEditPassCap", "Edit password:", "36,540,150,558", 10
-   qsField "qsEditPass", "154,536,430,560", false
-   qsLabel "qsEditHint", "LAN only", "438,540,604,558", 9
-   set the foregroundColor of field "qsEditHint" to "150,110,40"
+   qsLabel "qsEditPassCap", "Password:", "310,557,376,583", 10
+   qsField "qsEditPass", "380,558,520,584", false
+   qsLabel "qsEditHint", "LAN only", "526,557,600,583", 9
+   set the foregroundColor of field "qsEditHint" to kClrWarn
    set the textAlign of field "qsEditHint" to "right"
 
    -- =============== RIGHT: RECEIVE ===============
-   qsPanel "qsRecvPanel", "640,62,1080,224"
-   qsHdr "qsRecvSec", "2     Receive a file", "656,72,940,96"
-   qsLabel "qsRecvCap", "Paste a code a friend sent you, then Download.", "656,104,1064,122", 11
-   qsField "qsRecvCode", "656,126,948,158", false
-   set the textFont of field "qsRecvCode" to "Courier"
+   qsPanel "qsRecvPanel", "640,72,1080,244"
+   qsBadge "qsStep2", "656,90,682,116", "2"
+   qsHdr "qsRecvSec", "Receive a file", "692,86,940,114"
+   qsLabel "qsRecvCap", "Paste the code your friend sent you:", "656,122,1064,142", 10
+   set the foregroundColor of field "qsRecvCap" to kClrInkSoft
+   qsField "qsRecvCode", "656,146,948,180", false
+   set the textFont of field "qsRecvCode" to qsMonoFont()
    set the textSize of field "qsRecvCode" to 11
-   qsButton "qsGet", "Download", "956,126,1064,158"
-   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "656,170,1064,188", 10
-   qsField "qsRecvPass", "656,190,1064,216", false
+   set the margins of field "qsRecvCode" to "8,8,8,8"
+   set the dontWrap of field "qsRecvCode" to true
+   qsButton "qsGet", "Download", "956,146,1064,180"
+   -- Enter in either Receive field also clicks Download (returnInField above); the
+   -- default ring marks Download as the primary action of the whole right column
+   set the default of button "qsGet" to true
+   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "656,186,1064,206", 10
+   set the foregroundColor of field "qsRecvPassCap" to kClrInkSoft
+   qsField "qsRecvPass", "656,212,1064,236", false
    -- =============== RIGHT: TRANSFERS & SHARES ===============
    -- One actionable list of everything live: downloads, code seeds, and Tor/web pages.
    -- Click a row to select it, then Copy code (re-fetch that share's code) or Stop it.
    -- Multiple code shares run at once - each is its own selectable, stoppable row.
-   qsPanel "qsXferPanel", "640,234,1080,470"
-   qsHdr "qsXferSec", "Transfers & shares", "656,244,940,268"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "656,274,1064,290", 9
+   qsPanel "qsXferPanel", "640,256,1080,474"
+   qsHdr "qsXferSec", "Transfers & shares", "656,268,940,292"
+   -- the head's default left margin (8) lands within 1px of the list body's text
+   -- origin (1px border + 6px margin), so the columns line up without magic
+   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "655,298,1064,316", 9
    set the tabStops of field "qsXferHead" to "230,340"
-   set the textFont of field "qsXferHead" to "Courier"
-   set the textSize of field "qsXferHead" to 9
-   set the foregroundColor of field "qsXferHead" to "138,144,154"
-   qsList "qsXfers", "656,294,1064,430", false
+   set the textFont of field "qsXferHead" to qsMonoFont()
+   set the foregroundColor of field "qsXferHead" to kClrInkMute
+   qsList "qsXfers", "656,318,1064,404", false
    set the tabStops of field "qsXfers" to "230,340"
-   set the textFont of field "qsXfers" to "Courier"
+   set the textFont of field "qsXfers" to qsMonoFont()
    set the textSize of field "qsXfers" to 10
    put empty into sLastXferRows   -- freshly (re)built list: force the next refresh to paint
+   -- the live detail strip: peers/seeds/rates/ratio for the SELECTED row, fed
+   -- by qsRefreshXfers from status data the repaint loop already fetches
+   qsLabel "qsXferInfo", "", "656,408,1064,430", 9
+   set the textFont of field "qsXferInfo" to qsMonoFont()
+   set the foregroundColor of field "qsXferInfo" to kClrInkSoft
+   put "Click a row above for live details." into field "qsXferInfo"
    -- per-row management: pick a row, then act on THAT share/transfer
-   qsCap "qsXferHint", "Select a row to manage it:", "656,438,876,458"
-   qsButton "qsXferCopy", "Copy code", "884,435,976,461"
-   qsButton "qsXferStop", "Stop", "984,435,1064,461"
+   qsCap "qsXferHint", "Selected:", "656,438,728,460"
+   qsButton "qsXferCopy", "Copy code", "734,434,838,462"
+   qsButton "qsXferStop", "Stop", "846,434,918,462"
+   qsButton "qsXferFolder", "Open folder", "926,434,1064,462"
    -- =============== RIGHT: ACTIVITY ===============
-   qsPanel "qsActPanel", "640,480,1080,614"
-   qsHdr "qsActSec", "Activity", "656,490,940,512"
-   qsList "qsLog", "656,516,1064,602", true
+   qsPanel "qsActPanel", "640,486,1080,596"
+   qsHdr "qsActSec", "Activity", "656,494,940,518"
+   qsList "qsLog", "656,524,1064,584", true
    set the textSize of field "qsLog" to 9
-   -- a slim status line along the very bottom, full width
-   qsLabel "qsStatus", "", "20,618,1080,636", 10
-   set the foregroundColor of field "qsStatus" to "90,96,105"
+   set the foregroundColor of field "qsLog" to kClrInkSoft
+   -- slim status strip along the very bottom: connection state left, live rates right
+   qsLabel "qsStatus", "", "20,604,700,634", 10
+   set the foregroundColor of field "qsStatus" to kClrInkSoft
+   qsLabel "qsRates", "", "700,604,1080,634", 10
+   set the foregroundColor of field "qsRates" to kClrInkSoft
+   set the textAlign of field "qsRates" to "right"
    qsAddTips
    qsOnionPill
    qsSyncMethod
@@ -473,10 +652,17 @@ command qsClearGeneratedUI
          delete button tI of this card
       end if
    end repeat
+   -- the chrome layer (cards, chips, the drop target) is graphics since ui-2027-02
+   repeat with tI = the number of graphics of this card down to 1
+      if the short name of graphic tI of this card begins with "qs" then
+         delete graphic tI of this card
+      end if
+   end repeat
    unlock screen
 end qsClearGeneratedUI
 
 command qsLabel pName, pText, pRect, pSize
+   local tTop
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -485,41 +671,104 @@ command qsLabel pName, pText, pRect, pSize
    set the lockText of field pName to true
    set the borderWidth of field pName to 0
    set the opaque of field pName to false
+   set the threeD of field pName to false
    set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kClrInk
    put pText into field pName
+   -- OXT pass 1 taught us never to GUESS font metrics: hand-sized label rects
+   -- (and a single-number `set the margins to 0`, which OXT ignored) clipped the
+   -- bottom of every line on Windows. Ask the engine instead: grow the field to
+   -- its own formattedHeight (top edge pinned), so a label can never be shorter
+   -- than the text it holds, whatever the platform's line height and margins.
+   -- Empty labels (qsSharing, the status strip) keep their given rect: they
+   -- receive text later and must hold a fixed multi-line/strip height.
+   if pText is not empty then
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the height of field pName to the formattedHeight of field pName
+      set the top of field pName to tTop
+   end if
 end qsLabel
 
-command qsSection pName, pText, pRect
-   qsLabel pName, ("  " & pText), pRect, 11
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to "210,216,226"
-   set the foregroundColor of field pName to "30,40,60"
-   set the textStyle of field pName to "bold"
-end qsSection
+-- Create-or-reuse a named graphic: the chrome layer (cards, the Tor chip, the
+-- drop target, dividers). Created BEFORE the controls that sit on it, so it stays
+-- behind them in z-order. roundRect + antialiased by default; callers restyle.
+command qsGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end qsGfx
 
--- A card-background panel: an opaque, bordered, locked field placed BEHIND a group of
--- controls (created before them, so it sits below in z-order). It just groups a step
--- visually; clicks on it fall through to `default: pass mouseUp`.
+-- A dashboard card: a rounded, hairline-bordered, softly shadowed panel placed
+-- BEHIND a group of controls. It only groups a step visually; clicks on it fall
+-- through to `default: pass mouseUp`.
 command qsPanel pName, pRect
-   qsField pName, pRect, true
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to "255,255,255"
-   set the borderWidth of field pName to 1
-   set the threeD of field pName to false
-   set the borderColor of field pName to "214,220,228"
+   qsGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kClrCard
+   set the lineSize of graphic pName to 1
+   -- a graphic strokes its outline in the foregroundColor; borderColor is set too
+   -- so whichever the engine honours, the hairline lands (VERIFY on the OXT pass)
+   set the foregroundColor of graphic pName to kClrCardLine
+   set the borderColor of graphic pName to kClrCardLine
+   qsSoftShadow pName
 end qsPanel
 
--- A bold, dark section header sitting on a panel (e.g. "1     Send a file").
+-- A soft drop shadow under a card. Graphic effects are an LC-9-era feature, so
+-- this is a PURE enhancement: an engine without them just skips it (the try)
+-- and the hairline border still separates the card from the page.
+command qsSoftShadow pName
+   local tShadow, tErr
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end qsSoftShadow
+
+-- A small filled circle holding a step number ("1" Send, "2" Receive), so the two
+-- entry points pop without shouting: accent disc + centered white digit on top.
+command qsBadge pName, pRect, pDigit
+   local tL, tT, tR, tB
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 2 of pRect into tT
+   put item 3 of pRect into tR
+   put item 4 of pRect into tB
+   qsGfx (pName & "Bg"), pRect
+   set the roundRadius of graphic (pName & "Bg") to (tB - tT)   -- radius caps = circle
+   set the filled of graphic (pName & "Bg") to true
+   set the backgroundColor of graphic (pName & "Bg") to kClrAccent
+   set the lineSize of graphic (pName & "Bg") to 0
+   -- the digit field auto-sizes in qsLabel; center it on the disc by MEASURED
+   -- height (pass 1 clipped the digit clean off by trusting guessed metrics)
+   qsLabel pName, pDigit, pRect, 11
+   set the textStyle of field pName to "bold"
+   set the foregroundColor of field pName to kClrBandText
+   set the textAlign of field pName to "center"
+   set the top of field pName to (tT + (((tB - tT) - the height of field pName) div 2))
+end qsBadge
+
+-- A bold, dark section header sitting on a card (e.g. "Send a file or folder").
 command qsHdr pName, pText, pRect
    qsLabel pName, pText, pRect, 14
-   set the foregroundColor of field pName to "28,36,48"
    set the textStyle of field pName to "bold"
 end qsHdr
 
--- A small, muted caption (radio descriptions, the MORE OPTIONS divider).
+-- A small, muted caption (radio descriptions, hints, the MORE OPTIONS divider).
 command qsCap pName, pText, pRect
    qsLabel pName, pText, pRect, 10
-   set the foregroundColor of field pName to "138,144,154"
+   set the foregroundColor of field pName to kClrInkMute
 end qsCap
 
 command qsField pName, pRect, pLocked
@@ -530,6 +779,15 @@ command qsField pName, pRect, pLocked
    set the rect of field pName to pRect
    set the lockText of field pName to pLocked
    set the traversalOn of field pName to (not pLocked)
+   -- flat "modern input" chrome instead of the engine's sunken-3D default
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kClrFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kClrCard
+   -- 4-item margins form ONLY: OXT ignored the single-number form on pass 1
+   set the margins of field pName to "6,6,6,6"
+   set the textSize of field pName to 11
 end qsField
 
 command qsButton pName, pLabel, pRect
@@ -542,13 +800,9 @@ command qsButton pName, pLabel, pRect
 end qsButton
 
 command qsList pName, pRect, pIsLog
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
+   qsField pName, pRect, true
    set the vScrollbar of field pName to true
+   set the borderColor of field pName to kClrCardLine
    if pIsLog then
       set the listBehavior of field pName to false
    else
@@ -556,29 +810,122 @@ command qsList pName, pRect, pIsLog
    end if
 end qsList
 
+-- The platform's own terminal face for codes / links / the transfers table, so
+-- the monospace surfaces look native instead of typewriter-Courier. If a face is
+-- missing the engine substitutes its default - a soft, safe failure.
+function qsMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end qsMonoFont
+
+-- Paint the drop target for its three states - "idle", "hover" (pointer over it)
+-- and "hot" (an OS drag is over the window) - in ONE place, so the drag handlers,
+-- the hover handlers and the build cannot disagree about the colors.
+command qsDropPaint pMode
+   if there is no graphic "qsDropBg" then
+      exit qsDropPaint
+   end if
+   if pMode is "hot" then
+      set the backgroundColor of graphic "qsDropBg" to kClrDropHot
+      set the foregroundColor of graphic "qsDropBg" to kClrAccent
+      set the borderColor of graphic "qsDropBg" to kClrAccent
+   else if pMode is "hover" then
+      set the backgroundColor of graphic "qsDropBg" to kClrDropHot
+      set the foregroundColor of graphic "qsDropBg" to kClrDropLine
+      set the borderColor of graphic "qsDropBg" to kClrDropLine
+   else
+      set the backgroundColor of graphic "qsDropBg" to kClrDropBg
+      set the foregroundColor of graphic "qsDropBg" to kClrDropLine
+      set the borderColor of graphic "qsDropBg" to kClrDropLine
+   end if
+end qsDropPaint
+
+-- Write the drop zone's two lines (headline + muted detail). A wholesale
+-- `set the text` resets chunk styling, so line 2's smaller/muted look is
+-- re-applied here every time - the ONE place drop-zone text is ever written.
+command qsDropText pLine1, pLine2
+   if there is no field "qsDrop" then
+      exit qsDropText
+   end if
+   set the text of field "qsDrop" to (pLine1 & return & pLine2)
+   set the textSize of line 2 of field "qsDrop" to 10
+   set the foregroundColor of line 2 of field "qsDrop" to kClrInkMute
+end qsDropText
+
+-- The method-aware idle hint: the hero control narrates what a drop WILL do
+-- under the currently selected method. Repainted by qsSyncMethod on every
+-- method change, and by a short timer after a share preview (qsShareFile).
+command qsDropHint
+   if sTorSend is "true" then
+      qsDropText "Drag & drop to send privately over Tor", \
+         "both IP addresses stay hidden - or click to browse (the buttons below always work)"
+   else if sWebShare is "true" then
+      qsDropText "Drag & drop to share as a web link", \
+         "opens in any browser, no app needed - or click to browse (the buttons below always work)"
+   else
+      qsDropText "Drag & drop a file or folder here", \
+         "you get a short code to send - or click to browse (the buttons below always work)"
+   end if
+end qsDropHint
+
+-- Flash a Copy button's label to "Copied!" for a beat, then restore it - the
+-- feedback lands AT the pointer instead of only in the far-away Activity log.
+-- The original label rides a custom property so any button can flash.
+command qsCopyFlash pBtn
+   if there is no button pBtn then
+      exit qsCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("qsCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end qsCopyFlash
+
+command qsCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit qsCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end qsCopyFlashReset
+
 command qsAddTips
    set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
+   set the tooltip of button "qsPassSuggest" to "Fill in a strong random passphrase (16 characters, no confusable letters). Send it to your friend separately from the code - a phone call or a different app is ideal."
    set the tooltip of field "qsDrop" to "Drag a file or folder here from your desktop or a file window. If a drag will not register (it can be unreliable from a file window), use the Choose buttons below - they always work."
    set the tooltip of button "qsChooseFile" to "Open a dialog to pick a file to share, using the method selected above. Always works, even when a drag will not register."
    set the tooltip of button "qsChooseFolder" to "Open a dialog to pick a FOLDER to share. Over a web link or Tor it becomes a browsable page; as a share code the whole folder is sent. Always works, even when a drag will not register."
-   set the tooltip of field "qsCode" to "Your file's share code. Click Copy and send it to your friend."
+   set the tooltip of field "qsCode" to "Your file's share code. Click the code (or the Copy button) to copy it, then send it to your friend."
    set the tooltip of button "qsCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your newQuickShare folder."
    set the tooltip of field "qsXfers" to "Everything live: downloads, the files you are sharing by code (each is its own row - you can run many at once), and any Tor or web page. Click a row to select it, then Copy code or Stop."
-   set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again."
+   set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again. For a download row this copies a magnet link (works in any torrent client)."
    set the tooltip of button "qsXferStop" to "Stop the selected item: stop sharing a file (peers can no longer download it), or cancel a download in progress. Your original files are never deleted."
+   set the tooltip of button "qsXferFolder" to "Open your newQuickShare download folder in the file manager - every received file lands there."
+   set the tooltip of field "qsXferInfo" to "Live details for the selected row: connected peers and seeds, transfer rates, upload ratio, and bytes done."
    set the tooltip of button "qsMethodCode" to "The classic way: a normal peer-to-peer BitTorrent share. Give your friend the code; the transfer resumes if interrupted. Your IP is visible to peers."
    set the tooltip of button "qsMethodTor" to "Send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER to serve it as a browsable Tor web page - open the link in Tor Browser."
    set the tooltip of button "qsMethodWeb" to "Serve the file or folder over the plain web: the recipient just opens a link in any browser, no app needed. The router port is opened automatically (UPnP) and the link carries a secret token. Fast, but your IP is visible and the download is not encrypted - use Tor for privacy."
    set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
-   set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
+   set the tooltip of field "qsWebLink" to "The browser download link for this share. Click the link (or Copy) to copy it; open it in the recipient's browser."
    set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
    set the tooltip of button "qsEditToggle" to "Make the web-shared FOLDER editable from a browser - but ONLY from a device on your own local network (never over the internet or Tor). Set an edit password first. Visit the shared link with /_edit added on the end to open the editor. Needs cryptoXT (org.openxtalk.library.sodium)."
    set the tooltip of field "qsEditPass" to "A password you choose to unlock the live editor. Anyone on your LAN who opens the /_edit page must type it before they can change files. Needs cryptoXT installed."
    set the tooltip of field "qsEditHint" to "The live editor only answers devices on your local network; internet and Tor visitors can view the site but never reach the editor."
-   set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work."
+   set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work. If it says 'not running', start Tor (or Tor Browser) on this computer - control port 9051 or 9151 - and it connects by itself."
+   -- the radio captions are click-through to the same choice, so they share the
+   -- radio's tooltip (one source of truth, no drift)
+   set the tooltip of field "qsMethodCodeD" to the tooltip of button "qsMethodCode"
+   set the tooltip of field "qsMethodTorD" to the tooltip of button "qsMethodTor"
+   set the tooltip of field "qsMethodWebD" to the tooltip of button "qsMethodWeb"
 end qsAddTips
 
 -- ---- session + loops ---------------------------------------------------------
@@ -641,6 +988,11 @@ command qsStart
    -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
    -- without this the encrypt row would sit hidden + falsely captioned "install cryptoXT".
    qsSyncMethod
+   -- drop keyboard focus: without this the engine focuses the first traversal
+   -- control (the Share code radio) and draws a focus box around it at open
+   focus on nothing
+   -- a share code may already be on the clipboard (copy in chat -> open the app)
+   qsClipboardSuggest
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -672,6 +1024,8 @@ command qsStop
    put empty into sShareCodeByHandle
    put empty into sXferRow
    put empty into sXferSel
+   put empty into sStallSince
+   put empty into sStallWarned
 end qsStop
 
 command qsPollOnce
@@ -703,7 +1057,7 @@ end qsDashOnce
 -- first and seed THAT (a neutral name, ciphertext bytes); the code then carries
 -- the hash plus the real filename so the receiver can name + unlock it.
 command qsShareFile pPath
-   local tData, tH, tHash, tParent, tName, tPass
+   local tData, tH, tHash, tParent, tName, tPass, tSz
    local tEncPath, tEncParent, tErr, tSalt, tKey, tVerifier
    if sSession is 0 then
       qsLog "No session - reopen the stack."
@@ -728,6 +1082,26 @@ command qsShareFile pPath
       put "/" into tParent
    end if
    put qsTrim(field "qsSendPass") into tPass
+   -- Narrate the pick in the drop zone AT ONCE: packaging/encrypting a big file
+   -- blocks the single engine thread with no other feedback. Text-only, and the
+   -- zone falls back to its method hint on a short timer, so no share branch
+   -- (with its many early exits) has to remember to restore it.
+   if there is a folder pPath then
+      qsDropText ("Sharing the folder: " & tName), \
+         "setting up - a big folder can take a moment"
+   else
+      put qsFileSize(pPath) into tSz
+      if tSz is a number and tSz > 0 then
+         qsDropText ("Sharing: " & tName & " (" & qsBytes(tSz) & ")"), \
+            "setting up - a big file can take a moment"
+      else
+         qsDropText ("Sharing: " & tName), "setting up..."
+      end if
+   end if
+   send "qsDropHint" to me in 6000 milliseconds
+   -- yield once so the preview can paint before the blocking work (VERIFY
+   -- on-engine that a zero wait flushes the screen; harmless if it does not)
+   wait 0 milliseconds
    -- starting any NON-web share replaces a running clearweb server (so switching
    -- transports does not leave its listener + port mapping orphaned)
    if sCwActive is "true" and sWebShare is not "true" then
@@ -867,8 +1241,109 @@ command qsCopyCode
       exit qsCopyCode
    end if
    set the clipboardData["text"] to field "qsCode"
+   qsCopyFlash "qsCopy"
    qsLog "Code copied. Send it to your friend by email, chat, anywhere."
 end qsCopyCode
+
+-- Fill the Encrypt field with a strong, phone-typeable passphrase: 4 groups of
+-- 4 from an unambiguous alphabet (no 0/O, 1/l/i, or 8/B look-alikes), bytes
+-- from libsodium's CSPRNG. ~78 bits before the tiny mod-30 bias - far beyond
+-- what an offline Argon2id guess could ever chew through for a file share.
+-- Hidden alongside the passphrase field when encryption cannot work.
+command qsSuggestPass
+   local tBytes, tOut, tI, tN
+   if not sCanEncrypt then
+      qsLog "Passphrase suggestions need cryptoXT (org.openxtalk.library.sodium)."
+      exit qsSuggestPass
+   end if
+   put sxRandomBytes(16) into tBytes
+   put "" into tOut
+   repeat with tI = 1 to 16
+      put byteToNum(byte tI of tBytes) into tN
+      put char ((tN mod 30) + 1) of "abcdefghjkmnpqrstuvwxyz2345679" after tOut
+      if tI mod 4 is 0 and tI < 16 then
+         put "-" after tOut
+      end if
+   end repeat
+   put tOut into field "qsSendPass"
+   qsLog "Suggested a strong passphrase. Tell it to your friend SEPARATELY from the code - a call or a different app is ideal."
+end qsSuggestPass
+
+-- ---- clipboard auto-detect (the copy -> open -> Enter receive flow) ----------
+-- Does this text LOOK like something the Receive box accepts? A bare 40/64-hex
+-- info-hash, a locked (BTXQS1:) or Tor (BTXTOR1:) code, or a magnet link.
+function qsLooksLikeCode pText
+   local tHex, tI
+   if pText begins with kCodePrefix or pText begins with kTorCodePrefix then
+      return true
+   end if
+   if pText begins with "magnet:" then
+      return true
+   end if
+   if the number of chars of pText is not 40 and the number of chars of pText is not 64 then
+      return false
+   end if
+   put toLower(pText) into tHex
+   repeat with tI = 1 to the number of chars of tHex
+      if char tI of tHex is not in "0123456789abcdef" then
+         return false
+      end if
+   end repeat
+   return true
+end qsLooksLikeCode
+
+-- Is this a code WE minted (and is still live)? Offering the user a download
+-- of their own outbound share - fresh on the clipboard from the Copy button -
+-- would be nonsense, so those never pre-fill the Receive box.
+function qsIsOwnCode pCode
+   local tK
+   if pCode is not empty and pCode is sShareCode then
+      return true
+   end if
+   repeat for each key tK in sShareCodeByHandle
+      if sShareCodeByHandle[tK] is pCode then
+         return true
+      end if
+   end repeat
+   if sActiveShare["code"] is pCode then
+      return true
+   end if
+   return false
+end qsIsOwnCode
+
+-- If the clipboard holds something code-shaped and the Receive box is empty,
+-- pre-fill it so receiving collapses to copy -> open -> Enter. Runs at start
+-- and whenever the window comes back to the front (resumeStack). Polite by
+-- construction: never overwrites user input, offers each clipboard value only
+-- once, and ignores our own outbound codes. The try guards the clipboard read
+-- (it can fail transiently when another app holds the clipboard on Windows).
+command qsClipboardSuggest
+   local tClip, tErr
+   if there is no field "qsRecvCode" then
+      exit qsClipboardSuggest
+   end if
+   put "" into tClip
+   try
+      put qsTrim(the clipboardData["text"]) into tClip
+   catch tErr
+      exit qsClipboardSuggest
+   end try
+   if tClip is empty or tClip is sClipSuggested then
+      exit qsClipboardSuggest
+   end if
+   put tClip into sClipSuggested   -- one offer per value, even if it is declined
+   if not qsLooksLikeCode(tClip) then
+      exit qsClipboardSuggest
+   end if
+   if qsIsOwnCode(tClip) then
+      exit qsClipboardSuggest
+   end if
+   if qsTrim(field "qsRecvCode") is not empty then
+      exit qsClipboardSuggest
+   end if
+   put tClip into field "qsRecvCode"
+   qsLog "Found a share code on your clipboard - check it, then click Download (or press Enter)."
+end qsClipboardSuggest
 
 -- ---- receiving: a code becomes a download ------------------------------------
 -- A plain code is a magnet or a bare info-hash (the original flow). A code that
@@ -972,9 +1447,12 @@ end qsGetFile
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
    local tIH, tDisp, tDir, tK, tE, tProg, tRemain, tSelLine, tPrevLine
+   local tNow, tPeers, tStalled, tClr, tLive, tSelStat, tId, tSelType, tSelKey
+   local tInfo, tRatio, tSavedID
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
    end if
+   put the milliseconds into tNow   -- one clock read per pass (the perf playbook)
    -- snapshot the user's current selection BY IDENTITY before we rebuild the map, so
    -- the highlight follows the same transfer even as rows reorder or the list is
    -- retyped wholesale each pass. Reads the live listBehavior hilite (set the instant
@@ -1024,9 +1502,58 @@ command qsRefreshXfers
             put tProg && qsRateShort(tS["uploadRate"]) into tProg
          end if
       end if
+      -- stall coaching: a receive-side row at ZERO peers for 45s flips its
+      -- progress cell to plain English and logs the why ONCE per torrent (a
+      -- seed with no peers is just idle, so "sending" rows are exempt)
+      put false into tStalled
+      put tS["numPeers"] into tPeers
+      put 1 into tLive[tH]
+      if not (tDir contains "sending") then
+         if tPeers is a number and tPeers is 0 then
+            if sStallSince[tH] is empty then
+               put tNow into sStallSince[tH]
+            else if (tNow - sStallSince[tH]) > 45000 then
+               put true into tStalled
+               put "waiting for your friend..." into tProg
+               if sStallWarned[tH] is not "true" then
+                  put "true" into sStallWarned[tH]
+                  qsLog "No peers for" && quote & tDisp & quote && "yet - the sender must keep their newQuickShare window open. The transfer starts by itself once they are online."
+               end if
+            end if
+         else if sStallSince[tH] is not empty then
+            delete variable sStallSince[tH]
+         end if
+      end if
+      -- the row's state color (applied after the retype, chunk-level)
+      if tS["error"] is not empty then
+         put kClrRowErr into tClr[tLineNum]
+      else if tStalled then
+         put kClrInkMute into tClr[tLineNum]
+      else if tDir contains "sending" then
+         put kClrRowSend into tClr[tLineNum]
+      else if tDir contains "receiving" then
+         put kClrAccent into tClr[tLineNum]
+      else
+         put kClrInkMute into tClr[tLineNum]
+      end if
+      -- keep the SELECTED torrent's full status for the detail strip below
+      -- (no extra FFI call: this pass already fetched it)
+      if sXferSel is ("torrent|" & tH) then
+         put tS into tSelStat
+      end if
       put qsTrunc(tDisp, 26) & tab & tDir & tab & tProg & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
+   end repeat
+   -- prune stall bookkeeping for torrents that no longer exist (the keys list
+   -- is snapshotted once, so deleting inside the loop is safe)
+   repeat for each line tK in the keys of sStallSince
+      if tLive[tK] is empty then
+         delete variable sStallSince[tK]
+         if sStallWarned[tK] is not empty then
+            delete variable sStallWarned[tK]
+         end if
+      end if
    end repeat
    -- append anonymous (Tor) transfers; they have NO torrent handle, so the torrent
    -- loop above never sees them. Same "name TAB dir TAB bar" row format.
@@ -1040,13 +1567,21 @@ command qsRefreshXfers
       end if
       if tE["state"] is "connecting" or tE["total"] is 0 then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "connecting..." & return after tRows
+         put kClrWarn into tClr[tLineNum]
       else if tE["state"] is "done" then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "done" & return after tRows
+         put kClrRowSend into tClr[tLineNum]
       else if tE["state"] is "error" then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "stopped" & return after tRows
+         put kClrRowErr into tClr[tLineNum]
       else
          put (the round of (tE["got"] / tE["total"] * 1000) / 10) into tPct
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & tPct & "%  " & qsBytes(tE["got"]) & return after tRows
+         if tE["dir"] is "receiving" then
+            put kClrAccent into tClr[tLineNum]
+         else
+            put kClrRowSend into tClr[tLineNum]
+         end if
       end if
    end repeat
    -- a folder web share has no torrent and no per-file transfer rows; show one status
@@ -1055,17 +1590,20 @@ command qsRefreshXfers
       add 1 to tLineNum
       put "torweb|" into sXferRow[tLineNum]        -- the one Tor folder web page
       put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
+      put kClrRowSend into tClr[tLineNum]
    end if
    if sCwActive is "true" then
       add 1 to tLineNum
       put "web|" into sXferRow[tLineNum]           -- the one clearweb share
       put qsTrunc(sCwName, 26) & tab & "direct web" & tab & "serving (open the link)" & return after tRows
+      put kClrRowSend into tClr[tLineNum]
    end if
    if the last char of tRows is return then
       delete the last char of tRows
    end if
    if tLineNum is 0 then
-      put "   Nothing yet. Drag a file to share, or paste a code to download." into tRows
+      put "Nothing yet. Drag a file to share, or paste a code to download." into tRows
+      put kClrInkMute into tClr[1]
    end if
    -- Only RETYPE the list when its content actually changed. A wholesale field relayout
    -- + redraw every poll is the biggest avoidable UI cost (the OXT perf playbook), and -
@@ -1100,16 +1638,77 @@ command qsRefreshXfers
             set the hilitedLines of field "qsXfers" to empty
          end if
       end if
+      -- per-row state colors, chunk-level. Only runs when the text was retyped:
+      -- chunk colors survive between repaints, so an idle list costs nothing.
+      repeat with tI = 1 to the number of lines of tRows
+         if tClr[tI] is not empty then
+            set the foregroundColor of line tI of field "qsXfers" to tClr[tI]
+         end if
+      end repeat
       unlock screen
+   end if
+   -- the live detail strip for the SELECTED row: novices get a sentence, power
+   -- users get peers/seeds/rates/ratio. Runs every pass (a selection can change
+   -- without the row text changing), but only retypes the field on a change.
+   put qsSelectedIdentity() into tId
+   put "Click a row above for live details." into tInfo
+   if tId is not empty then
+      put the itemDelimiter into tSavedID
+      set the itemDelimiter to "|"
+      put item 1 of tId into tSelType
+      put item 2 of tId into tSelKey
+      set the itemDelimiter to tSavedID
+      switch tSelType
+         case "torrent"
+            if tSelStat is not an array then
+               -- selection landed between passes; one small status call catches up
+               put btTorrentStatus(tSelKey) into tSelStat
+            end if
+            if tSelStat["name"] is empty then
+               put "Fetching details from the swarm..." into tInfo
+            else
+               put ("peers " & tSelStat["numPeers"] & " (" & tSelStat["numSeeds"] & " seeds)" \
+                  & "   down " & qsRateShort(tSelStat["downloadRate"]) \
+                  & "   up " & qsRateShort(tSelStat["uploadRate"])) into tInfo
+               if tSelStat["totalDone"] is a number and tSelStat["totalDone"] > 0 \
+                     and tSelStat["allTimeUpload"] is a number then
+                  put (the round of (tSelStat["allTimeUpload"] / tSelStat["totalDone"] * 10) / 10) into tRatio
+                  put tInfo & "   ratio " & tRatio into tInfo
+               end if
+               if tSelStat["totalWanted"] is a number and tSelStat["totalWanted"] > 0 then
+                  put tInfo & "   " & qsBytes(tSelStat["totalDone"]) & " of " \
+                     & qsBytes(tSelStat["totalWanted"]) into tInfo
+               end if
+            end if
+            break
+         case "onion"
+            put sOnionXfers[tSelKey] into tE
+            put ("via Tor - " & tE["dir"] & ", " & qsBytes(tE["got"]) & " of " & qsBytes(tE["total"])) into tInfo
+            break
+         case "torweb"
+            put "Serving a folder page over Tor - open the link in Tor Browser." into tInfo
+            break
+         case "web"
+            put ("Serving over the web: " & sCwLink) into tInfo
+            break
+         default
+            break
+      end switch
+   end if
+   if tInfo is not the text of field "qsXferInfo" then
+      set the text of field "qsXferInfo" to tInfo
    end if
    put btDhtState(sSession) into tD
    put tD["nodes"] into tNodes
    if tNodes is a number and tNodes > 0 then
-      put ("Connected - DHT: " & tNodes & " nodes") into tStat
+      put ("Connected to the peer network (" & tNodes & " DHT nodes)") into tStat
    else
-      put "Connecting to the network..." into tStat
+      put "Connecting to the peer network..." into tStat
    end if
-   put tStat & "        sending " & (qsBytes(tUp) & "/s") & "    receiving " & (qsBytes(tDown) & "/s") into field "qsStatus"
+   -- state on the left, live rates on the right (two fields, not spacing hacks)
+   set the text of field "qsStatus" to tStat
+   set the text of field "qsRates" to ("sending " & qsBytes(tUp) & "/s" & "      " & \
+      "receiving " & qsBytes(tDown) & "/s")
 end qsRefreshXfers
 
 -- ---- My Shares: per-row selection, copy, and stop --------------------------
@@ -1155,7 +1754,18 @@ command qsCopySelected
       case "torrent"
          put sShareCodeByHandle[tKey] into tCode
          if tCode is empty then
-            qsLog "That row is a download you are receiving, not a share you created - there is no code to copy."
+            -- a download row has no minted code, but its info-hash IS the share:
+            -- hand out a magnet link, which pastes into ANY torrent client (and
+            -- into this app's own Receive box) - an ex-dead-end, now useful
+            put btInfoHash(tKey) into tCode
+            if tCode is empty then
+               qsLog "No code for that row yet - it is still fetching its details from the swarm."
+               exit qsCopySelected
+            end if
+            put "magnet:?xt=urn:btih:" & tCode & "&tr=" & qsTracker() into tCode
+            set the clipboardData["text"] to tCode
+            qsCopyFlash "qsXferCopy"
+            qsLog "Copied that download as a magnet link - it works in any torrent client, or in this app's Receive box."
             exit qsCopySelected
          end if
          break
@@ -1181,8 +1791,30 @@ command qsCopySelected
       exit qsCopySelected
    end if
    set the clipboardData["text"] to tCode
+   qsCopyFlash "qsXferCopy"
    qsLog "Copied that share's code to the clipboard. Send it to your friend."
 end qsCopySelected
+
+-- Open the newQuickShare download folder in the OS file manager - the #1
+-- post-download question is "where did my file go?". `launch url` on a file:
+-- URL hands the folder to the default handler (VERIFY on-engine per platform);
+-- any failure still prints the exact path, so the button never dead-ends.
+command qsOpenSaveFolder
+   local tPath, tErr
+   put qsSaveFolder() into tPath
+   try
+      if char 1 of tPath is "/" then
+         launch url ("file://" & tPath)
+      else
+         launch url ("file:///" & tPath)   -- Windows drive paths lack the leading /
+      end if
+      if the result is not empty then
+         qsLog "Could not open the folder automatically. Your downloads are in: " & tPath
+      end if
+   catch tErr
+      qsLog "Could not open the folder automatically. Your downloads are in: " & tPath
+   end try
+end qsOpenSaveFolder
 
 command qsStopSelected
    local tId, tType, tKey, tSavedID
@@ -1437,20 +2069,6 @@ function qsRole pState
          return "waiting"
    end switch
 end qsRole
-
--- a 10-segment ASCII progress bar, e.g. [####------] 42%  (monospaced field)
-function qsBar pPct
-   local tFilled
-   put trunc(pPct / 10) into tFilled
-   if tFilled < 0 then
-      put 0 into tFilled
-   end if
-   if tFilled > 10 then
-      put 10 into tFilled
-   end if
-   return "[" & (char 1 to tFilled of "##########") & \
-      (char 1 to (10 - tFilled) of "----------") & "]" && pPct & "%"
-end qsBar
 
 function qsBytes pBytes
    local tUnits, tVal, tI
@@ -1765,7 +2383,7 @@ command qsOnionServicePublished pInfo
    else
       -- plaintext, app-only: a browser hitting the onion gets a 'web download off' page
       set the text of field "qsWebLink" to ""
-      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden, but the sender is not verified. Send the code above; keep this window open. (Tick 'Serve as web download' to also allow a Tor Browser link.)")
+      set the text of field "qsSharing" to ("Sharing " & quote & sActiveShare["name"] & quote & " over Tor (not encrypted) - both IPs hidden. Send the code above and keep this window open. Tick the checkbox below to also allow a Tor Browser link.")
       qsLog "Private Tor address published. Click Copy and send the code to your friend."
    end if
 end qsOnionServicePublished
@@ -1773,25 +2391,35 @@ end qsOnionServicePublished
 -- Repaint the live pill AND drive the toggle's disabled/hilite state. A mode the
 -- environment cannot honor never stays silently armed (sTorSend forced off).
 command qsOnionPill
-   local tState
+   local tState, tBg, tFg
    if there is no field "qsTorPill" then
       exit qsOnionPill
    end if
+   -- short chip texts only (the chip is 190px wide; overflow just clips): the
+   -- "how do I fix it" detail lives in the chip's tooltip and the Activity log
    if not sHasOnion then
       if sCanEncrypt then
-         put "Tor: no extension" into tState
+         put "Tor: extension not installed" into tState
       else
          put "Tor: needs cryptoXT" into tState
       end if
+      put kClrPillOff into tBg
+      put kClrPillOffText into tFg
       set the disabled of button "qsMethodTor" to true
    else if not oxIsControlAuthenticated() then
-      put "Tor: no daemon (start Tor on 127.0.0.1:9051 or 9151)" into tState
+      put "Tor: not running" into tState
+      put kClrPillOff into tBg
+      put kClrPillOffText into tFg
       set the disabled of button "qsMethodTor" to true
    else if not oxIsReady() then
       put ("Tor: connecting " & oxBootstrapProgress() & "%") into tState
+      put kClrPillWait into tBg
+      put kClrPillWaitText into tFg
       set the disabled of button "qsMethodTor" to false
    else
       put "Tor: ready" into tState
+      put kClrPillOk into tBg
+      put kClrPillOkText into tFg
       set the disabled of button "qsMethodTor" to false
    end if
    -- if Tor became unavailable while it was the chosen method, fall back to a share code
@@ -1800,6 +2428,10 @@ command qsOnionPill
       qsSyncMethod
    end if
    set the text of field "qsTorPill" to tState
+   set the foregroundColor of field "qsTorPill" to tFg
+   if there is a graphic "qsTorPillBg" then
+      set the backgroundColor of graphic "qsTorPillBg" to tBg
+   end if
 end qsOnionPill
 
 -- The send method is a 3-way, mutually-exclusive RADIO choice - "code", "tor", or
@@ -1841,20 +2473,25 @@ command qsSyncMethod
    -- nothing can - in both cases HIDE the field and turn the caption into a full-width
    -- plain-English reason, so the affordance never misleads (qsShareFile already ignores
    -- a passphrase on the web branch, so this changes no share behaviour).
+   -- rect heights here must stay >= the build-time auto-sized height (qsLabel
+   -- measures the engine's real line height); 28px holds one line on any platform
    if tIsWeb then
       set the visible of field "qsSendPass" to false
-      set the rect of field "qsSendPassCap" to "36,180,604,198"
-      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      set the visible of button "qsPassSuggest" to false
+      set the rect of field "qsSendPassCap" to "40,193,600,221"
+      set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Not encrypted - a web link opens in any browser, which cannot decrypt." into field "qsSendPassCap"
    else if sCanEncrypt is not "true" then
       set the visible of field "qsSendPass" to false
-      set the rect of field "qsSendPassCap" to "36,180,604,198"
-      set the foregroundColor of field "qsSendPassCap" to "138,144,154"
+      set the visible of button "qsPassSuggest" to false
+      set the rect of field "qsSendPassCap" to "40,193,600,221"
+      set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Encrypt: install cryptoXT (org.openxtalk.library.sodium) to lock this file." into field "qsSendPassCap"
    else
       set the visible of field "qsSendPass" to true
-      set the rect of field "qsSendPassCap" to "36,180,176,198"
-      set the foregroundColor of field "qsSendPassCap" to empty   -- restore the default dark
+      set the visible of button "qsPassSuggest" to true
+      set the rect of field "qsSendPassCap" to "40,193,164,221"
+      set the foregroundColor of field "qsSendPassCap" to kClrInk   -- back to a field label
       put "Encrypt (optional):" into field "qsSendPassCap"
    end if
    -- MORE OPTIONS: reveal only the advanced control(s) that apply to THIS method; the
@@ -1863,6 +2500,9 @@ command qsSyncMethod
    -- write to it), so they stay visible for tor AND web - only qsWebCheck is Tor-only and
    -- the editor group is Web-only.
    set the visible of field "qsMoreCap" to (not tIsCode)
+   if there is a graphic "qsMoreLine" then
+      set the visible of graphic "qsMoreLine" to (not tIsCode)
+   end if
    set the visible of button "qsWebCheck" to tIsTor
    set the visible of field "qsWebLink" to (not tIsCode)
    set the visible of button "qsWebCopy" to (not tIsCode)
@@ -1870,6 +2510,22 @@ command qsSyncMethod
    set the visible of field "qsEditPassCap" to tIsWeb
    set the visible of field "qsEditPass" to tIsWeb
    set the visible of field "qsEditHint" to tIsWeb
+   -- lay the two More-options rows out per method: on Tor the checkbox CAUSES the
+   -- link (cause before effect), on Web the link is the first output and the
+   -- LAN-editor row follows it - so the block always reads top-down in the order
+   -- things happen, with no gap where the other method's control would sit.
+   if tIsTor then
+      set the rect of button "qsWebCheck" to "40,530,520,550"
+      set the rect of field "qsWebLink" to "40,558,512,584"
+      set the rect of button "qsWebCopy" to "520,556,600,584"
+   else if tIsWeb then
+      set the rect of field "qsWebLink" to "40,528,512,554"
+      set the rect of button "qsWebCopy" to "520,526,600,554"
+      set the rect of button "qsEditToggle" to "40,560,304,582"
+      set the rect of field "qsEditPassCap" to "310,557,376,583"
+      set the rect of field "qsEditPass" to "380,558,520,584"
+      set the rect of field "qsEditHint" to "526,557,600,583"
+   end if
    -- never leave an advanced mode silently armed once its context is gone (the qsOnionPill
    -- idiom); guarded so this is a no-op at build time when nothing was armed.
    if sWebServe is "true" and not tIsTor then
@@ -1880,6 +2536,8 @@ command qsSyncMethod
       qsEditDisable
       set the hilite of button "qsEditToggle" to false
    end if
+   -- the drop zone narrates the chosen method (text-only; colors are qsDropPaint's)
+   qsDropHint
 end qsSyncMethod
 
 -- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
@@ -4698,7 +5356,7 @@ command qsCwStatusText
       if sCwMapped is "true" then
          put ("Internet link is LIVE (top link) - your router opened the port automatically. Anyone can open it in a browser; keep this window open.") into tMsg
       else
-         put ("Internet link is shown above, but your router did not open the port automatically. Forward port " & sCwPort & " (TCP) to this computer (" & sCwLanIp & ") in your router's settings, then it works. On the same network, the local link works right now.") into tMsg
+         put ("Internet link shown above, but the router did not open the port. Forward port " & sCwPort & " (TCP) to " & sCwLanIp & " in your router settings to enable it; the local link already works on your own network.") into tMsg
       end if
    else if sCwExtIp is not empty then
       put ("A direct internet link is not possible here - your connection uses carrier-grade NAT (shared public IP " & sCwExtIp & "). Use the local-network link, or share over Tor (which always reaches the internet).") into tMsg
@@ -5089,7 +5747,7 @@ function qsMoveFile pSrc, pDst
    return ""
 end qsMoveFile
 
--- Flip the "Serve as web download" checkbox (managed two-state; autoHilite off).
+-- Flip the "Also offer a Tor Browser download link" checkbox (managed; autoHilite off).
 command qsToggleWeb
    if sWebServe is "true" then
       put "false" into sWebServe
@@ -5136,19 +5794,20 @@ end qsToggleEdit
 
 command qsCopyWebLink
    if field "qsWebLink" is empty then
-      qsLog "No web link yet - share a plaintext file over Tor with 'Serve as web download' ticked."
+      qsLog "No web link yet - share a plaintext file over Tor with 'Also offer a Tor Browser download link' ticked."
       exit qsCopyWebLink
    end if
    set the clipboardData["text"] to field "qsWebLink"
+   qsCopyFlash "qsWebCopy"
    qsLog "Web link copied. Anyone with Tor Browser can open it to download."
 end qsCopyWebLink
 
--- Shown to a browser when the sender did NOT tick 'Serve as web download'.
+-- Shown to a browser when the sender did NOT tick the Tor Browser link checkbox.
 function qsHtmlDisabled
    return (qsFsPageTop("Not available") & qsFsIconSprite() & \
       "<main class='card'><header class='hd'><svg class='fi' style='color:#e8a317'><use href='#i-warn'/></svg>" & \
       "<h1>Web download is off</h1></header><div class='msg'>The sender shared this file for the app only. " & \
-      "Ask them for the share code, or to tick 'Serve as web download'.</div></main>" & qsFsPageBottom())
+      "Ask them for the share code, or to turn on the Tor Browser download link.</div></main>" & qsFsPageBottom())
 end qsHtmlDisabled
 
 command qsLog pMsg
