@@ -116,7 +116,7 @@ constant kChAppVersion = "1.0.0"
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-ui-2027-01"
+constant kUiVersion = "channels-ui-2027-02"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- The same palette newquickshare settled on after its OXT passes, so the two
@@ -484,7 +484,7 @@ command chClearGeneratedUI
 end chClearGeneratedUI
 
 command chMakeLabel pName, pText, pRect, pSize
-   local tTop
+   local tTop, tFH
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -497,16 +497,20 @@ command chMakeLabel pName, pText, pRect, pSize
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
-   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
-   -- to formattedHeight when the text needs more room (top pinned), never shrink -
-   -- so a deliberately tall label keeps its height, and if formattedHeight is
-   -- unavailable before the window is shown (build is in preOpenStack) the
-   -- comparison fails safe (the label keeps its rect, never collapses to zero).
+   -- never GUESS font metrics (the newquickshare OXT lesson): FIT the field to
+   -- its measured text height (top pinned). This prevents clipping AND makes
+   -- `the height of field` equal the TEXT height, which the band-title centering
+   -- and chSection's divider placement rely on. GUARD: only resize when the
+   -- engine returns a sane measurement - a 0/blank formattedHeight (possible
+   -- before the window is realized) would collapse the label, so keep the rect
+   -- in that case. (An earlier grow-only version broke the centering by leaving
+   -- the field at its taller rect height.) Empty labels get their text later.
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      if the formattedHeight of field pName > the height of field pName then
-         set the height of field pName to the formattedHeight of field pName
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
          set the top of field pName to tTop
       end if
    end if
@@ -522,8 +526,8 @@ command chSection pName, pText, pRect
    set the itemDelimiter to comma
    put item 1 of pRect into tL
    put item 3 of pRect into tR
-   -- place the divider below the label's ACTUAL bottom (grow-only may have made
-   -- the header taller than pRect), so a grown header never sits on its own line
+   -- place the divider below the label's ACTUAL (fit-to-text) bottom, so it
+   -- tracks the real header height on any platform's line metrics
    put the bottom of field pName into tB
    chGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
    set the style of graphic (pName & "Line") to "rectangle"
