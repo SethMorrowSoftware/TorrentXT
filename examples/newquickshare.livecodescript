@@ -60,6 +60,11 @@ local sShareCodeByHandle -- array: torrent handle -> the share code we minted fo
 local sXferRow          -- array: list line number -> "type|key" identity for that row
 local sXferSel          -- the currently selected row identity ("type|key"), or empty
 local sLastXferRows     -- last text set into the qsXfers list (only retype it on a change)
+-- Clipboard auto-detect: when the window opens or comes to the front and the
+-- clipboard holds something code-shaped, the Receive box is pre-filled (never
+-- overwriting user input). Each clipboard value is offered exactly ONCE, so a
+-- declined suggestion never nags on every focus change.
+local sClipSuggested    -- the last clipboard text already offered (or dismissed)
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -205,7 +210,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2027-03"
+constant kQsUiVersion = "nqs-ui-2027-04"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- One palette for every generated control, so the whole surface shifts together
@@ -246,6 +251,13 @@ end openStack
 on closeStack
    qsStop
 end closeStack
+
+on resumeStack
+   -- the window came back to the front: a share code may be waiting on the
+   -- clipboard (the classic receive flow is copy in chat -> switch to the app)
+   qsClipboardSuggest
+   pass resumeStack
+end resumeStack
 
 -- ---- OS file drag-and-drop ---------------------------------------------------
 -- These bubble up from whatever control is under the pointer to this stack
@@ -316,6 +328,9 @@ on mouseUp
       case "qsMethodWeb"
       case "qsMethodWebD"
          qsSetMethod "web"
+         break
+      case "qsPassSuggest"
+         qsSuggestPass
          break
       case "qsWebCheck"
          qsToggleWeb
@@ -469,9 +484,11 @@ command qsBuild
    set the style of button "qsMethodWeb" to "radioButton"
    set the autoHilite of button "qsMethodWeb" to false
    qsCap "qsMethodWebD", "Any browser. Not encrypted.", "439,170,600,186"
-   -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs cryptoXT)
+   -- optional end-to-end encryption: a passphrase set BEFORE dropping (needs
+   -- cryptoXT), plus a Suggest button that mints a strong one from the CSPRNG
    qsLabel "qsSendPassCap", "Encrypt (optional):", "40,193,164,215", 10
-   qsField "qsSendPass", "172,194,600,222", false
+   qsField "qsSendPass", "172,194,516,222", false
+   qsButton "qsPassSuggest", "Suggest", "524,194,600,222"
    -- the drag zone: the hero action, so it gets the most visual weight - a dashed
    -- rounded target (qsDropBg) with a transparent click/drop overlay field on top
    -- (qsDrop keeps the name every existing handler targets). Drag delivery is
@@ -491,10 +508,8 @@ command qsBuild
    set the textSize of field "qsDrop" to 13
    set the foregroundColor of field "qsDrop" to kClrInk
    set the margins of field "qsDrop" to "8,30,8,8"   -- top margin centers the 2 lines
-   set the text of field "qsDrop" to ("Drag & drop a file or folder here" & return & \
-      "or click to browse - the Choose buttons below always work")
-   set the textSize of line 2 of field "qsDrop" to 10
-   set the foregroundColor of line 2 of field "qsDrop" to kClrInkMute
+   -- the zone's two-line message is method-aware, painted by qsDropHint (via the
+   -- qsSyncMethod call below), so a drop always says what it is about to do
    -- always-reliable pickers: separate file / folder choosers open the native dialog
    -- directly (no guessing), so sharing a FOLDER is one obvious click even when a drag
    -- will not register.
@@ -811,6 +826,34 @@ command qsDropPaint pMode
    end if
 end qsDropPaint
 
+-- Write the drop zone's two lines (headline + muted detail). A wholesale
+-- `set the text` resets chunk styling, so line 2's smaller/muted look is
+-- re-applied here every time - the ONE place drop-zone text is ever written.
+command qsDropText pLine1, pLine2
+   if there is no field "qsDrop" then
+      exit qsDropText
+   end if
+   set the text of field "qsDrop" to (pLine1 & return & pLine2)
+   set the textSize of line 2 of field "qsDrop" to 10
+   set the foregroundColor of line 2 of field "qsDrop" to kClrInkMute
+end qsDropText
+
+-- The method-aware idle hint: the hero control narrates what a drop WILL do
+-- under the currently selected method. Repainted by qsSyncMethod on every
+-- method change, and by a short timer after a share preview (qsShareFile).
+command qsDropHint
+   if sTorSend is "true" then
+      qsDropText "Drag & drop to send privately over Tor", \
+         "both IP addresses stay hidden - or click to browse (the buttons below always work)"
+   else if sWebShare is "true" then
+      qsDropText "Drag & drop to share as a web link", \
+         "opens in any browser, no app needed - or click to browse (the buttons below always work)"
+   else
+      qsDropText "Drag & drop a file or folder here", \
+         "you get a short code to send - or click to browse (the buttons below always work)"
+   end if
+end qsDropHint
+
 -- Flash a Copy button's label to "Copied!" for a beat, then restore it - the
 -- feedback lands AT the pointer instead of only in the far-away Activity log.
 -- The original label rides a custom property so any button can flash.
@@ -836,6 +879,7 @@ end qsCopyFlashReset
 
 command qsAddTips
    set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
+   set the tooltip of button "qsPassSuggest" to "Fill in a strong random passphrase (16 characters, no confusable letters). Send it to your friend separately from the code - a phone call or a different app is ideal."
    set the tooltip of field "qsDrop" to "Drag a file or folder here from your desktop or a file window. If a drag will not register (it can be unreliable from a file window), use the Choose buttons below - they always work."
    set the tooltip of button "qsChooseFile" to "Open a dialog to pick a file to share, using the method selected above. Always works, even when a drag will not register."
    set the tooltip of button "qsChooseFolder" to "Open a dialog to pick a FOLDER to share. Over a web link or Tor it becomes a browsable page; as a share code the whole folder is sent. Always works, even when a drag will not register."
@@ -927,6 +971,8 @@ command qsStart
    -- drop keyboard focus: without this the engine focuses the first traversal
    -- control (the Share code radio) and draws a focus box around it at open
    focus on nothing
+   -- a share code may already be on the clipboard (copy in chat -> open the app)
+   qsClipboardSuggest
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -989,7 +1035,7 @@ end qsDashOnce
 -- first and seed THAT (a neutral name, ciphertext bytes); the code then carries
 -- the hash plus the real filename so the receiver can name + unlock it.
 command qsShareFile pPath
-   local tData, tH, tHash, tParent, tName, tPass
+   local tData, tH, tHash, tParent, tName, tPass, tSz
    local tEncPath, tEncParent, tErr, tSalt, tKey, tVerifier
    if sSession is 0 then
       qsLog "No session - reopen the stack."
@@ -1014,6 +1060,26 @@ command qsShareFile pPath
       put "/" into tParent
    end if
    put qsTrim(field "qsSendPass") into tPass
+   -- Narrate the pick in the drop zone AT ONCE: packaging/encrypting a big file
+   -- blocks the single engine thread with no other feedback. Text-only, and the
+   -- zone falls back to its method hint on a short timer, so no share branch
+   -- (with its many early exits) has to remember to restore it.
+   if there is a folder pPath then
+      qsDropText ("Sharing the folder: " & tName), \
+         "setting up - a big folder can take a moment"
+   else
+      put qsFileSize(pPath) into tSz
+      if tSz is a number and tSz > 0 then
+         qsDropText ("Sharing: " & tName & " (" & qsBytes(tSz) & ")"), \
+            "setting up - a big file can take a moment"
+      else
+         qsDropText ("Sharing: " & tName), "setting up..."
+      end if
+   end if
+   send "qsDropHint" to me in 6000 milliseconds
+   -- yield once so the preview can paint before the blocking work (VERIFY
+   -- on-engine that a zero wait flushes the screen; harmless if it does not)
+   wait 0 milliseconds
    -- starting any NON-web share replaces a running clearweb server (so switching
    -- transports does not leave its listener + port mapping orphaned)
    if sCwActive is "true" and sWebShare is not "true" then
@@ -1156,6 +1222,106 @@ command qsCopyCode
    qsCopyFlash "qsCopy"
    qsLog "Code copied. Send it to your friend by email, chat, anywhere."
 end qsCopyCode
+
+-- Fill the Encrypt field with a strong, phone-typeable passphrase: 4 groups of
+-- 4 from an unambiguous alphabet (no 0/O, 1/l/i, or 8/B look-alikes), bytes
+-- from libsodium's CSPRNG. ~78 bits before the tiny mod-30 bias - far beyond
+-- what an offline Argon2id guess could ever chew through for a file share.
+-- Hidden alongside the passphrase field when encryption cannot work.
+command qsSuggestPass
+   local tBytes, tOut, tI, tN
+   if not sCanEncrypt then
+      qsLog "Passphrase suggestions need cryptoXT (org.openxtalk.library.sodium)."
+      exit qsSuggestPass
+   end if
+   put sxRandomBytes(16) into tBytes
+   put "" into tOut
+   repeat with tI = 1 to 16
+      put byteToNum(byte tI of tBytes) into tN
+      put char ((tN mod 30) + 1) of "abcdefghjkmnpqrstuvwxyz2345679" after tOut
+      if tI mod 4 is 0 and tI < 16 then
+         put "-" after tOut
+      end if
+   end repeat
+   put tOut into field "qsSendPass"
+   qsLog "Suggested a strong passphrase. Tell it to your friend SEPARATELY from the code - a call or a different app is ideal."
+end qsSuggestPass
+
+-- ---- clipboard auto-detect (the copy -> open -> Enter receive flow) ----------
+-- Does this text LOOK like something the Receive box accepts? A bare 40/64-hex
+-- info-hash, a locked (BTXQS1:) or Tor (BTXTOR1:) code, or a magnet link.
+function qsLooksLikeCode pText
+   local tHex, tI
+   if pText begins with kCodePrefix or pText begins with kTorCodePrefix then
+      return true
+   end if
+   if pText begins with "magnet:" then
+      return true
+   end if
+   if the number of chars of pText is not 40 and the number of chars of pText is not 64 then
+      return false
+   end if
+   put toLower(pText) into tHex
+   repeat with tI = 1 to the number of chars of tHex
+      if char tI of tHex is not in "0123456789abcdef" then
+         return false
+      end if
+   end repeat
+   return true
+end qsLooksLikeCode
+
+-- Is this a code WE minted (and is still live)? Offering the user a download
+-- of their own outbound share - fresh on the clipboard from the Copy button -
+-- would be nonsense, so those never pre-fill the Receive box.
+function qsIsOwnCode pCode
+   local tK
+   if pCode is not empty and pCode is sShareCode then
+      return true
+   end if
+   repeat for each key tK in sShareCodeByHandle
+      if sShareCodeByHandle[tK] is pCode then
+         return true
+      end if
+   end repeat
+   if sActiveShare["code"] is pCode then
+      return true
+   end if
+   return false
+end qsIsOwnCode
+
+-- If the clipboard holds something code-shaped and the Receive box is empty,
+-- pre-fill it so receiving collapses to copy -> open -> Enter. Runs at start
+-- and whenever the window comes back to the front (resumeStack). Polite by
+-- construction: never overwrites user input, offers each clipboard value only
+-- once, and ignores our own outbound codes. The try guards the clipboard read
+-- (it can fail transiently when another app holds the clipboard on Windows).
+command qsClipboardSuggest
+   local tClip, tErr
+   if there is no field "qsRecvCode" then
+      exit qsClipboardSuggest
+   end if
+   put "" into tClip
+   try
+      put qsTrim(the clipboardData["text"]) into tClip
+   catch tErr
+      exit qsClipboardSuggest
+   end try
+   if tClip is empty or tClip is sClipSuggested then
+      exit qsClipboardSuggest
+   end if
+   put tClip into sClipSuggested   -- one offer per value, even if it is declined
+   if not qsLooksLikeCode(tClip) then
+      exit qsClipboardSuggest
+   end if
+   if qsIsOwnCode(tClip) then
+      exit qsClipboardSuggest
+   end if
+   if qsTrim(field "qsRecvCode") is not empty then
+      exit qsClipboardSuggest
+   end if
+   put tClip into field "qsRecvCode"
+   qsLog "Found a share code on your clipboard - check it, then click Download (or press Enter)."
+end qsClipboardSuggest
 
 -- ---- receiving: a code becomes a download ------------------------------------
 -- A plain code is a magnet or a bare info-hash (the original flow). A code that
@@ -2136,16 +2302,19 @@ command qsSyncMethod
    -- measures the engine's real line height); 28px holds one line on any platform
    if tIsWeb then
       set the visible of field "qsSendPass" to false
+      set the visible of button "qsPassSuggest" to false
       set the rect of field "qsSendPassCap" to "40,193,600,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Not encrypted - a web link opens in any browser, which cannot decrypt." into field "qsSendPassCap"
    else if sCanEncrypt is not "true" then
       set the visible of field "qsSendPass" to false
+      set the visible of button "qsPassSuggest" to false
       set the rect of field "qsSendPassCap" to "40,193,600,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInkMute
       put "Encrypt: install cryptoXT (org.openxtalk.library.sodium) to lock this file." into field "qsSendPassCap"
    else
       set the visible of field "qsSendPass" to true
+      set the visible of button "qsPassSuggest" to true
       set the rect of field "qsSendPassCap" to "40,193,164,221"
       set the foregroundColor of field "qsSendPassCap" to kClrInk   -- back to a field label
       put "Encrypt (optional):" into field "qsSendPassCap"
@@ -2192,6 +2361,8 @@ command qsSyncMethod
       qsEditDisable
       set the hilite of button "qsEditToggle" to false
    end if
+   -- the drop zone narrates the chosen method (text-only; colors are qsDropPaint's)
+   qsDropHint
 end qsSyncMethod
 
 -- Tear down the onion subsystem on close, BEFORE btStopSession. All idempotent.
