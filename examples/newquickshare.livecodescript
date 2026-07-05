@@ -1,4 +1,4 @@
-script "newQuickShareApp"
+script "No Cloud Quick Share"
 
 -- newquickshare.livecodescript - a REVAMPED Quick Share (see torrent-quickshare for
 -- the original). Same engine and features; a wider, shorter, self-explanatory UI that
@@ -24,7 +24,7 @@ script "newQuickShareApp"
 -- Internet library (libURL) - used only for the public-IP lookup on the web
 -- link path, and harmless if left out (the lookup is try-guarded); (3) no
 -- other inclusions, externals, or resources are needed. Downloads land in
--- Documents/newQuickShare on every platform.
+-- Documents/No Cloud Quick Share on every platform.
 --
 -- THE DEMO (two machines, both running this stack):
 --   1. On machine A, drag a file onto the drop area (or click it to choose one).
@@ -259,7 +259,7 @@ constant kQsAppVersion = "1.0.0"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2027-05"
+constant kQsUiVersion = "ncqs-ui-2027-06"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- One palette for every generated control, so the whole surface shifts together
@@ -506,7 +506,7 @@ command qsBuild
    -- tear it (VERIFY on-engine: property honoured by the window manager)
    set the resizable of this stack to false
    set the backgroundColor of this card to kClrPage
-   set the title of this stack to ("newQuickShare " & kQsAppVersion)
+   set the title of this stack to ("No Cloud Quick Share " & kQsAppVersion)
 
    -- title band (a plain filled graphic) + tagline + live Tor status chip. Each
    -- band label auto-sizes in qsLabel, then is CENTERED on the band's midline
@@ -516,7 +516,7 @@ command qsBuild
    set the filled of graphic "qsTitleBg" to true
    set the backgroundColor of graphic "qsTitleBg" to kClrBand
    set the lineSize of graphic "qsTitleBg" to 0
-   qsLabel "qsTitle", "newQuickShare", "12,4,400,52", 16
+   qsLabel "qsTitle", "No Cloud Quick Share", "12,4,400,52", 16
    set the foregroundColor of field "qsTitle" to kClrBandText
    set the textStyle of field "qsTitle" to "bold"
    set the top of field "qsTitle" to (28 - ((the height of field "qsTitle") div 2))
@@ -974,11 +974,11 @@ command qsAddTips
    set the tooltip of button "qsCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "qsRecvCode" to "Paste the code a friend gave you here."
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
-   set the tooltip of button "qsGet" to "Download the file for that code into your newQuickShare folder."
+   set the tooltip of button "qsGet" to "Download the file for that code into your No Cloud Quick Share folder."
    set the tooltip of field "qsXfers" to "Everything live: downloads, the files you are sharing by code (each is its own row - you can run many at once), and any Tor or web page. Click a row to select it, then Copy code or Stop."
    set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again. For a download row this copies a magnet link (works in any torrent client)."
    set the tooltip of button "qsXferStop" to "Stop the selected item: stop sharing a file (peers can no longer download it), or cancel a download in progress. Your original files are never deleted."
-   set the tooltip of button "qsXferFolder" to "Open your newQuickShare download folder in the file manager - every received file lands there."
+   set the tooltip of button "qsXferFolder" to "Open your No Cloud Quick Share download folder in the file manager - every received file lands there."
    set the tooltip of field "qsXferInfo" to "Live details for the selected row: connected peers and seeds, transfer rates, upload ratio, and bytes done."
    set the tooltip of button "qsMethodCode" to "The classic way: a normal peer-to-peer BitTorrent share. Give your friend the code; the transfer resumes if interrupted. Your IP is visible to peers."
    set the tooltip of button "qsMethodTor" to "Send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER to serve it as a browsable Tor web page - open the link in Tor Browser."
@@ -1054,9 +1054,9 @@ command qsStart
       qsOnionPill
    end if
    if sCanEncrypt then
-      qsLog "newQuickShare " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
+      qsLog "No Cloud Quick Share " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
-      qsLog "newQuickShare " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
+      qsLog "No Cloud Quick Share " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
    -- repaint the method-driven UI now that sCanEncrypt + the method flags are known:
    -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
@@ -1596,7 +1596,7 @@ command qsRefreshXfers
                put "waiting for your friend..." into tProg
                if sStallWarned[tH] is not "true" then
                   put "true" into sStallWarned[tH]
-                  qsLog "No peers for" && quote & tDisp & quote && "yet - the sender must keep their newQuickShare window open. The transfer starts by itself once they are online."
+                  qsLog "No peers for" && quote & tDisp & quote && "yet - the sender must keep their No Cloud Quick Share window open. The transfer starts by itself once they are online."
                end if
             end if
          else if sStallSince[tH] is not empty then
@@ -1874,7 +1874,7 @@ command qsCopySelected
    qsLog "Copied that share's code to the clipboard. Send it to your friend."
 end qsCopySelected
 
--- Open the newQuickShare download folder in the OS file manager - the #1
+-- Open the No Cloud Quick Share download folder in the OS file manager - the #1
 -- post-download question is "where did my file go?". `launch url` on a file:
 -- URL hands the folder to the default handler (VERIFY on-engine per platform);
 -- any failure still prints the exact path, so the button never dead-ends.
@@ -2122,7 +2122,7 @@ function qsSaveFolder
    if tBase is empty then
       put specialFolderPath("desktop") into tBase
    end if
-   put tBase & "/newQuickShare" into tBase
+   put tBase & "/No Cloud Quick Share" into tBase
    if there is no folder tBase then
       try
          create folder tBase
@@ -3682,7 +3682,7 @@ command qsInfoRoute pConn, pRequest
       put "tor" into tMode
    end if
    put quote into tQ
-   put "{" & tQ & "app" & tQ & ":" & tQ & "newQuickShare" & tQ & "," & \
+   put "{" & tQ & "app" & tQ & ":" & tQ & "No Cloud Quick Share" & tQ & "," & \
       tQ & "mode" & tQ & ":" & tQ & qsJsonEscape(tMode) & tQ & "," & \
       tQ & "share" & tQ & ":" & tQ & qsJsonEscape(tName) & tQ & "," & \
       tQ & "method" & tQ & ":" & tQ & qsJsonEscape(pRequest["__method"]) & tQ & "}" into tJson
@@ -4225,7 +4225,7 @@ end qsFsServePath
 function qsHttpExtraHeaders
    local tCrlf
    put (numToChar(13) & numToChar(10)) into tCrlf
-   return ("Server: newQuickShare" & tCrlf & "X-Content-Type-Options: nosniff" & tCrlf & \
+   return ("Server: No Cloud Quick Share" & tCrlf & "X-Content-Type-Options: nosniff" & tCrlf & \
       "Cache-Control: no-cache" & tCrlf)
 end qsHttpExtraHeaders
 
