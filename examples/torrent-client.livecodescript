@@ -58,7 +58,7 @@ constant kTcAppVersion = "1.0.0"
 -- Bump when the generated UI changes; tcBuildUI rebuilds the controls on a
 -- mismatch so updating the script in a SAVED stack picks up the new layout
 -- instead of keeping the old controls (and dead buttons) around.
-constant kUiVersion = "client-ui-2027-01"
+constant kUiVersion = "client-ui-2027-02"
 -- prefs file header: 8-byte magic + 1-byte mode. The client keeps no secrets, so
 -- it only ever writes mode "P" (plain); the format matches the channels demo.
 constant kPrefMagic = "BTXPREF1"
@@ -490,7 +490,7 @@ command tcBuildUI
 end tcBuildUI
 
 command tcMakeLabel pName, pText, pRect, pSize
-   local tTop
+   local tTop, tFH
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -503,18 +503,21 @@ command tcMakeLabel pName, pText, pRect, pSize
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
-   -- never GUESS font metrics (the newquickshare OXT lesson). GROW-ONLY: enlarge
-   -- to formattedHeight when the text needs more room (top pinned), never shrink -
-   -- so the opaque header/status bars keep their designed height, and if
-   -- formattedHeight is unavailable before the window is shown (build is in
-   -- preOpenStack) the comparison fails safe (no collapse to zero height).
-   -- Labels that tcRelayout later re-rects (detail, totals, headers) are fine -
-   -- relayout sets their final rect after build.
+   -- never GUESS font metrics (the newquickshare OXT lesson): FIT the field to
+   -- its measured text height (top pinned). This prevents clipping AND makes
+   -- `the height of field` equal the TEXT height, which the title-band centering
+   -- (tcTitle / tcSubtitle) relies on. GUARD: only resize when the engine
+   -- returns a sane measurement - a 0/blank formattedHeight (possible before the
+   -- window is realized) would collapse the label, so keep the rect then.
+   -- (An earlier grow-only version left the field at its taller rect height and
+   -- broke the centering.) The column-header/status bars are re-rected by
+   -- tcRelayout after build, and empty labels get their text later.
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      if the formattedHeight of field pName > the height of field pName then
-         set the height of field pName to the formattedHeight of field pName
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
          set the top of field pName to tTop
       end if
    end if
