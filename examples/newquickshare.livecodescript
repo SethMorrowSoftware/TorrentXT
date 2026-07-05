@@ -65,6 +65,12 @@ local sLastXferRows     -- last text set into the qsXfers list (only retype it o
 -- overwriting user input). Each clipboard value is offered exactly ONCE, so a
 -- declined suggestion never nags on every focus change.
 local sClipSuggested    -- the last clipboard text already offered (or dismissed)
+-- Stall coaching (round 4): a download sitting at ZERO peers is the worst
+-- novice moment - it reads as "broken" when it usually means "the sender
+-- closed their window". Track when each torrent was first seen peerless so
+-- 45s of that flips its row to plain English and logs the explanation ONCE.
+local sStallSince       -- array: torrent handle -> the milliseconds 0 peers was first seen
+local sStallWarned      -- array: torrent handle -> "true" once the one-time log ran
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -210,7 +216,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "nqs-ui-2027-04"
+constant kQsUiVersion = "nqs-ui-2027-05"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- One palette for every generated control, so the whole surface shifts together
@@ -234,7 +240,9 @@ constant kClrCodeLine = "210,217,229"   -- code/link output border
 constant kClrDropBg = "247,249,252"     -- drop zone fill, idle
 constant kClrDropHot = "232,241,255"    -- drop zone fill, hover / drag-over
 constant kClrDropLine = "170,182,202"   -- drop zone dashed border, idle
-constant kClrWarn = "150,110,40"        -- small amber hints ("LAN only")
+constant kClrWarn = "150,110,40"        -- small amber hints ("LAN only"; Tor connecting rows)
+constant kClrRowSend = "23,128,63"      -- transfers list: seeding / done / serving rows
+constant kClrRowErr = "176,58,46"       -- transfers list: stopped / errored rows
 constant kClrPillOff = "31,64,116"      -- Tor chip: unavailable (band-toned)
 constant kClrPillOffText = "199,216,241"
 constant kClrPillWait = "250,240,199"   -- Tor chip: bootstrapping
@@ -352,6 +360,9 @@ on mouseUp
          break
       case "qsXferStop"
          qsStopSelected
+         break
+      case "qsXferFolder"
+         qsOpenSaveFolder
          break
       default
          pass mouseUp
@@ -590,15 +601,22 @@ command qsBuild
    set the tabStops of field "qsXferHead" to "230,340"
    set the textFont of field "qsXferHead" to qsMonoFont()
    set the foregroundColor of field "qsXferHead" to kClrInkMute
-   qsList "qsXfers", "656,318,1064,426", false
+   qsList "qsXfers", "656,318,1064,404", false
    set the tabStops of field "qsXfers" to "230,340"
    set the textFont of field "qsXfers" to qsMonoFont()
    set the textSize of field "qsXfers" to 10
    put empty into sLastXferRows   -- freshly (re)built list: force the next refresh to paint
+   -- the live detail strip: peers/seeds/rates/ratio for the SELECTED row, fed
+   -- by qsRefreshXfers from status data the repaint loop already fetches
+   qsLabel "qsXferInfo", "", "656,408,1064,430", 9
+   set the textFont of field "qsXferInfo" to qsMonoFont()
+   set the foregroundColor of field "qsXferInfo" to kClrInkSoft
+   put "Click a row above for live details." into field "qsXferInfo"
    -- per-row management: pick a row, then act on THAT share/transfer
-   qsCap "qsXferHint", "Select a row to manage it:", "656,434,868,456"
-   qsButton "qsXferCopy", "Copy code", "876,432,968,460"
-   qsButton "qsXferStop", "Stop", "976,432,1064,460"
+   qsCap "qsXferHint", "Selected:", "656,438,728,460"
+   qsButton "qsXferCopy", "Copy code", "734,434,838,462"
+   qsButton "qsXferStop", "Stop", "846,434,918,462"
+   qsButton "qsXferFolder", "Open folder", "926,434,1064,462"
    -- =============== RIGHT: ACTIVITY ===============
    qsPanel "qsActPanel", "640,486,1080,596"
    qsHdr "qsActSec", "Activity", "656,494,940,518"
@@ -889,8 +907,10 @@ command qsAddTips
    set the tooltip of field "qsRecvPass" to "If your friend locked the file, type the passphrase they gave you here BEFORE clicking Download."
    set the tooltip of button "qsGet" to "Download the file for that code into your newQuickShare folder."
    set the tooltip of field "qsXfers" to "Everything live: downloads, the files you are sharing by code (each is its own row - you can run many at once), and any Tor or web page. Click a row to select it, then Copy code or Stop."
-   set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again."
+   set the tooltip of button "qsXferCopy" to "Copy the share code for the selected row back to the clipboard - handy when several shares are running and you need an older one's code again. For a download row this copies a magnet link (works in any torrent client)."
    set the tooltip of button "qsXferStop" to "Stop the selected item: stop sharing a file (peers can no longer download it), or cancel a download in progress. Your original files are never deleted."
+   set the tooltip of button "qsXferFolder" to "Open your newQuickShare download folder in the file manager - every received file lands there."
+   set the tooltip of field "qsXferInfo" to "Live details for the selected row: connected peers and seeds, transfer rates, upload ratio, and bytes done."
    set the tooltip of button "qsMethodCode" to "The classic way: a normal peer-to-peer BitTorrent share. Give your friend the code; the transfer resumes if interrupted. Your IP is visible to peers."
    set the tooltip of button "qsMethodTor" to "Send over Tor: both IP addresses are hidden and NO torrent is created (best for small, sensitive files). Add a passphrase to also encrypt and authenticate. Drag a FOLDER to serve it as a browsable Tor web page - open the link in Tor Browser."
    set the tooltip of button "qsMethodWeb" to "Serve the file or folder over the plain web: the recipient just opens a link in any browser, no app needed. The router port is opened automatically (UPnP) and the link carries a secret token. Fast, but your IP is visible and the download is not encrypted - use Tor for privacy."
@@ -1004,6 +1024,8 @@ command qsStop
    put empty into sShareCodeByHandle
    put empty into sXferRow
    put empty into sXferSel
+   put empty into sStallSince
+   put empty into sStallWarned
 end qsStop
 
 command qsPollOnce
@@ -1425,9 +1447,12 @@ end qsGetFile
 command qsRefreshXfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
    local tIH, tDisp, tDir, tK, tE, tProg, tRemain, tSelLine, tPrevLine
+   local tNow, tPeers, tStalled, tClr, tLive, tSelStat, tId, tSelType, tSelKey
+   local tInfo, tRatio, tSavedID
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
    end if
+   put the milliseconds into tNow   -- one clock read per pass (the perf playbook)
    -- snapshot the user's current selection BY IDENTITY before we rebuild the map, so
    -- the highlight follows the same transfer even as rows reorder or the list is
    -- retyped wholesale each pass. Reads the live listBehavior hilite (set the instant
@@ -1477,9 +1502,58 @@ command qsRefreshXfers
             put tProg && qsRateShort(tS["uploadRate"]) into tProg
          end if
       end if
+      -- stall coaching: a receive-side row at ZERO peers for 45s flips its
+      -- progress cell to plain English and logs the why ONCE per torrent (a
+      -- seed with no peers is just idle, so "sending" rows are exempt)
+      put false into tStalled
+      put tS["numPeers"] into tPeers
+      put 1 into tLive[tH]
+      if not (tDir contains "sending") then
+         if tPeers is a number and tPeers is 0 then
+            if sStallSince[tH] is empty then
+               put tNow into sStallSince[tH]
+            else if (tNow - sStallSince[tH]) > 45000 then
+               put true into tStalled
+               put "waiting for your friend..." into tProg
+               if sStallWarned[tH] is not "true" then
+                  put "true" into sStallWarned[tH]
+                  qsLog "No peers for" && quote & tDisp & quote && "yet - the sender must keep their newQuickShare window open. The transfer starts by itself once they are online."
+               end if
+            end if
+         else if sStallSince[tH] is not empty then
+            delete variable sStallSince[tH]
+         end if
+      end if
+      -- the row's state color (applied after the retype, chunk-level)
+      if tS["error"] is not empty then
+         put kClrRowErr into tClr[tLineNum]
+      else if tStalled then
+         put kClrInkMute into tClr[tLineNum]
+      else if tDir contains "sending" then
+         put kClrRowSend into tClr[tLineNum]
+      else if tDir contains "receiving" then
+         put kClrAccent into tClr[tLineNum]
+      else
+         put kClrInkMute into tClr[tLineNum]
+      end if
+      -- keep the SELECTED torrent's full status for the detail strip below
+      -- (no extra FFI call: this pass already fetched it)
+      if sXferSel is ("torrent|" & tH) then
+         put tS into tSelStat
+      end if
       put qsTrunc(tDisp, 26) & tab & tDir & tab & tProg & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
+   end repeat
+   -- prune stall bookkeeping for torrents that no longer exist (the keys list
+   -- is snapshotted once, so deleting inside the loop is safe)
+   repeat for each line tK in the keys of sStallSince
+      if tLive[tK] is empty then
+         delete variable sStallSince[tK]
+         if sStallWarned[tK] is not empty then
+            delete variable sStallWarned[tK]
+         end if
+      end if
    end repeat
    -- append anonymous (Tor) transfers; they have NO torrent handle, so the torrent
    -- loop above never sees them. Same "name TAB dir TAB bar" row format.
@@ -1493,13 +1567,21 @@ command qsRefreshXfers
       end if
       if tE["state"] is "connecting" or tE["total"] is 0 then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "connecting..." & return after tRows
+         put kClrWarn into tClr[tLineNum]
       else if tE["state"] is "done" then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "done" & return after tRows
+         put kClrRowSend into tClr[tLineNum]
       else if tE["state"] is "error" then
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & "stopped" & return after tRows
+         put kClrRowErr into tClr[tLineNum]
       else
          put (the round of (tE["got"] / tE["total"] * 1000) / 10) into tPct
          put qsTrunc(tE["name"], 26) & tab & tDir & tab & tPct & "%  " & qsBytes(tE["got"]) & return after tRows
+         if tE["dir"] is "receiving" then
+            put kClrAccent into tClr[tLineNum]
+         else
+            put kClrRowSend into tClr[tLineNum]
+         end if
       end if
    end repeat
    -- a folder web share has no torrent and no per-file transfer rows; show one status
@@ -1508,17 +1590,20 @@ command qsRefreshXfers
       add 1 to tLineNum
       put "torweb|" into sXferRow[tLineNum]        -- the one Tor folder web page
       put qsTrunc(sActiveShare["name"], 26) & tab & "web via Tor" & tab & "serving (open the link)" & return after tRows
+      put kClrRowSend into tClr[tLineNum]
    end if
    if sCwActive is "true" then
       add 1 to tLineNum
       put "web|" into sXferRow[tLineNum]           -- the one clearweb share
       put qsTrunc(sCwName, 26) & tab & "direct web" & tab & "serving (open the link)" & return after tRows
+      put kClrRowSend into tClr[tLineNum]
    end if
    if the last char of tRows is return then
       delete the last char of tRows
    end if
    if tLineNum is 0 then
       put "Nothing yet. Drag a file to share, or paste a code to download." into tRows
+      put kClrInkMute into tClr[1]
    end if
    -- Only RETYPE the list when its content actually changed. A wholesale field relayout
    -- + redraw every poll is the biggest avoidable UI cost (the OXT perf playbook), and -
@@ -1553,7 +1638,65 @@ command qsRefreshXfers
             set the hilitedLines of field "qsXfers" to empty
          end if
       end if
+      -- per-row state colors, chunk-level. Only runs when the text was retyped:
+      -- chunk colors survive between repaints, so an idle list costs nothing.
+      repeat with tI = 1 to the number of lines of tRows
+         if tClr[tI] is not empty then
+            set the foregroundColor of line tI of field "qsXfers" to tClr[tI]
+         end if
+      end repeat
       unlock screen
+   end if
+   -- the live detail strip for the SELECTED row: novices get a sentence, power
+   -- users get peers/seeds/rates/ratio. Runs every pass (a selection can change
+   -- without the row text changing), but only retypes the field on a change.
+   put qsSelectedIdentity() into tId
+   put "Click a row above for live details." into tInfo
+   if tId is not empty then
+      put the itemDelimiter into tSavedID
+      set the itemDelimiter to "|"
+      put item 1 of tId into tSelType
+      put item 2 of tId into tSelKey
+      set the itemDelimiter to tSavedID
+      switch tSelType
+         case "torrent"
+            if tSelStat is not an array then
+               -- selection landed between passes; one small status call catches up
+               put btTorrentStatus(tSelKey) into tSelStat
+            end if
+            if tSelStat["name"] is empty then
+               put "Fetching details from the swarm..." into tInfo
+            else
+               put ("peers " & tSelStat["numPeers"] & " (" & tSelStat["numSeeds"] & " seeds)" \
+                  & "   down " & qsRateShort(tSelStat["downloadRate"]) \
+                  & "   up " & qsRateShort(tSelStat["uploadRate"])) into tInfo
+               if tSelStat["totalDone"] is a number and tSelStat["totalDone"] > 0 \
+                     and tSelStat["allTimeUpload"] is a number then
+                  put (the round of (tSelStat["allTimeUpload"] / tSelStat["totalDone"] * 10) / 10) into tRatio
+                  put tInfo & "   ratio " & tRatio into tInfo
+               end if
+               if tSelStat["totalWanted"] is a number and tSelStat["totalWanted"] > 0 then
+                  put tInfo & "   " & qsBytes(tSelStat["totalDone"]) & " of " \
+                     & qsBytes(tSelStat["totalWanted"]) into tInfo
+               end if
+            end if
+            break
+         case "onion"
+            put sOnionXfers[tSelKey] into tE
+            put ("via Tor - " & tE["dir"] & ", " & qsBytes(tE["got"]) & " of " & qsBytes(tE["total"])) into tInfo
+            break
+         case "torweb"
+            put "Serving a folder page over Tor - open the link in Tor Browser." into tInfo
+            break
+         case "web"
+            put ("Serving over the web: " & sCwLink) into tInfo
+            break
+         default
+            break
+      end switch
+   end if
+   if tInfo is not the text of field "qsXferInfo" then
+      set the text of field "qsXferInfo" to tInfo
    end if
    put btDhtState(sSession) into tD
    put tD["nodes"] into tNodes
@@ -1611,7 +1754,18 @@ command qsCopySelected
       case "torrent"
          put sShareCodeByHandle[tKey] into tCode
          if tCode is empty then
-            qsLog "That row is a download you are receiving, not a share you created - there is no code to copy."
+            -- a download row has no minted code, but its info-hash IS the share:
+            -- hand out a magnet link, which pastes into ANY torrent client (and
+            -- into this app's own Receive box) - an ex-dead-end, now useful
+            put btInfoHash(tKey) into tCode
+            if tCode is empty then
+               qsLog "No code for that row yet - it is still fetching its details from the swarm."
+               exit qsCopySelected
+            end if
+            put "magnet:?xt=urn:btih:" & tCode & "&tr=" & qsTracker() into tCode
+            set the clipboardData["text"] to tCode
+            qsCopyFlash "qsXferCopy"
+            qsLog "Copied that download as a magnet link - it works in any torrent client, or in this app's Receive box."
             exit qsCopySelected
          end if
          break
@@ -1640,6 +1794,27 @@ command qsCopySelected
    qsCopyFlash "qsXferCopy"
    qsLog "Copied that share's code to the clipboard. Send it to your friend."
 end qsCopySelected
+
+-- Open the newQuickShare download folder in the OS file manager - the #1
+-- post-download question is "where did my file go?". `launch url` on a file:
+-- URL hands the folder to the default handler (VERIFY on-engine per platform);
+-- any failure still prints the exact path, so the button never dead-ends.
+command qsOpenSaveFolder
+   local tPath, tErr
+   put qsSaveFolder() into tPath
+   try
+      if char 1 of tPath is "/" then
+         launch url ("file://" & tPath)
+      else
+         launch url ("file:///" & tPath)   -- Windows drive paths lack the leading /
+      end if
+      if the result is not empty then
+         qsLog "Could not open the folder automatically. Your downloads are in: " & tPath
+      end if
+   catch tErr
+      qsLog "Could not open the folder automatically. Your downloads are in: " & tPath
+   end try
+end qsOpenSaveFolder
 
 command qsStopSelected
    local tId, tType, tKey, tSavedID
