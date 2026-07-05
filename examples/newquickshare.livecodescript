@@ -11,7 +11,7 @@ script "newQuickShareApp"
 --
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI and starts a
--- TorrentXT session. Needs only the loaded org.openxtalk.library.torrent.
+-- No Cloud Quick Share session. Needs only the loaded org.openxtalk.library.torrent.
 --
 -- SAVING AS A STANDALONE: the stack is standalone-ready - the UI self-builds in
 -- preOpenStack every launch (nothing needs to persist in the stackfile), every
@@ -149,7 +149,7 @@ local sEditSalt         -- Argon2id salt for the edit password
 local sEditVerify       -- sxSecretBox verifier: proves a login password is correct
 local sEditSession      -- the current valid edit-session token (random hex), or empty
 -- Clearweb (direct, non-Tor) web sharing. A plain LiveCode socket HTTP server serves
--- a file/folder to any browser at http://<ip>:<port>/<token>/... . TorrentXT's
+-- a file/folder to any browser at http://<ip>:<port>/<token>/... . No Cloud Quick Share's
 -- libtorrent opens the router port automatically (btMapPort / UPnP-NAT-PMP) and
 -- discovers the public IP (the externalIp event), so no manual port forwarding is
 -- needed when the router cooperates; the LAN link always works. The <token> (a random
@@ -726,7 +726,7 @@ command qsClearGeneratedUI
 end qsClearGeneratedUI
 
 command qsLabel pName, pText, pRect, pSize
-   local tTop
+   local tTop, tFH
    if there is no field pName then
       create field
       set the name of the last field to pName
@@ -739,19 +739,21 @@ command qsLabel pName, pText, pRect, pSize
    set the textSize of field pName to pSize
    set the foregroundColor of field pName to kClrInk
    put pText into field pName
-   -- OXT pass 1 taught us never to GUESS font metrics: hand-sized label rects
-   -- (and a single-number `set the margins to 0`, which OXT ignored) clipped the
-   -- bottom of every line on Windows. Ask the engine instead. GROW-ONLY: enlarge
-   -- to formattedHeight when the text needs more room (top pinned), but never
-   -- shrink - so a deliberately tall label keeps its height, AND if
-   -- formattedHeight is unavailable before the window is shown (build runs in
-   -- preOpenStack) the comparison fails safe and the label keeps its rect
-   -- instead of collapsing to zero. Empty labels are skipped (text comes later).
+   -- OXT pass 1 taught us never to GUESS font metrics: hand-sized rects clipped
+   -- text on Windows. So FIT the field to its measured text height (top pinned).
+   -- This does double duty: it prevents clipping (the field exactly holds its
+   -- text), AND it makes `the height of field` equal the TEXT height, which the
+   -- band-title and step-badge centering below rely on to place text on a
+   -- midline. GUARD: only resize when the engine returns a sane measurement -
+   -- a 0/blank formattedHeight (possible before the window is fully realized)
+   -- would collapse the label, so in that case keep the given rect. Empty
+   -- labels are skipped (they receive their text later).
    if pText is not empty then
       set the itemDelimiter to comma
       put item 2 of pRect into tTop
-      if the formattedHeight of field pName > the height of field pName then
-         set the height of field pName to the formattedHeight of field pName
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
          set the top of field pName to tTop
       end if
    end if
@@ -1005,7 +1007,7 @@ command qsStart
    btStartSession
    put the result into sSession
    if sSession is 0 or sSession is empty then
-      qsLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      qsLog "Could not start a session (is another No Cloud Quick Share stack open?):" && btLastError()
       put 0 into sSession
       exit qsStart
    end if
@@ -4081,7 +4083,7 @@ end qsEditListDir
 function qsEditHtml
    return ("<!doctype html><html><head><meta charset='utf-8'>" & \
       "<meta name='viewport' content='width=device-width,initial-scale=1'>" & \
-      "<title>TorrentXT Live Editor</title><style>" & \
+      "<title>No Cloud Quick Share Live Editor</title><style>" & \
       "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;color:#1c2430;background:#fff;height:100vh;display:flex;flex-direction:column}" & \
       "#bar{padding:.6em .9em;border-bottom:1px solid #e5e8ee;display:flex;gap:.8em;align-items:baseline;flex:0 0 auto}" & \
       "#bar b{font-size:1.05em}#msg{font-size:.85em}.muted{color:#8a909a}" & \
@@ -4099,7 +4101,7 @@ function qsEditHtml
       "#files .f:hover{background:#20242c}#tools input,#ed{background:#12151a;color:#dfe4ea}" & \
       "button{background:#20242c;color:#dfe4ea;border-color:#39404b}button:hover{background:#2a2f38}}" & \
       "</style></head><body>" & \
-      "<div id='bar'><b>TorrentXT Live Editor</b><span id='msg' class='muted'>LAN-only. Changes are written to the shared folder.</span></div>" & \
+      "<div id='bar'><b>No Cloud Quick Share Live Editor</b><span id='msg' class='muted'>LAN-only. Changes are written to the shared folder.</span></div>" & \
       "<div id='login'><p>This folder is shared live. Enter the edit password to make changes.</p>" & \
       "<input id='pw' type='password' placeholder='edit password' autofocus>" & \
       "<button id='unlock'>Unlock</button></div>" & \
@@ -4508,7 +4510,7 @@ function qsFsListing pDiskFolder, pUrlPath
       "<h1>" & tHeading & "</h1><span class='cnt'>" & tCount & " item(s)</span></header>" after tOut
    put "<ul class='fl'>" & tRows & "</ul>" after tOut
    put "<footer class='ft'><svg class='ic'><use href='#i-dl'/></svg>" & \
-      "<span>Shared with <b>TorrentXT</b> - downloads resume if interrupted.</span></footer></main>" after tOut
+      "<span>Shared with <b>No Cloud Quick Share</b> - downloads resume if interrupted.</span></footer></main>" after tOut
    put qsFsPageBottom() after tOut
    return tOut
 end qsFsListing
@@ -4856,7 +4858,7 @@ end qsFsHtmlEscape
 -- ==== the CLEARWEB web server (a direct browser link, no Tor) =================
 -- Serves the shared file/folder over a plain LiveCode socket HTTP server, so the
 -- recipient just opens http://<ip>:<port>/<token>/... in ANY browser - no app, no
--- Tor. TorrentXT's libtorrent opens the router port automatically (btMapPort /
+-- Tor. No Cloud Quick Share's libtorrent opens the router port automatically (btMapPort /
 -- UPnP-NAT-PMP) and reports the public IP (the externalIp event); the LAN link always
 -- works. The <token> (random capability string) gates every request, so an open port
 -- is not an open directory to port-scanners. Reuses the qsFs* pure helpers
