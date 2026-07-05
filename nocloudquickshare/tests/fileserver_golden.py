@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """fileserver_golden.py - pure-Python reference for the security- and
-correctness-critical logic of Quick Share's FOLDER web server (the browsable
-directory page served over the onion when a folder is shared with Tor on), in
-examples/torrent-quickshare.livecodescript.
+correctness-critical logic of No Cloud Quick Share's web server (the browsable
+directory page, HTTP range, MIME, request framing, dotfile guard, and the editor
+path-confinement linchpin), in src/nocloudquickshare.livecodescript.
 
-OXT cannot compile/run .livecodescript headlessly, so - exactly like
-onion_frame_golden.py and record_golden_test.py - this PINS the parts of the
-folder server that are verifiable off-engine: the HTTP byte-range parser, the
+OXT cannot compile/run .livecodescript headlessly, so this PINS the parts of the
+web server that are verifiable off-engine: the HTTP byte-range parser, the
 path-traversal decision, the MIME mapping, and the HTML escaper. If this and the
 .livecodescript ever disagree, one of them is wrong.
 
@@ -173,7 +172,7 @@ def fs_icon(name, is_dir):
     return "file"
 
 
-# ---- qsFileSizeSeek: O(log n) file-size probe (newquickshare) ----------------
+# ---- qsFileSizeSeek: O(log n) file-size probe --------------------------------
 # Instead of reading a whole file to size it (a UI-freezing, disk-doubling full read),
 # find EOF by exponential-then-binary search over `seek to N; read 1`. readable(N) means
 # "a byte exists at 0-based offset N" (N < size); the size is the smallest non-readable

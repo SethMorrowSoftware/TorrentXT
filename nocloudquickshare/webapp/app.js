@@ -179,9 +179,9 @@
       '<p class="status" id="swstat" style="margin-top:1.1em">' +
       (swOk ? 'Service worker: <span id="swval" class="muted">checking&hellip;</span>'
             : 'Service worker: <span class="no">not supported by this browser</span>') + '</p></div>' +
-      '<div class="card"><h2>Host it yourself</h2><p class="muted">In Quick Share, drag this ' +
-      '<kbd>quickshare-webapp</kbd> folder onto the drop area, then share it over Tor or tick ' +
-      '<b>Share via web link</b>. Open the link and you are looking at this page.</p></div>';
+      '<div class="card"><h2>Host it yourself</h2><p class="muted">In No Cloud Quick Share, drag this ' +
+      '<kbd>webapp</kbd> folder onto the drop area, then share it over Tor or pick ' +
+      '<b>Web link</b>. Open the link and you are looking at this page.</p></div>';
   }
   function wireAbout() {
     var val = document.getElementById('swval');
