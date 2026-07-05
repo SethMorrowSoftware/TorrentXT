@@ -13,6 +13,19 @@ script "newQuickShareApp"
 -- (Object > Stack Script), then close+reopen. It builds its own UI and starts a
 -- TorrentXT session. Needs only the loaded org.openxtalk.library.torrent.
 --
+-- SAVING AS A STANDALONE: the stack is standalone-ready - the UI self-builds in
+-- preOpenStack every launch (nothing needs to persist in the stackfile), every
+-- handler declares its variables (strict/explicitVariables-clean), and quitting
+-- is caught by shutdownRequest so the session always shuts down properly. In
+-- the standalone builder: (1) include the org.openxtalk.library.torrent
+-- extension - plus org.openxtalk.library.sodium (cryptoXT) for the passphrase
+-- features and OnionXT for the Tor features; both are OPTIONAL and the app
+-- fails closed with a clear message when they are absent; (2) include the
+-- Internet library (libURL) - used only for the public-IP lookup on the web
+-- link path, and harmless if left out (the lookup is try-guarded); (3) no
+-- other inclusions, externals, or resources are needed. Downloads land in
+-- Documents/newQuickShare on every platform.
+--
 -- THE DEMO (two machines, both running this stack):
 --   1. On machine A, drag a file onto the drop area (or click it to choose one).
 --      A 40-character SHARE CODE appears. Click Copy and send it to machine B.
@@ -239,6 +252,10 @@ constant kTorControlPort = "9051"
 constant kTorSocksPortTB = "9150"      -- Tor Browser
 constant kTorControlPortTB = "9151"
 
+-- The user-facing release version: shown in the OS title bar and the startup
+-- log line, so a bug report always says which build it came from.
+constant kQsAppVersion = "1.0.0"
+
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
@@ -277,14 +294,30 @@ constant kClrPillOk = "205,240,214"     -- Tor chip: ready
 constant kClrPillOkText = "22,101,52"
 
 -- ---- lifecycle ---------------------------------------------------------------
-on openStack
+-- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
+-- kQsUiVersion rebuild) never flashes an unstyled or mis-sized window; the
+-- session then starts in openStack once the window is up.
+on preOpenStack
    qsBuild
+end preOpenStack
+
+on openStack
    qsStart
 end openStack
 
 on closeStack
    qsStop
 end closeStack
+
+-- A standalone quits via shutdownRequest (Cmd-Q / Alt-F4 / Dock quit) WITHOUT
+-- a guaranteed closeStack first - and the session MUST be stopped cleanly
+-- either way (pause -> flush resume data -> join the engine threads; tear down
+-- Tor and the web listener; delete temp .enc files). qsStop is idempotent, so
+-- arriving here after closeStack already ran is a safe no-op.
+on shutdownRequest
+   qsStop
+   pass shutdownRequest
+end shutdownRequest
 
 on resumeStack
    -- the window came back to the front: a share code may be waiting on the
@@ -468,7 +501,7 @@ command qsBuild
    -- tear it (VERIFY on-engine: property honoured by the window manager)
    set the resizable of this stack to false
    set the backgroundColor of this card to kClrPage
-   set the title of this stack to "newQuickShare"
+   set the title of this stack to ("newQuickShare " & kQsAppVersion)
 
    -- title band (a plain filled graphic) + tagline + live Tor status chip. Each
    -- band label auto-sizes in qsLabel, then is CENTERED on the band's midline
@@ -1006,9 +1039,9 @@ command qsStart
       qsOnionPill
    end if
    if sCanEncrypt then
-      qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
+      qsLog "newQuickShare " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
-      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
+      qsLog "newQuickShare " & kQsAppVersion & " ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
    -- repaint the method-driven UI now that sCanEncrypt + the method flags are known:
    -- qsBuild ran qsSyncMethod BEFORE this point, when sCanEncrypt was still empty, so
