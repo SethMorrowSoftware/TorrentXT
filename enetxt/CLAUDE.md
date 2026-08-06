@@ -3,12 +3,13 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with
 code in this repository.
 
-> **Phase 0 only.** The plan is `TorrentXT`'s `docs/NEXT-EXTENSIONS-PLAN.md`
-> Part III ("ENet — real-time, step 1"); this folder currently holds the
-> milestone-0 spike (pinned build + shim export/firewall proof + one-process
-> loopback under sanitizers). Phase 1 copies the proven family pattern from
-> the siblings — read `datachannelxt/CLAUDE.md` (or the standalone
-> dataChannelXT repo) for the full as-built rulebook this will inherit.
+> **Phase 1 complete (the full binding).** The plan is `TorrentXT`'s
+> `docs/NEXT-EXTENSIONS-PLAN.md` Part III ("ENet — real-time, step 1");
+> milestones 0–3 are built: the full `enx_` ABI (v2), the LCB layer
+> (`org.openxtalk.library.enet`, public `en*`), helpers, the LAN chat demo,
+> the OXT selftest, all static gates, CI, and the committed linux binary.
+> Runtime behaviour is verified statically; needs an OXT pass
+> (`tests/enet-selftest.livecodescript` + the demo on two machines).
 
 ## The rules that carry over unchanged
 
@@ -27,24 +28,45 @@ code in this repository.
    control) but ENet is not for files — bulk belongs to TorrentXT. Packet
    ownership: `enet_packet_create` copies in; after `enet_peer_send` the host
    owns the packet; on RECEIVE copy the bytes out THEN `enet_packet_destroy`
-   — never hand script a pointer into ENet-owned memory (the spike models
+   — never hand script a pointer into ENet-owned memory (the smoke test models
    this copy-then-destroy shape).
 
-## Phase 0 facts
+## As-built facts (Phase 1)
 
 - Dependency pinned: ENet v1.3.18 (MIT) via FetchContent; headers are SYSTEM
-  headers (their warnings are not ours; our code stays -Wall -Wextra clean).
-- One shared library, bare token `enetxt` (PREFIX "", same shipping shape as
-  the siblings: `src/code/<arch>-<platform>/enetxt.{so,dll,dylib}` later).
+  headers; `CMAKE_POSITION_INDEPENDENT_CODE ON` sits BEFORE FetchContent (a
+  non-PIC static archive cannot link into the shared lib; ld only says "bad
+  value"). One shared library, bare token `enetxt`.
 - `ENETXT_SANITIZE` is the family's GLOBAL sanitizer knob (injected before
   FetchContent so ENet is instrumented too). "address" is the lane that
-  matters; ENet is threadless so TSan is academic.
+  matters; ENet is threadless so there is NO TSan lane, on purpose.
 - `enet_initialize`/`enet_deinitialize` are process-global; the shim
-  refcounts them so paired calls stay balanced (many HOSTS per process are
-  fine — the single-session rule of torrentxt does NOT apply here).
-- The spike is the reference scenario Phase 1's wrapped calls must reproduce:
-  server+client hosts in one process, connect data, reliable echo both ways,
-  unsequenced on a second channel, disconnect data, teardown.
+  refcounts them, and the FINAL deinitialize destroys every surviving host
+  (many HOSTS per process are fine — the torrentxt single-session rule does
+  NOT apply here).
+- **THE LOSSLESS PARTIAL DRAIN** (this binding's one novel structure):
+  enx_poll encodes serviced events into the caller buffer; one that no longer
+  fits goes into the host's ONE-SLOT STASH and the pump STOPS — unserviced
+  events stay inside ENet, the stash goes first next poll. Lossless and
+  ordered at ANY buffer size (pinned by the smoke test's keyhole scenario);
+  no bounded queue or overflow accounting needed because WE decide when
+  events materialize.
+- **Handle lifecycle**: born in enx_connect (outgoing) or at the drain that
+  writes an incoming peer's E_CONNECT (the announcing event carries the
+  newborn handle); the int handle rides ENetPeer.data as a backlink; retired
+  when E_DISCONNECT drains (polite) or immediately on disconnect_now/reset
+  (ENet defines those as locally event-less).
+- **Packet ownership** (ENet's contract, kept everywhere): create COPIES
+  bytes in (never NO_ALLOCATE); after a successful send the host owns the
+  packet (but a REFUSED enet_peer_send leaves it ours — destroy it); on
+  receive, copy out THEN destroy before the drain returns.
+- The 60000-byte budget is enforced both ways: sends refuse with -4;
+  oversized inbound drops WHOLE with an E_ERROR event.
+- Registries (enx_record.h): 15 field ids, 4 event codes, 10 peer states
+  (static_asserted to mirror ENetPeerState — NOTE the real enum spells it
+  ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT), 3 send flags (OUR enum: 0
+  reliable / 1 unreliable / 2 unsequenced — ENet's raw bits would make the
+  safe default a magic number). APPEND-ONLY; adding one bumps the ABI.
 
 ## Building
 
@@ -52,9 +74,9 @@ code in this repository.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENETXT_BUILD_TESTS=ON
 cmake --build build --parallel && ctest --test-dir build --output-on-failure
 cmake -S . -B build-asan -DENETXT_BUILD_TESTS=ON -DENETXT_SANITIZE=address
-cmake --build build-asan --parallel && ./build-asan/enet_spike_test
+cmake --build build-asan --parallel && ./build-asan/enet_smoke_test
 ```
 
 gcc for the sanitizer lane (clang's runtimes are not installed in this
-environment). A shim change is "done" only with the spike green under
+environment). A shim change is "done" only with the smoke test green under
 ASan/UBSan.

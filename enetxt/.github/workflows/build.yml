@@ -1,0 +1,225 @@
+# enetxt CI - the family workflow, sized to this binding:
+#
+#   static-gates    : check-livecodescript + record golden + registry gate +
+#                     record_handle_test under gcc ASan/UBSan (no ENet needed)
+#   sanitize        : the full shim + smoke test under ASan/UBSan with ENet
+#                     itself instrumented (the global ENETXT_SANITIZE knob).
+#                     NO TSan lane on purpose: ENet is threadless and the shim
+#                     spawns nothing - there is no concurrency to sanitize
+#                     (dataChannelXT is the sibling that needs TSan).
+#   build-matrix    : the 5 shipping targets. ENet has no external deps, so
+#                     the acquire steps are tiny (no vcpkg, no OpenSSL).
+#   commit-binaries : on a push TO main - or a manual Run-workflow dispatch ON
+#                     main (the button must be a full substitute for a push;
+#                     GitHub dropped push events for hours the day the sibling
+#                     repo was bootstrapped) - commit the SELF-CONTAINED libs
+#                     into src/code/<arch-platform>/ ([skip ci], so no loop).
+#                     dylibs never commit from CI (host-arch, unsigned; the
+#                     real universal dylib is a separate release build).
+#
+# Runner images are pinned to the current generation (the 22.04-era labels
+# stopped receiving runners in Aug 2026).
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+  # pull_request intentionally omitted: same-repo branch development means the
+  # push event already runs CI and its checks show on the PR.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-gates:
+    name: static gates (lint + golden + sanitized header test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: check-livecodescript
+        run: python3 tools/check-livecodescript.py
+      - name: record golden test
+        run: python3 tests/record_golden_test.py
+      - name: record-registry cross-check
+        run: python3 tools/check-record-registry.py
+      - name: record_handle_test (gcc ASan+UBSan)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
+            -fno-sanitize-recover=all tests/record_handle_test.cpp -o /tmp/rht
+          /tmp/rht
+
+  sanitize:
+    name: full-stack ASan+UBSan (linux x86_64)
+    needs: static-gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build
+      - name: Configure + build + test under ASan/UBSan
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DENETXT_BUILD_TESTS=ON -DENETXT_SANITIZE=address
+          cmake --build build --parallel
+          ./build/record_handle_test
+          ./build/enet_smoke_test
+
+  build-matrix:
+    name: ${{ matrix.name }}
+    needs: static-gates
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            platform_id: x86_64-linux
+            acquire: linux64
+            cmake_args: ""
+          - name: linux-x86
+            os: ubuntu-24.04
+            platform_id: x86-linux
+            acquire: linux32
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
+          - name: macos
+            os: macos-15
+            platform_id: universal-mac
+            acquire: none
+            cmake_args: ""
+          - name: windows-x86_64
+            os: windows-2025
+            platform_id: x86_64-win32
+            acquire: none
+            cmake_args: "-A x64"
+          - name: windows-x86
+            os: windows-2025
+            platform_id: x86-win32
+            acquire: none
+            cmake_args: "-A Win32"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python (for package-extension.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Acquire toolchain (Linux x86_64)
+        if: matrix.acquire == 'linux64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build
+
+      - name: Acquire 32-bit toolchain (Linux x86)
+        if: matrix.acquire == 'linux32'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-multilib gcc-multilib cmake ninja-build
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENETXT_BUILD_TESTS=ON \
+            ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Stage per-platform binary
+        shell: bash
+        run: |
+          python3 tools/package-extension.py \
+            --platform-id ${{ matrix.platform_id }} \
+            --build-dir build || \
+            echo "package-extension: nothing to stage."
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-${{ matrix.platform_id }}
+          path: src/code/${{ matrix.platform_id }}/
+          if-no-files-found: ignore
+
+  commit-binaries:
+    # Same two gates as the sibling repos: main only (CI builds are not
+    # byte-reproducible, so per-branch binary commits collide at merge), and
+    # self-contained libs only. Needs "Read and write" workflow permissions
+    # (or relies on the explicit permissions block below).
+    name: commit native libs to src/code
+    needs: build-matrix
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Download all built native libs
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+          pattern: native-*
+      - name: Place each SELF-CONTAINED lib into its src/code/<arch-platform>/ folder
+        run: |
+          # *.dll  : ENet folds in statically; ship as-is.
+          # *.so   : commit only if it does NOT dynamically NEED enet
+          #          (libc/libstdc++ are fine - present on every Linux target).
+          # *.dylib: never from CI (host-arch, unsigned - see docs/building.md).
+          shopt -s nullglob
+          placed=0
+          for dir in _artifacts/native-*/; do
+            id="${dir#_artifacts/native-}"; id="${id%/}"
+            for f in "$dir"*; do
+              base="$(basename "$f")"
+              case "$base" in
+                *.dylib)
+                  echo "SKIP src/code/$id/$base - macOS CI artifact is host-arch (see docs/building.md)."
+                  continue ;;
+                *.so)
+                  if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*enet'; then
+                    echo "SKIP src/code/$id/$base - dynamically links enet (not self-contained)."
+                    continue
+                  fi ;;
+                *.dll)
+                  : ;;
+                *)
+                  echo "SKIP src/code/$id/$base - not a library file."
+                  continue ;;
+              esac
+              mkdir -p "src/code/$id"
+              cp "$f" "src/code/$id/"
+              echo "placed src/code/$id/$base"
+              placed=1
+            done
+          done
+          rm -rf _artifacts
+          if [ "$placed" = 0 ]; then
+            echo "No self-contained native-lib artifacts to commit."
+          fi
+      - name: Commit refreshed binaries (skip CI to avoid a loop)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/code
+          if git diff --cached --quiet; then
+            echo "Native libs unchanged - nothing to commit."
+            exit 0
+          fi
+          git commit -m "CI: place freshly built native libs in src/code/<arch-platform>/ [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}" || \
+            echo "push rejected (branch advanced during the run); the next push refreshes it."
