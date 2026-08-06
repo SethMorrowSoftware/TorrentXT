@@ -203,6 +203,15 @@ needs an OXT pass" and let a human run `tests/datachannel-selftest.livecodescrip
 8. **`dcPoll` is the ONE buffer call whose return is a COUNT, not bytes** (same
    as TorrentXT's `btPoll`); the walker reads the leading u16 and each entry's
    bodyLen, so the unused buffer tail is never touched.
+9. **LCB idioms do not exist in LiveCode Script** (cost an OXT compile error in
+   the selftest): `{}` is valid LCB but NOT LCS (no array literals at all); a
+   function result cannot be subscripted in LCS (`f(x)["k"]` - put it in a
+   local first); a bare `is empty` on a whole ARRAY is vacuously true (arrays
+   stringify to empty) - count `the keys of` a variable instead; string
+   literals have NO escape syntax (`"\0"` is two ordinary characters - build
+   binary with `numToByte`); and `is` is case-INsensitive, so byte-exact Data
+   comparison needs `set the caseSensitive to true` first. The checker now
+   flags the first two statically (`LCS_ANTIPATTERNS`).
 
 ## The single-threaded performance playbook (carried)
 

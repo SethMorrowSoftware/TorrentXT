@@ -29,7 +29,8 @@ local sPeerA, sPeerB    -- the loopback peers
 local sChanA, sChanB    -- A's channel; B's (learned from dcChannelIncoming)
 local sAOpen, sBOpen    -- "true" once each side's channel open arrived
 local sGotText          -- the text B received
-local sGotBytes         -- the binary payload B received (a Data)
+local sGotBytes         -- the binary payload A received back (a Data)
+local sSentBytes        -- the binary payload B sent (kept for byte-exact compare)
 local sDeadline         -- the async phase's drop-dead time (ms clock)
 local sPhase            -- "", "opening", "messaging", "done"
 
@@ -142,6 +143,7 @@ end stShow
 
 -- ---- the run -----------------------------------------------------------------
 command stRun
+   local tPair
    put 0 into sTotal
    put 0 into sPassed
    put 0 into sFailed
@@ -160,7 +162,12 @@ command stRun
    stAssert "dcPeerState(0) is -1", dcPeerState(0) is -1
    stAssert "dcGatheringState(0) is -1", dcGatheringState(0) is -1
    stAssert "dcLocalDescription(0) empty", dcLocalDescription(0) is empty
-   stAssert "dcSelectedCandidatePair(0) empty", dcSelectedCandidatePair(0) is {}
+   -- an Array crosses from LCB; LiveCode Script has NO `{}` literal, and a
+   -- bare `is empty` on an array is vacuously true (arrays stringify to
+   -- empty) - so emptiness is asserted by counting keys of a LOCAL (a
+   -- function result cannot be subscripted or keyed directly in LCS either)
+   put dcSelectedCandidatePair(0) into tPair
+   stAssert "dcSelectedCandidatePair(0) empty", the number of lines of the keys of tPair is 0
    stAssert "dcCreateChannel(0) is 0", dcCreateChannel(0, "x") is 0
    stAssert "dcSendText(0) errors", dcSendText(0, "x") < 0
    stAssert "dcChannelLabel(0) empty", dcChannelLabel(0) is empty
@@ -189,6 +196,7 @@ command stRun
    put empty into sBOpen
    put empty into sGotText
    put empty into sGotBytes
+   put empty into sSentBytes
    put "opening" into sPhase
    put the milliseconds + 20000 into sDeadline
    stShow
@@ -197,7 +205,7 @@ end stRun
 
 -- One poll pass of the async phase; reschedules itself until done/deadline.
 command stPump
-   local tEvents, tEvent, tDest, tBin
+   local tEvents, tEvent, tDest, tPair
    if sPhase is "done" or sPhase is empty then
       exit stPump
    end if
@@ -242,19 +250,31 @@ command stPump
          stAssert "stream id assigned", dcChannelStreamId(sChanA) >= 0
          stAssert "negotiated max message > 0", dcChannelMaxMessage(sChanA) > 0
          stAssert "buffered amount >= 0", dcBufferedAmount(sChanA) >= 0
-         stAssert "selected pair has localCandidate", dcSelectedCandidatePair(sPeerA)["localCandidate"] is not empty
+         -- keyed access needs a local (LCS cannot subscript a function result)
+         put dcSelectedCandidatePair(sPeerA) into tPair
+         stAssert "selected pair has localCandidate", tPair["localCandidate"] is not empty
          stAssert "dcSendText returns 0", dcSendText(sChanA, "hello oxt") is 0
          put "messaging" into sPhase
       end if
    else if sPhase is "messaging" then
-      if sGotText is not empty and sGotBytes is empty then
+      -- a distinct phase per step, so a slow delivery cannot re-fire the send
+      -- (and re-count the assertions) on every 33 ms pump pass
+      if sGotText is not empty then
          stAssert "text arrived intact", sGotText is "hello oxt"
-         put textEncode("binary\0byte\1round-trip", "UTF-8") into tBin
-         stAssert "dcSendData returns 0", dcSendData(sChanB, tBin) is 0
-         -- note: that send goes B -> A; catch it below via sGotBytes
+         -- REAL embedded NUL/0x01 bytes (LCS string literals have no escape
+         -- syntax - a "\0" would be two ordinary characters), so this proves
+         -- a Data crosses unmangled, not merely that ASCII survives
+         put textEncode("binary", "UTF-8") & numToByte(0) & textEncode("byte", "UTF-8") \
+               & numToByte(1) & textEncode("round-trip", "UTF-8") into sSentBytes
+         stAssert "dcSendData returns 0", dcSendData(sChanB, sSentBytes) is 0
+         put "binary-wait" into sPhase
       end if
+   else if sPhase is "binary-wait" then
       if sGotBytes is not empty then
-         stAssert "binary payload arrived", the number of bytes in sGotBytes > 0
+         -- byte-exact: `is` is case-insensitive by default, which would let
+         -- 0x41 match 0x61 inside binary data
+         set the caseSensitive to true
+         stAssert "binary arrived byte-for-byte (incl. NUL)", sGotBytes is sSentBytes
          stFinish
          exit stPump
       end if
