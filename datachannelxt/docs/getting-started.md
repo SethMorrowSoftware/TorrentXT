@@ -2,7 +2,8 @@
 
 This walks from install to a working two-machine connection. If you want the
 zero-setup proof first, skip to **The loopback demo** — it needs no second
-machine and no signaling infrastructure.
+machine and no signaling infrastructure. If you want the headline act — two
+machines chatting across the internet with no server — that is section 6.
 
 ## 1. Install the extension
 
@@ -134,7 +135,33 @@ between the two panes. Its `dcLocalDescription`/`dcLocalCandidate` handlers are
 the template for real signaling: replace "hand it to the other local peer" with
 "transmit it".
 
-## 6. Where to go next
+## 6. The flagship demo: DHT-signalled chat (two machines, no server)
+
+`examples/datachannel-dht-chat.livecodescript` is the copy/paste flow of
+section 3 with the human removed: **TorrentXT's DHT carries the blobs.** One
+side clicks **Host a room** and sends the room code to the other, who pastes
+it and clicks **Join**; the offer and answer travel as signed BEP44 mutable
+items, ICE punches the NATs, and the chat itself is a direct DTLS data
+channel — no server of yours anywhere, ever.
+
+Worth stealing from it even if you never run it:
+
+- **The room code is a keypair.** `btDhtKeypair` is deterministic on a 64-hex
+  seed, so handing someone the seed hands them the same signing keypair — a
+  shared write-capability for one DHT mailbox, minted fresh per room.
+- **Non-trickle over a slow channel.** A DHT round-trip is seconds, so the
+  demo ships ONE blob per side (wait for `dcGatheringStateChange` == 2), never
+  a candidate trickle.
+- **The 1000-byte BEP44 budget.** Blobs are compressed and, when still too
+  big, split across content-addressed immutable items listed in the mutable
+  head — see the wire-format comment at the top of the script.
+- **Nonce-paired offer/answer.** DHT items linger for hours; a nonce echoed
+  from offer to answer is what lets "Reconnect" reuse a room code safely.
+
+It needs BOTH extensions installed (TorrentXT is probed at startup and the
+demo fails closed with an install message when absent) plus the helpers stack.
+
+## 7. Where to go next
 
 - `docs/api-reference.md` — every handler, event, key, and constant.
 - The runtime self-test (`tests/datachannel-selftest.livecodescript`) — paste

@@ -80,6 +80,17 @@ the helpers: two real WebRTC peers negotiate inside one process — offer, answe
 ICE, DTLS, SCTP — and you chat between two panes. If that works, the whole
 pipeline works; real signaling is the only thing left to add.
 
+## Then try the flagship (two machines, no server)
+
+`examples/datachannel-dht-chat.livecodescript` supplies that real signaling
+with the family's own answer: **TorrentXT's DHT.** Host a room on one machine,
+paste the room code on the other, and the WebRTC handshake travels as signed
+BEP44 items over the BitTorrent DHT — then the chat itself is a direct,
+DTLS-encrypted data channel between the two machines. No account, no server,
+no port forward, nothing to operate. It needs the TorrentXT extension
+installed alongside this one (probed at startup; fails closed with a clear
+message when missing); `docs/getting-started.md` section 6 has the tour.
+
 ## Install
 
 DataChannelXT ships as a standard OXT extension: the LCB module plus the

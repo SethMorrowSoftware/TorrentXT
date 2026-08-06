@@ -227,6 +227,38 @@ candidates). The loopback demo is the four-line proof; TURN is the fallback when
 both NATs are hostile (credentials ride in the ICE-server URI — they are secrets
 in ordinary memory, same caveat as the family's other secrets).
 
+## The flagship demo (datachannel-dht-chat) - decisions that must hold
+
+`examples/datachannel-dht-chat.livecodescript` pairs this extension with
+TorrentXT: BEP44 mutable items carry the WebRTC handshake, then the chat rides
+the direct channel. Its load-bearing decisions:
+
+1. **The room code IS the keypair seed.** `btDhtKeypair` is deterministic on a
+   64-hex seed, so the code is a shared write-capability for one DHT mailbox
+   (both sides sign with the same key; salts "wx-o"/"wx-a" split the slots).
+   Codes are minted fresh per Host click, so they are single-use and stale DHT
+   leftovers can never belong to the current room. Document (not solve) that
+   whoever knows a code can read the SDP blobs (they contain IPs).
+2. **Non-trickle only.** A DHT round-trip is seconds; trickling candidates
+   through it would be absurd. Publish ONE blob per side after
+   `dcGatheringStateChange` == complete.
+3. **The 1000-byte BEP44 budget** forces a wire format: head item
+   `"DXC1" & kind & rest`, kind "D" = zlib(body) inline, kind "C" = comma list
+   of 40-hex immutable-chunk targets (content-addressed = free integrity;
+   republish lands on the same targets). Body = `nonce LF type LF sdp`; split
+   on the FIRST TWO LFs only - the SDP is full of line breaks.
+4. **The nonce pairs answer to offer.** Both sides dedup/reject on it, which
+   is what makes Reconnect-under-the-same-code safe while stale items float
+   around the DHT for hours. Seq also rises, but the nonce is the simpler,
+   role-symmetric guard.
+5. **The folder stays standalone.** The demo depends on TorrentXT's EXTENSION,
+   never its example files - the bt poll loop is inlined (a dozen lines), and
+   both extensions are probed at startup with guarded calls that fail closed
+   (the family's cryptoXT pattern).
+6. **One standing timer chain per loop**, armed once at start, rescheduling
+   first and no-oping by phase. Arming chains per user action (Host/Join/
+   Reconnect) stacks duplicates that double every poll and republish.
+
 ## Git / workflow
 
 - Develop on the per-task branch; commit there; draft PR if none exists.
