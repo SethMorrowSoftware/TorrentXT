@@ -1,0 +1,899 @@
+library org.openxtalk.library.datachannel
+
+-- datachannel.lcb - the LCB binding for DataChannelXT (library
+-- org.openxtalk.library.datachannel). It declares one `private foreign
+-- handler` per dcx_* symbol in src/dcx_abi.h and wraps each in a `public dc*`
+-- handler that hides every handle, pre-sizes and reuses the poll/scratch
+-- buffers, walks the big-endian KV records by byte arithmetic, and never
+-- throws into script.
+--
+-- The FFI idiom for byte buffers (carried from TorrentXT - the hard-won
+-- lesson). An LCB Data does NOT auto-bridge to a C `void*` (the Language
+-- Reference is explicit: "No automatic bridging from Data or String to
+-- Pointer exists" - a Data marshals as an MCDataRef). So:
+--   * OUTPUT buffers (C fills them) are raw blocks from the engine <builtin>
+--     MCMemoryAllocate, passed as a real Pointer. C returns bytes-written (or
+--     the negative of the capacity it needed, so we grow and retry), then we
+--     copy the written bytes back into a Data with MCDataCreateWithBytes and
+--     walk them.
+--   * INPUT buffers (C reads them) pass MCDataGetBytePtr(theData) - the
+--     read-only pointer to a Data's own bytes - together with the byte count.
+--   * records are walked with `the code of (byte I of D)` (big-endian u16)
+--     and `byte X to Y of D` for sub-ranges.
+--   * every foreign call sits inside `unsafe ... end unsafe`; all `variable`s
+--     are declared at the top of their handler.
+--
+-- The numeric constants below MIRROR src/dcx_record.h; tools/check-record-
+-- registry.py proves they never drift.
+--
+-- THE MODEL (the one WebRTC twist an xTalk author must know): everything is
+-- asynchronous, and SIGNALING IS YOURS. Creating a channel does not connect
+-- anything; it starts a negotiation whose artifacts (a description, then
+-- candidates) arrive as dcPoll events that YOUR code must carry to the other
+-- peer over any channel you have (TorrentXT's DHT, a copy/paste, a server),
+-- and the remote's artifacts come back into dcSetRemoteDescription /
+-- dcAddRemoteCandidate. Then the channelOpen event says "now you can talk".
+-- The examples show both trickle (ship each candidate) and copy/paste (wait
+-- for gathering complete, ship one blob) styles.
+--
+-- Runtime behaviour needs an OXT pass to confirm (OXT cannot compile/run .lcb
+-- headlessly); the static gate tools/check-livecodescript.py is run on every
+-- edit. If `textDecode`/byte-chunk operators fail to resolve in a given OXT
+-- build, add `use com.livecode.byte` alongside the foreign import below.
+
+use com.livecode.foreign
+
+metadata version is "0.1.0"
+metadata author is "Seth Morrow Software"
+metadata title is "DataChannelXT"
+
+-- ===================================================================== --
+--  Constants
+-- ===================================================================== --
+
+-- Must equal DCX_ABI_VERSION in src/dcx_abi.h; _checkABI() throws on skew.
+constant kABIVersion is 1
+
+-- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
+-- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText via MCStringDecode.
+constant kEncodingUtf8 is 4
+
+-- The per-message size budget, mirroring DCX_MAX_MESSAGE in dcx_abi.h: sends
+-- above it fail with error -4 (too large); a compliant remote never sends
+-- above it back. Chunk bigger payloads, or move bulk via TorrentXT.
+constant kMaxMessage is 60000
+
+-- Reusable buffer capacities (the single-thread performance playbook:
+-- allocate once, reuse every poll, never rebuild). Grown on demand when the
+-- shim reports a bigger -needed. The drain default holds one max-size message
+-- with room to spare; scratch covers an SDP (a few KB).
+constant kDrainCap is 65536
+constant kScratchCap is 8192
+
+-- Record field value types (mirror dcx_record.h FieldType -> kType*).
+constant kTypeInt is 0
+constant kTypeReal is 1
+constant kTypeUtf8 is 2
+constant kTypeRaw is 3
+constant kTypeHex is 4
+
+-- Record field ids (mirror dcx_record.h FieldId -> kField*).
+constant kFieldDcPeer is 1
+constant kFieldDcChannel is 2
+constant kFieldDcSdp is 3
+constant kFieldDcSdpType is 4
+constant kFieldDcCandidate is 5
+constant kFieldDcMid is 6
+constant kFieldDcState is 7
+constant kFieldDcLabel is 8
+constant kFieldDcProtocol is 9
+constant kFieldDcPayload is 10
+constant kFieldDcText is 11
+constant kFieldDcError is 12
+constant kFieldDcDropped is 13
+constant kFieldDcLocalCand is 14
+constant kFieldDcRemoteCand is 15
+constant kFieldDcStreamId is 16
+
+-- Stable event type codes (mirror dcx_record.h EventType -> kEvent*).
+constant kEventLocalDescription is 1
+constant kEventLocalCandidate is 2
+constant kEventStateChange is 3
+constant kEventGatheringState is 4
+constant kEventChannelIncoming is 5
+constant kEventChannelOpen is 6
+constant kEventChannelClosed is 7
+constant kEventMessage is 8
+constant kEventChannelError is 9
+constant kEventBufferedLow is 10
+constant kEventQueueOverflow is 11
+
+-- Peer-connection states (mirror dcx_record.h PeerState -> kPeerState*; the
+-- W3C numbering). dcPeerState returns one of these, or -1 for a bad handle.
+constant kPeerStateNew is 0
+constant kPeerStateConnecting is 1
+constant kPeerStateConnected is 2
+constant kPeerStateDisconnected is 3
+constant kPeerStateFailed is 4
+constant kPeerStateClosed is 5
+
+-- ICE gathering states (mirror dcx_record.h GatheringState -> kGathering*).
+constant kGatheringNew is 0
+constant kGatheringInProgress is 1
+constant kGatheringComplete is 2
+
+-- ===================================================================== --
+--  Module state: the reusable poll/scratch buffers
+-- ===================================================================== --
+
+-- Reusable raw buffers for the fill-a-buffer FFI (allocated via the verified
+-- engine <builtin> MCMemoryAllocate; an LCB Data does not bridge to a void*).
+-- Each pairs a Pointer with its current byte capacity. They persist for the
+-- process - bounded reuse, the single-thread playbook - because there is no
+-- deterministic library-unload hook to free them at.
+variable sDrainPtr as Pointer
+variable sDrainCap as Integer
+variable sScratchPtr as Pointer
+variable sScratchCap as Integer
+
+-- ===================================================================== --
+--  Foreign handlers (one per dcx_* symbol in dcx_abi.h). Buffer params are
+--  `Pointer` - we hand them MCMemoryAllocate blocks (output) or
+--  MCDataGetBytePtr pointers (input), never a Data value; short strings are
+--  ZStringUTF8. All cdecl. Never rename these binds.
+-- ===================================================================== --
+
+private foreign handler _dcx_abi_version() returns CInt binds to "c:datachannelxt>dcx_abi_version!cdecl"
+private foreign handler _dcx_init() returns CInt binds to "c:datachannelxt>dcx_init!cdecl"
+private foreign handler _dcx_cleanup() returns CInt binds to "c:datachannelxt>dcx_cleanup!cdecl"
+private foreign handler _dcx_library_version(in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_library_version!cdecl"
+private foreign handler _dcx_last_error(in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_last_error!cdecl"
+private foreign handler _dcx_clear_error() returns nothing binds to "c:datachannelxt>dcx_clear_error!cdecl"
+
+private foreign handler _dcx_peer_new(in pIceServers as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_peer_new!cdecl"
+private foreign handler _dcx_peer_close(in pPeer as CInt) returns CInt binds to "c:datachannelxt>dcx_peer_close!cdecl"
+private foreign handler _dcx_peer_free(in pPeer as CInt) returns nothing binds to "c:datachannelxt>dcx_peer_free!cdecl"
+private foreign handler _dcx_set_local_description(in pPeer as CInt, in pType as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_set_local_description!cdecl"
+private foreign handler _dcx_set_remote_description(in pPeer as CInt, in pSdp as ZStringUTF8, in pType as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_set_remote_description!cdecl"
+private foreign handler _dcx_add_remote_candidate(in pPeer as CInt, in pCand as ZStringUTF8, in pMid as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_add_remote_candidate!cdecl"
+private foreign handler _dcx_local_description(in pPeer as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_local_description!cdecl"
+private foreign handler _dcx_local_description_type(in pPeer as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_local_description_type!cdecl"
+private foreign handler _dcx_peer_state(in pPeer as CInt) returns CInt binds to "c:datachannelxt>dcx_peer_state!cdecl"
+private foreign handler _dcx_gathering_state(in pPeer as CInt) returns CInt binds to "c:datachannelxt>dcx_gathering_state!cdecl"
+private foreign handler _dcx_selected_candidate_pair(in pPeer as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_selected_candidate_pair!cdecl"
+
+private foreign handler _dcx_channel_new(in pPeer as CInt, in pLabel as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_channel_new!cdecl"
+private foreign handler _dcx_channel_new_ex(in pPeer as CInt, in pLabel as ZStringUTF8, in pProtocol as ZStringUTF8, in pUnordered as CInt, in pMaxRetransmits as CInt, in pMaxLifetimeMs as CInt, in pNegotiated as CInt, in pStreamId as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_new_ex!cdecl"
+private foreign handler _dcx_channel_close(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_close!cdecl"
+private foreign handler _dcx_channel_free(in pChan as CInt) returns nothing binds to "c:datachannelxt>dcx_channel_free!cdecl"
+private foreign handler _dcx_send_data(in pChan as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:datachannelxt>dcx_send_data!cdecl"
+private foreign handler _dcx_send_text(in pChan as CInt, in pText as ZStringUTF8) returns CInt binds to "c:datachannelxt>dcx_send_text!cdecl"
+private foreign handler _dcx_channel_label(in pChan as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_label!cdecl"
+private foreign handler _dcx_channel_protocol(in pChan as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_protocol!cdecl"
+private foreign handler _dcx_channel_stream_id(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_stream_id!cdecl"
+private foreign handler _dcx_channel_is_open(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_is_open!cdecl"
+private foreign handler _dcx_channel_peer(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_peer!cdecl"
+private foreign handler _dcx_channel_max_message(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_channel_max_message!cdecl"
+private foreign handler _dcx_buffered_amount(in pChan as CInt) returns CInt binds to "c:datachannelxt>dcx_buffered_amount!cdecl"
+private foreign handler _dcx_set_buffered_low_threshold(in pChan as CInt, in pAmount as CInt) returns CInt binds to "c:datachannelxt>dcx_set_buffered_low_threshold!cdecl"
+
+private foreign handler _dcx_poll(in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:datachannelxt>dcx_poll!cdecl"
+
+-- ===================================================================== --
+--  Engine Foundation <builtin> foreign handlers
+-- ===================================================================== --
+-- These bind to the engine's own libfoundation, not to our shim. They are the
+-- sanctioned bridge between LCB Data/Pointer and raw C buffers. NOTE: a
+-- `<builtin>` handler resolves by its NAME matching the engine symbol, so
+-- these - unlike every other private handler in this file - carry NO leading
+-- `_`. Renaming any of them breaks the binding.
+private foreign handler MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+
+-- ===================================================================== --
+--  Private helpers
+-- ===================================================================== --
+
+-- Throw a clear error if the loaded native library's ABI does not match this
+-- binding. Better a legible throw at startup than a crash at first use.
+private handler _checkABI()
+   variable tABI as Integer
+   unsafe
+      put _dcx_abi_version() into tABI
+   end unsafe
+   if tABI is not kABIVersion then
+      throw "DataChannelXT native library ABI does not match the LCB binding; rebuild and repackage the native library."
+   end if
+end handler
+
+-- Ensure the reusable drain buffer holds at least pNeed bytes. A grow frees
+-- the old block and allocates fresh (MCMemoryReallocate is not a confirmed
+-- <builtin>); it only happens when the shim reports a -needed past the
+-- current capacity, which is rare. Capacity 0 doubles as "not allocated yet".
+private handler _ensureDrain(in pNeed as Integer)
+   variable tOk as Boolean
+   if sDrainCap < pNeed then
+      if sDrainCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sDrainPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sDrainPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "DataChannelXT: failed to allocate the drain buffer."
+      end if
+      put pNeed into sDrainCap
+   end if
+end handler
+
+private handler _ensureScratch(in pNeed as Integer)
+   variable tOk as Boolean
+   if sScratchCap < pNeed then
+      if sScratchCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sScratchPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sScratchPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "DataChannelXT: failed to allocate the scratch buffer."
+      end if
+      put pNeed into sScratchCap
+   end if
+end handler
+
+-- Copy the pLen bytes the shim wrote into our raw buffer back into a fresh
+-- Data the record walkers can index by byte. Empty Data on a non-positive
+-- length or an allocation failure.
+private handler _bufToData(in pPtr as Pointer, in pLen as Integer) returns Data
+   variable tData as Data
+   variable tOk as Boolean
+   put the empty data into tData
+   if pLen > 0 then
+      put false into tOk
+      unsafe
+         put MCDataCreateWithBytes(pPtr, pLen, tData) into tOk
+      end unsafe
+      if not tOk then
+         put the empty data into tData
+      end if
+   end if
+   return tData
+end handler
+
+-- Read a big-endian u16 at 1-based byte offset pOffset (the wire is network
+-- order; this is the inverse of the shim's put_u16).
+private handler _readU16(in pData as Data, in pOffset as Integer) returns Integer
+   variable tHi as Integer
+   variable tLo as Integer
+   put the code of (byte pOffset of pData) into tHi
+   put the code of (byte (pOffset + 1) of pData) into tLo
+   return tHi * 256 + tLo
+end handler
+
+-- Decode pLen bytes of UTF-8 (1-based pStart) into a String via the engine's
+-- MCStringDecode (declared above); LCB has no `textDecode` handler.
+private handler _decodeText(in pData as Data, in pStart as Integer, in pLen as Integer) returns String
+   variable tSub as Data
+   variable tStr as String
+   variable tOk as Boolean
+   if pLen <= 0 then
+      return ""
+   end if
+   put byte pStart to (pStart + pLen - 1) of pData into tSub
+   put "" into tStr
+   unsafe
+      put MCStringDecode(tSub, kEncodingUtf8, false, tStr) into tOk
+   end unsafe
+   if tOk then
+      return tStr
+   end if
+   return ""
+end handler
+
+-- Read a string-filling getter through the scratch buffer with one
+-- grow-and-retry, returning the decoded text ("" on empty/stale handle).
+-- The three string getters share this shape; LCB cannot pass a handler as a
+-- value, so each public wrapper repeats the two-call dance inline instead.
+
+-- Map a record field id to its script-facing array key. "" means "skip"
+-- (an unknown id, which the registry checker prevents in practice).
+private handler _fieldKey(in pId as Integer) returns String
+   if pId is kFieldDcPeer then
+      return "peer"
+   else if pId is kFieldDcChannel then
+      return "channel"
+   else if pId is kFieldDcSdp then
+      return "sdp"
+   else if pId is kFieldDcSdpType then
+      return "sdpType"
+   else if pId is kFieldDcCandidate then
+      return "candidate"
+   else if pId is kFieldDcMid then
+      return "mid"
+   else if pId is kFieldDcState then
+      return "state"
+   else if pId is kFieldDcLabel then
+      return "label"
+   else if pId is kFieldDcProtocol then
+      return "protocol"
+   else if pId is kFieldDcPayload then
+      return "payload"
+   else if pId is kFieldDcText then
+      return "text"
+   else if pId is kFieldDcError then
+      return "error"
+   else if pId is kFieldDcDropped then
+      return "dropped"
+   else if pId is kFieldDcLocalCand then
+      return "localCandidate"
+   else if pId is kFieldDcRemoteCand then
+      return "remoteCandidate"
+   else if pId is kFieldDcStreamId then
+      return "streamId"
+   else
+      return ""
+   end if
+end handler
+
+-- Map a stable event code to the semantic message name the poll dispatcher
+-- sends (see examples/datachannel-helpers.livecodescript).
+private handler _eventName(in pCode as Integer) returns String
+   if pCode is kEventLocalDescription then
+      return "dcLocalDescription"
+   else if pCode is kEventLocalCandidate then
+      return "dcLocalCandidate"
+   else if pCode is kEventStateChange then
+      return "dcStateChange"
+   else if pCode is kEventGatheringState then
+      return "dcGatheringStateChange"
+   else if pCode is kEventChannelIncoming then
+      return "dcChannelIncoming"
+   else if pCode is kEventChannelOpen then
+      return "dcChannelOpen"
+   else if pCode is kEventChannelClosed then
+      return "dcChannelClosed"
+   else if pCode is kEventMessage then
+      return "dcMessage"
+   else if pCode is kEventChannelError then
+      return "dcChannelError"
+   else if pCode is kEventBufferedLow then
+      return "dcBufferedLow"
+   else if pCode is kEventQueueOverflow then
+      return "dcQueueOverflow"
+   else
+      return "dcEvent"
+   end if
+end handler
+
+-- Walk one bare kvrecord starting at 1-based pStart into an Array, using the
+-- field-id -> key mapping. Raw fields become Data; everything else a String
+-- (lossless for display and `the number`-parsable for ints).
+private handler _parseRecord(in pData as Data, in pStart as Integer) returns Array
+   variable tRec as Array
+   variable tOffset as Integer
+   variable tCount as Integer
+   variable tI as Integer
+   variable tId as Integer
+   variable tType as Integer
+   variable tLen as Integer
+   variable tKey as String
+   put {} into tRec
+   put pStart into tOffset
+   put _readU16(pData, tOffset) into tCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tCount
+      put the code of (byte tOffset of pData) into tId
+      put the code of (byte (tOffset + 1) of pData) into tType
+      add 2 to tOffset
+      put _readU16(pData, tOffset) into tLen
+      add 2 to tOffset
+      put _fieldKey(tId) into tKey
+      if tKey is not "" then
+         if tType is kTypeRaw then
+            if tLen > 0 then
+               put byte tOffset to (tOffset + tLen - 1) of pData into tRec[tKey]
+            else
+               put the empty data into tRec[tKey]
+            end if
+         else
+            put _decodeText(pData, tOffset, tLen) into tRec[tKey]
+         end if
+      end if
+      add tLen to tOffset
+   end repeat
+   return tRec
+end handler
+
+-- ===================================================================== --
+--  Public API: lifecycle & diagnostics
+-- ===================================================================== --
+
+-- Initialise the native layer (quiet logging, warm the DTLS certificate).
+-- Optional - dcCreatePeer calls it implicitly - but calling it early at
+-- startup moves the one-time certificate cost off the first connection.
+-- Verifies the ABI (throws a clear error on skew). Returns 0 on success.
+public handler dcInit() returns Integer
+   variable tR as Integer
+   _checkABI()
+   unsafe
+      put _dcx_init() into tR
+   end unsafe
+   return tR
+end handler
+
+-- Tear EVERYTHING down: every peer connection, every channel, the native
+-- threads. The app MUST call this before quitting (e.g. on closeStack) -
+-- there is no automatic unload hook, and skipping it leaks native threads.
+-- Idempotent; after it, dcCreatePeer works again. Returns 0 on success.
+public handler dcCleanup() returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_cleanup() into tR
+   end unsafe
+   return tR
+end handler
+
+-- "libdatachannel <tag>" - which pinned engine this binary was built from.
+public handler dcLibraryVersion() returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_library_version(sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_library_version(sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- The module-static last-error string ("" when there is no error).
+public handler dcLastError() returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_last_error(sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_last_error(sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+public handler dcClearError()
+   unsafe
+      _dcx_clear_error()
+   end unsafe
+end handler
+
+-- ===================================================================== --
+--  Public API: peer connections
+-- ===================================================================== --
+
+-- Create a peer connection. pIceServers is a return-separated list of ICE
+-- server URIs, e.g. "stun:stun.l.google.com:19302" (one per line; TURN as
+-- "turn:user:pass@host:port?transport=udp"); "" means none (LAN / loopback).
+-- Returns a positive peer handle, or 0 on failure (see dcLastError).
+-- Auto-negotiation is on: creating the first channel produces the offer, and
+-- applying a remote offer produces the answer - both arrive as
+-- dcLocalDescription events for YOUR signaling code to deliver.
+public handler dcCreatePeer(in pIceServers as String) returns Integer
+   variable tPeer as Integer
+   _checkABI()
+   unsafe
+      put _dcx_peer_new(pIceServers) into tPeer
+   end unsafe
+   return tPeer
+end handler
+
+-- Politely close (state events still arrive; the handle stays inspectable
+-- until dcFreePeer). Returns 0 on success.
+public handler dcClosePeer(in pPeer as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_peer_close(pPeer) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Close AND destroy the peer, all its channels, and their handles.
+-- Idempotent; a stale handle is a harmless no-op.
+public handler dcFreePeer(in pPeer as Integer)
+   unsafe
+      _dcx_peer_free(pPeer)
+   end unsafe
+end handler
+
+-- Manual renegotiation only (auto-negotiation normally does this for you).
+-- pType is "offer", "answer", or "" (let the engine pick).
+public handler dcSetLocalDescription(in pPeer as Integer, in pType as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_set_local_description(pPeer, pType) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Apply the REMOTE side's description, received over your signaling channel.
+-- pType is "offer" or "answer" (the dcLocalDescription event on their side
+-- carried it as "sdpType"). Applying an offer auto-emits our answer.
+public handler dcSetRemoteDescription(in pPeer as Integer, in pSdp as String, in pType as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_set_remote_description(pPeer, pSdp, pType) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Apply one REMOTE ICE candidate from your signaling channel. pMid may be ""
+-- (the engine resolves it).
+public handler dcAddRemoteCandidate(in pPeer as Integer, in pCandidate as String, in pMid as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_add_remote_candidate(pPeer, pCandidate, pMid) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The current local description (the whole SDP, "" if none yet). After the
+-- gathering state reaches kGatheringComplete this SDP CONTAINS the gathered
+-- candidates - the basis of copy/paste (non-trickle) signaling: ship just
+-- this one blob, skip per-candidate shipping entirely.
+public handler dcLocalDescription(in pPeer as Integer) returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_local_description(pPeer, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_local_description(pPeer, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- "offer" / "answer" / "" - the current local description's type.
+public handler dcLocalDescriptionType(in pPeer as Integer) returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_local_description_type(pPeer, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_local_description_type(pPeer, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- The connection state (kPeerState*), or -1 for a stale handle. 0 IS a real
+-- state (new), which is why the bad-handle answer is -1, not 0.
+public handler dcPeerState(in pPeer as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_peer_state(pPeer) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The ICE gathering state (kGathering*), or -1 for a stale handle.
+public handler dcGatheringState(in pPeer as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_gathering_state(pPeer) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Once connected: the selected ICE pair as an array with "localCandidate"
+-- and "remoteCandidate" keys - shows whether the path is direct (typ host /
+-- srflx) or relayed (typ relay). Empty array until a pair is selected.
+public handler dcSelectedCandidatePair(in pPeer as Integer) returns Array
+   variable tCount as Integer
+   variable tRec as Array
+   put {} into tRec
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_selected_candidate_pair(pPeer, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_selected_candidate_pair(pPeer, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tRec
+   end if
+   put _parseRecord(_bufToData(sScratchPtr, tCount), 1) into tRec
+   return tRec
+end handler
+
+-- ===================================================================== --
+--  Public API: data channels
+-- ===================================================================== --
+
+-- Create an outgoing channel (reliable + ordered - the default). The FIRST
+-- channel on a fresh peer triggers the offer. NOT usable until its
+-- dcChannelOpen event arrives. Returns a channel handle, or 0 on failure.
+public handler dcCreateChannel(in pPeer as Integer, in pLabel as String) returns Integer
+   variable tChan as Integer
+   unsafe
+      put _dcx_channel_new(pPeer, pLabel) into tChan
+   end unsafe
+   return tChan
+end handler
+
+-- Create a channel with explicit reliability/negotiation options - the
+-- real-time half of WebRTC:
+--   pProtocol        subprotocol string ("" for none)
+--   pUnordered       true: out-of-order delivery allowed
+--   pMaxRetransmits  >= 0: at most N retransmissions (unreliable); -1 unset
+--   pMaxLifetimeMs   >= 0: retransmit at most N ms (unreliable); -1 unset
+--                    (set at most ONE of the two)
+--   pNegotiated      true: out-of-band channel - BOTH sides must create it
+--                    with the SAME pStreamId; no in-band open handshake
+--   pStreamId        explicit stream id 0..65534 for negotiated; -1 = auto
+public handler dcCreateChannelEx(in pPeer as Integer, in pLabel as String, in pProtocol as String, in pUnordered as Boolean, in pMaxRetransmits as Integer, in pMaxLifetimeMs as Integer, in pNegotiated as Boolean, in pStreamId as Integer) returns Integer
+   variable tChan as Integer
+   variable tUnordered as Integer
+   variable tNegotiated as Integer
+   if pUnordered then
+      put 1 into tUnordered
+   else
+      put 0 into tUnordered
+   end if
+   if pNegotiated then
+      put 1 into tNegotiated
+   else
+      put 0 into tNegotiated
+   end if
+   unsafe
+      put _dcx_channel_new_ex(pPeer, pLabel, pProtocol, tUnordered, pMaxRetransmits, pMaxLifetimeMs, tNegotiated, pStreamId) into tChan
+   end unsafe
+   return tChan
+end handler
+
+-- Politely close (both sides see dcChannelClosed; the handle stays
+-- inspectable until dcFreeChannel). Returns 0 on success.
+public handler dcCloseChannel(in pChannel as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_channel_close(pChannel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Close AND destroy the channel, freeing its handle. Idempotent.
+public handler dcFreeChannel(in pChannel as Integer)
+   unsafe
+      _dcx_channel_free(pChannel)
+   end unsafe
+end handler
+
+-- Send one BINARY message (a browser peer receives an ArrayBuffer; an OXT
+-- peer a dcMessage event with a "payload" Data). Fails -4 over kMaxMessage.
+-- An empty Data sends an empty message.
+public handler dcSendData(in pChannel as Integer, in pData as Data) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen is 0 then
+      -- no byte pointer exists for an empty Data; hand the shim the (always
+      -- allocated) scratch block with length 0 - the shim never reads it
+      _ensureScratch(kScratchCap)
+      unsafe
+         put _dcx_send_data(pChannel, sScratchPtr, 0) into tR
+      end unsafe
+   else
+      unsafe
+         put MCDataGetBytePtr(pData) into tPtr
+         put _dcx_send_data(pChannel, tPtr, tLen) into tR
+      end unsafe
+   end if
+   return tR
+end handler
+
+-- Send one TEXT message (a browser peer receives a string; an OXT peer a
+-- dcMessage event with a "text" key). Fails -4 over kMaxMessage.
+public handler dcSendText(in pChannel as Integer, in pText as String) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_send_text(pChannel, pText) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The channel's label ("" for a stale handle).
+public handler dcChannelLabel(in pChannel as Integer) returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_channel_label(pChannel, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_channel_label(pChannel, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- The channel's subprotocol ("" when none / stale).
+public handler dcChannelProtocol(in pChannel as Integer) returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _dcx_channel_protocol(pChannel, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _dcx_channel_protocol(pChannel, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- The channel's SCTP stream id, or -1 (stale / not assigned yet). Stream 0
+-- is valid, hence -1 for "no value".
+public handler dcChannelStreamId(in pChannel as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_channel_stream_id(pChannel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- true while the channel is open and sendable.
+public handler dcChannelIsOpen(in pChannel as Integer) returns Boolean
+   variable tR as Integer
+   unsafe
+      put _dcx_channel_is_open(pChannel) into tR
+   end unsafe
+   return tR is not 0
+end handler
+
+-- The peer handle this channel belongs to (0 for a stale handle). Handy in
+-- the dcMessage handler when one app drives several connections.
+public handler dcChannelPeer(in pChannel as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_channel_peer(pChannel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- The NEGOTIATED per-message limit for this channel (bytes; -1 stale).
+-- Sends must satisfy both this and kMaxMessage.
+public handler dcChannelMaxMessage(in pChannel as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_channel_max_message(pChannel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Bytes queued to send but not yet handed to the transport (-1 stale).
+-- Poll it and throttle when it climbs - or use the threshold event below.
+public handler dcBufferedAmount(in pChannel as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_buffered_amount(pChannel) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Arm the dcBufferedLow event: it fires when the send buffer drains back
+-- under pAmount bytes. The backpressure pattern: send until dcBufferedAmount
+-- exceeds a high-water mark, then stop until dcBufferedLow.
+public handler dcSetBufferedLowThreshold(in pChannel as Integer, in pAmount as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _dcx_set_buffered_low_threshold(pChannel, pAmount) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: the event drain
+-- ===================================================================== --
+
+-- Drain ALL pending events in ONE FFI round-trip (the single-thread
+-- playbook). Returns a List of event Arrays, oldest first; each carries
+-- "code" (the numeric kEvent*), "name" (the semantic message name, e.g.
+-- "dcMessage"), "peer", "channel", and the event-specific keys from the
+-- field table ("sdp", "sdpType", "candidate", "mid", "state", "label",
+-- "protocol", "payload" (Data), "text", "error", "dropped"). Call it on a
+-- timer (16-33 ms for real-time feel; the interval is a latency knob, never
+-- a correctness knob) - or just use dcStartPolling from the helpers script.
+public handler dcPoll() returns List
+   variable tEvents as List
+   variable tCount as Integer
+   variable tOffset as Integer
+   variable tEventCount as Integer
+   variable tType as Integer
+   variable tBodyLen as Integer
+   variable tEvent as Array
+   variable tI as Integer
+   variable tBuf as Data
+   put [] into tEvents
+   _ensureDrain(kDrainCap)
+   unsafe
+      put _dcx_poll(sDrainPtr, sDrainCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      -- even the first record did not fit; grow to the needed size, retry once
+      _ensureDrain(-tCount)
+      unsafe
+         put _dcx_poll(sDrainPtr, sDrainCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tEvents
+   end if
+   -- IMPORTANT: dcx_poll is the ONE buffer call that returns the EVENT COUNT
+   -- on success, not a byte length (every other dcx_* returns bytes). So copy
+   -- the WHOLE buffer and let the on-wire framing bound the walk - the
+   -- [eventCount:u16] header below is the loop count and each record carries
+   -- its own bodyLen. The records sit at the front; the unused tail is never
+   -- touched.
+   put _bufToData(sDrainPtr, sDrainCap) into tBuf
+   put 1 into tOffset
+   put _readU16(tBuf, tOffset) into tEventCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tEventCount
+      -- entry := [eventType:u16][bodyLen:u16][kvrecord]
+      put _readU16(tBuf, tOffset) into tType
+      put _readU16(tBuf, tOffset + 2) into tBodyLen
+      put _parseRecord(tBuf, tOffset + 4) into tEvent
+      put tType into tEvent["code"]
+      put _eventName(tType) into tEvent["name"]
+      push tEvent onto tEvents
+      add (4 + tBodyLen) to tOffset
+   end repeat
+   return tEvents
+end handler
+
+-- A library module must be closed with `end library` (matching the opening
+-- `library ...` declaration) or OXT reports a syntax error at end-of-file.
+end library

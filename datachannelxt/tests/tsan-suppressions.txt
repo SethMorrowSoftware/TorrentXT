@@ -1,0 +1,15 @@
+# ThreadSanitizer suppressions for the DataChannelXT TSan lane.
+#
+# SCOPE RULE: this file may ONLY ever suppress races whose racing accesses both
+# live inside a vendored dependency. A report with a datachannel_shim.cpp frame
+# among the RACING ACCESSES is ours and must be FIXED, never suppressed here
+# (a shim frame in the thread-CREATION provenance is fine — our init spawns
+# the dependency's thread pool, so it appears in every report's ancestry).
+#
+# usrsctp: the SCTP SACK fast path (sctp_express_handle_sack and friends in
+# netinet/sctp_indata.c) reads association counters without the association
+# lock — a long-standing upstream pattern TSan flags between the DTLS-recv and
+# SCTP-iterator threads. Both accesses are wholly inside usrsctp; nothing of
+# ours is involved. Suppress by the function-name prefix all of usrsctp's
+# internals share (no shim symbol starts with sctp_, so the scope holds).
+race:sctp_

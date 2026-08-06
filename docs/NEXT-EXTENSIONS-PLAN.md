@@ -27,9 +27,9 @@ leg of it:
 | Layer | Library | Role | Status |
 |---|---|---|---|
 | Discovery + bulk transfer | **TorrentXT** (libtorrent) | DHT rendezvous + BitTorrent file movement | done (ABI v8) |
-| Trust | **libsodium** | identity, signing, encryption, password hashing | planned - **do first** |
-| Real-time (reliable UDP) | **ENet** | low-latency peer messaging (games, presence, collab) | planned - **second** |
-| Real-time (WebRTC) | **libdatachannel** + **libjuice** | browser-interoperable P2P + real NAT traversal | planned - **third** |
+| Trust | **libsodium** | identity, signing, encryption, password hashing | done (cryptoXT / org.openxtalk.library.sodium) |
+| Real-time (reliable UDP) | **ENet** | low-latency peer messaging (games, presence, collab) | planned |
+| Real-time (WebRTC) | **libdatachannel** + **libjuice** | browser-interoperable P2P + real NAT traversal | **Phases 1-2 built** - `datachannelxt/` (standalone-ready folder; dcx_ ABI v1, data channels only; smoke test green under ASan/UBSan + TSan; the IV.7 flagship demo - P2P chat over **DHT-signalled** WebRTC, TorrentXT BEP44 as the rendezvous - is `datachannelxt/examples/datachannel-dht-chat.livecodescript`; needs an OXT pass) |
 
 They compose: libsodium secures the channels; ENet/libdatachannel carry live
 messages; and libdatachannel's signaling can ride **TorrentXT's DHT (BEP44)** -

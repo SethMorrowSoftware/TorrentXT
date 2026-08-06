@@ -1,0 +1,331 @@
+# .github/workflows/build.yml - DataChannelXT CI.
+#
+#   static-gates    : every push/PR. NO native deps, < 1 min. The always-green
+#                     gate (LCB checker, record golden, registry cross-check,
+#                     header-only record_handle_test under gcc ASan/UBSan).
+#
+#   sanitize        : the memory-safety gate - the WHOLE stack (libdatachannel,
+#                     libjuice, usrsctp AND the shim) built under gcc ASan+UBSan,
+#                     smoke test run against it.
+#
+#   tsan            : the CONCURRENCY gate - this is the family's one binding
+#                     with real cross-thread callbacks, so the whole stack is
+#                     also built under ThreadSanitizer and the loopback smoke
+#                     test (which hammers the mutex queue from libdatachannel's
+#                     real threads) must pass. Suppressions are limited to
+#                     usrsctp-internal races (tests/tsan-suppressions.txt).
+#
+#   build-matrix    : all five targets build the shim (Release) with
+#                     FetchContent-pinned libdatachannel (a fast source build -
+#                     minutes, not the hours Boost/libtorrent cost TorrentXT)
+#                     and run ctest. DTLS comes from each OS's OpenSSL: apt dev
+#                     packages on Linux, Homebrew on macOS, vcpkg static on
+#                     Windows. fail-fast off so one platform never masks another.
+#
+#   commit-binaries : on push TO main, gather the built libs and commit the
+#                     SELF-CONTAINED ones into src/code/<arch-platform>/
+#                     ([skip ci], so no loop). Same two gates as the sibling
+#                     repos: main only (CI builds are not byte-reproducible, so
+#                     per-branch binary commits collide at merge), and
+#                     self-contained only (a lib that dynamically links
+#                     libdatachannel would not load on a user machine).
+#
+# NOTE on macOS: the CI lane builds+tests the HOST arch (arm64) - proving the
+# binding compiles and runs on macOS. The shipped *universal* (arm64+x86_64),
+# codesigned+notarized dylib is a separate release build (it needs Apple
+# credentials we do not store in CI); see docs/building.md.
+#
+# All actions pinned to a major version, matching the sibling repos.
+
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+  # pull_request intentionally omitted: same-repo branch development means the
+  # push event already runs CI and its checks show on the PR. Re-add
+  # `pull_request:` if you want CI on PRs opened from forks.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-gates:
+    name: static gates (lint + golden + sanitized header test)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: check-livecodescript
+        run: python3 tools/check-livecodescript.py
+      - name: golden tests (every tests/*_golden*.py)
+        run: |
+          shopt -s nullglob
+          for t in tests/*_golden*.py; do
+            echo "== $t =="
+            python3 "$t" || exit 1
+          done
+      - name: record-registry cross-check
+        run: python3 tools/check-record-registry.py
+      - name: record_handle_test (gcc ASan+UBSan)
+        run: |
+          g++ -std=c++17 -Wall -Wextra \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer \
+            tests/record_handle_test.cpp -o record_handle_test
+          ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./record_handle_test
+
+  sanitize:
+    # ASan+UBSan across the WHOLE static stack (the DATACHANNELXT_SANITIZE knob
+    # injects the flags before FetchContent, so libdatachannel/juice/usrsctp are
+    # instrumented too - no mixed-instrumentation false positives).
+    name: full-stack ASan+UBSan (linux x86_64)
+    needs: static-gates
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire toolchain + OpenSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build libssl-dev
+      - name: Configure + build + test under ASan/UBSan
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DDATACHANNELXT_BUILD_TESTS=ON \
+            -DDATACHANNELXT_SANITIZE=address
+          cmake --build build --parallel 4
+          ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+          ctest --test-dir build --output-on-failure
+
+  tsan:
+    # ThreadSanitizer across the whole stack - the gate that justifies this
+    # binding's design (the mutex-guarded queue under real foreign threads).
+    name: full-stack ThreadSanitizer (linux x86_64)
+    needs: static-gates
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire toolchain + OpenSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build libssl-dev
+      - name: Configure + build + test under TSan
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DDATACHANNELXT_BUILD_TESTS=ON \
+            -DDATACHANNELXT_SANITIZE=thread
+          cmake --build build --parallel 4
+          TSAN_OPTIONS="halt_on_error=1:suppressions=$(pwd)/tests/tsan-suppressions.txt" \
+          ctest --test-dir build --output-on-failure
+
+  build-matrix:
+    name: ${{ matrix.name }}
+    needs: static-gates
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux x86_64 - FetchContent libdatachannel, statically linked
+          #      into our one .so; OpenSSL stays a dynamic NEEDED dep (present
+          #      on every Linux target). -------------------------------------
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            platform_id: x86_64-linux
+            acquire: linux64
+            cmake_args: ""
+
+          # ---- Linux x86 (32-bit) - the same source build under -m32 against
+          #      the i386 OpenSSL. ------------------------------------------
+          - name: linux-x86
+            os: ubuntu-22.04
+            platform_id: x86-linux
+            acquire: linux32
+            cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so -DOPENSSL_INCLUDE_DIR=/usr/include"
+
+          # ---- macOS (host arch arm64) - Homebrew OpenSSL; universal +
+          #      notarized dylib is a separate release build (header note). --
+          - name: macos
+            os: macos-14
+            platform_id: universal-mac
+            acquire: brew
+            cmake_args: ""
+
+          # ---- Windows x86_64 - vcpkg static OpenSSL ----------------------
+          - name: windows-x86_64
+            os: windows-2022
+            platform_id: x86_64-win32
+            acquire: vcpkg
+            vcpkg_triplet: x64-windows-static
+            cmake_args: ""
+
+          # ---- Windows x86 (32-bit) - vcpkg static + the generated .def ---
+          - name: windows-x86
+            os: windows-2022
+            platform_id: x86-win32
+            acquire: vcpkg
+            vcpkg_triplet: x86-windows-static
+            cmake_args: "-A Win32"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for package-extension.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Acquire toolchain + OpenSSL (Linux x86_64)
+        if: matrix.acquire == 'linux64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build libssl-dev
+
+      - name: Acquire 32-bit toolchain + i386 OpenSSL (Linux x86)
+        if: matrix.acquire == 'linux32'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          # The 32-bit C/C++ toolchain MUST succeed on its OWN line - it
+          # provides Scrt1.o, crti.o, lib32stdc++, lib32gcc that -m32 needs.
+          sudo apt-get install -y g++-multilib gcc-multilib ninja-build
+          # find_package(OpenSSL) must resolve the i386 libs, not the host
+          # amd64 ones, or the -m32 link fails with "file in wrong format";
+          # the lane's cmake_args point OPENSSL_*_LIBRARY at i386-linux-gnu.
+          sudo apt-get install -y libssl-dev:i386
+
+      - name: Acquire OpenSSL (Homebrew, macOS)
+        if: matrix.acquire == 'brew'
+        run: |
+          brew update
+          brew install openssl@3 ninja
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+
+      - name: Set up vcpkg + acquire OpenSSL (Windows)
+        if: matrix.acquire == 'vcpkg'
+        shell: pwsh
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          & "$vcpkg\vcpkg.exe" install "openssl:${{ matrix.vcpkg_triplet }}"
+          echo "CMAKE_TOOLCHAIN_FILE=$vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+          echo "VCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+            if [ -n "${VCPKG_TARGET_TRIPLET:-}" ]; then
+              EXTRA="$EXTRA -DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+            fi
+          fi
+          if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
+            EXTRA="$EXTRA -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}"
+          fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDATACHANNELXT_BUILD_TESTS=ON \
+            ${{ matrix.cmake_args }} \
+            $EXTRA
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Stage per-platform binary
+        shell: bash
+        run: |
+          python3 tools/package-extension.py \
+            --platform-id ${{ matrix.platform_id }} \
+            --build-dir build || \
+            echo "package-extension: nothing to stage."
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-${{ matrix.platform_id }}
+          path: src/code/${{ matrix.platform_id }}/
+          if-no-files-found: ignore
+
+  commit-binaries:
+    # Automatic library placement, gated exactly like the sibling repos: main
+    # only, and self-contained libs only. Requires the repo's Actions setting
+    # "Workflow permissions" = "Read and write permissions".
+    name: commit native libs to src/code
+    needs: build-matrix
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Download all built native libs
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+          pattern: native-*
+      - name: Place each SELF-CONTAINED lib into its src/code/<arch-platform>/ folder
+        run: |
+          # *.dll  : vcpkg *-static OpenSSL -> self-contained; ship as-is.
+          # *.so   : commit only if it does NOT dynamically NEED libdatachannel
+          #          (OpenSSL/libc are fine - present on every Linux target).
+          # *.dylib: never from CI - the macOS artifact is host-arch and
+          #          Homebrew-linked; the real universal + codesigned +
+          #          notarized dylib is a separate release build.
+          # other  : never - a stray non-lib file is not committed.
+          shopt -s nullglob
+          placed=0
+          for dir in _artifacts/native-*/; do
+            id="${dir#_artifacts/native-}"; id="${id%/}"
+            for f in "$dir"*; do
+              base="$(basename "$f")"
+              case "$base" in
+                *.dylib)
+                  echo "SKIP src/code/$id/$base - macOS CI artifact is host-arch + Homebrew-linked (see docs/building.md)."
+                  continue ;;
+                *.so)
+                  if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libdatachannel'; then
+                    echo "SKIP src/code/$id/$base - dynamically links libdatachannel (not self-contained)."
+                    continue
+                  fi ;;
+                *.dll)
+                  : ;;
+                *)
+                  echo "SKIP src/code/$id/$base - not a library file."
+                  continue ;;
+              esac
+              mkdir -p "src/code/$id"
+              cp "$f" "src/code/$id/"
+              echo "placed src/code/$id/$base"
+              placed=1
+            done
+          done
+          rm -rf _artifacts
+          if [ "$placed" = 0 ]; then
+            echo "No self-contained native-lib artifacts to commit."
+          fi
+      - name: Commit refreshed binaries (skip CI to avoid a loop)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/code
+          if git diff --cached --quiet; then
+            echo "Native libs unchanged - nothing to commit."
+            exit 0
+          fi
+          git commit -m "CI: place freshly built native libs in src/code/<arch-platform>/ [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}" || \
+            echo "push rejected (branch advanced during the run); the next push refreshes it."
