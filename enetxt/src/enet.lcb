@@ -689,8 +689,9 @@ public handler enPeerStatus(in pPeer as Integer) returns Array
    return _parseRecord(_bufToData(sScratchPtr, tCount), 1)
 end handler
 
--- One live snapshot of a host: keys host, address (the bound socket; a
--- client host shows its ephemeral port), peerCount. {} for a stale handle.
+-- One live snapshot of a host: keys host, address (the bound socket via
+-- getsockname, so a port-0 server shows its real ephemeral port; an unbound
+-- client host shows "0.0.0.0:0"), peerCount. {} for a stale handle.
 public handler enHostStatus(in pHost as Integer) returns Array
    variable tCount as Integer
    variable tRec as Array

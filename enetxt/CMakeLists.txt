@@ -1,10 +1,11 @@
 # enetxt - ENet (reliable UDP) for OpenXTalk / the xTalk family.
-# PHASE 0 (NEXT-EXTENSIONS-PLAN.md Part III.7 milestone 0): prove the pinned
-# dependency builds, prove the bare-token shared library exports through the
-# exception firewall, and prove a one-process loopback (connect -> reliable
-# echo both ways -> unsequenced send -> disconnect) runs clean under the
-# sanitizers. The full enx_ surface (handle tables, record codec, poll drain)
-# is milestone 1 and reuses the datachannelxt/torrentxt pattern verbatim.
+# PHASE 1 as-built (NEXT-EXTENSIONS-PLAN.md Part III.7): the full enx_ ABI
+# (v2) - hosts, peers, send/broadcast, tuning, status records, the lossless
+# poll drain - built as ONE bare-token shared library, with the smoke test
+# driving the whole exported surface over a live loopback and the
+# codec/handle-table unit test running header-only. Both run clean under
+# ASan/UBSan via the global ENETXT_SANITIZE knob below (which instruments
+# the pinned ENet dependency too).
 cmake_minimum_required(VERSION 3.16)
 project(enetxt CXX C)
 

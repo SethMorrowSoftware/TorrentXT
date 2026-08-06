@@ -213,8 +213,14 @@ command ecStop
       -- helpers stack already gone; nothing was polling
    end try
    -- the one mandatory teardown: destroys any surviving hosts and releases
-   -- the socket layer (bare command form - see the header comment)
-   enDeinitialize
+   -- the socket layer (bare command form - see the header comment). Guarded
+   -- like the ecStart probe: when the extension is missing, quitting the
+   -- stack must not throw out of closeStack.
+   try
+      enDeinitialize
+   catch tErr
+      -- extension not installed; nothing to release
+   end try
 end ecStop
 
 -- ---- host / join / leave -----------------------------------------------------

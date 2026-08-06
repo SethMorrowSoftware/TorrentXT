@@ -30,7 +30,7 @@ latency floor: 16–33 ms for real-time feel, 100+ ms for chat-grade traffic.
 | `enHostCreateServer(pBindHost, pPort, pMaxPeers, pChannels, pInBW, pOutBW)` | Integer | bind + listen; pBindHost "" (or "*") = every interface; peers 1..4095, channels 1..255 (fixed for the host's life), bandwidth bytes/sec (0 = unlimited) |
 | `enHostCreateClient(pMaxPeers, pChannels, pInBW, pOutBW)` | Integer | unbound host; initiates only |
 | `enHostDestroy(pHost)` | Integer | destroys the socket and retires every peer riding it; idempotent |
-| `enHostStatus(pHost)` | Array | keys `host`, `address` (bound socket), `peerCount`; {} when stale |
+| `enHostStatus(pHost)` | Array | keys `host`, `address` (the real bound socket — a port-0 server shows its actual ephemeral port; an unbound CLIENT host shows `0.0.0.0:0`), `peerCount`; {} when stale |
 | `enSetHostBandwidth(pHost, pInBW, pOutBW)` | Integer | live re-throttle |
 | `enFlush(pHost)` | Integer | push queued sends NOW without servicing inbound |
 
@@ -41,7 +41,7 @@ demo's normal shape) — the torrentxt single-session rule does NOT apply here.
 
 | Handler | Returns | Notes |
 |---|---|---|
-| `enConnect(pHost, pRemoteHost, pPort, pChannels, pData)` | Integer | peer handle NOW (optimistic); `enetConnect` confirms, `enetDisconnect` reports failure/timeout. pData is a u32 the far side sees in ITS `enetConnect` (protocol version, room id...). A hostname resolves DNS synchronously — pass an IP when that matters |
+| `enConnect(pHost, pRemoteHost, pPort, pChannels, pData)` | Integer | peer handle NOW (optimistic); `enetConnect` confirms, `enetDisconnect` reports failure/timeout. pData is a u32 the far side sees in ITS `enetConnect` (protocol version, room id...; from script pass 0..2147483647 — it crosses the FFI as a signed 32-bit int). A hostname resolves DNS synchronously — pass an IP when that matters |
 | `enDisconnect(pPeer, pData)` | Integer | polite: drains sends, notifies, YOUR `enetDisconnect` arrives via the pump — which is when the handle retires |
 | `enDisconnectNow(pPeer, pData)` | Integer | abrupt: one last notify out, NO local event, immediate retire |
 | `enResetPeer(pPeer)` | Integer | silent teardown both ways; immediate retire |

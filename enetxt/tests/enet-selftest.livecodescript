@@ -327,8 +327,14 @@ command stCleanup
    end if
    put empty into sServer
    put empty into sClient
-   -- bare command form: OXT cannot compile a zero-argument name() statement
-   enDeinitialize
+   -- bare command form: OXT cannot compile a zero-argument name() statement;
+   -- guarded so closing a stack whose extension is missing (the run already
+   -- threw loudly at enInitialize) cannot throw a second time from closeStack
+   try
+      enDeinitialize
+   catch tErr
+      -- extension not installed; nothing to release
+   end try
 end stCleanup
 
 -- ---- small helpers -----------------------------------------------------------
