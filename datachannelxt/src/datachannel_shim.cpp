@@ -744,15 +744,23 @@ extern "C" DCX_API int DCX_CALL dcx_cleanup(void) {
     });
 }
 
-extern "C" DCX_API int DCX_CALL dcx_library_version(char *out, int cap) {
-    DCX_GUARD_BUFFER({
+/* The version-pin conditional lives in this plain helper, NOT inside the
+ * guard body below: a preprocessor directive inside a macro ARGUMENT is
+ * undefined behaviour the standard never promised — gcc tolerates it, MSVC
+ * rejects it outright (C2121 "'#': invalid character"), which is exactly how
+ * the first-ever Windows build failed. Keep every #if out of DCX_GUARD_*
+ * bodies. */
+static const std::string &library_version_string() {
 #ifdef DCX_LIBDATACHANNEL_VERSION
-        static const std::string v = std::string("libdatachannel ") + DCX_LIBDATACHANNEL_VERSION;
+    static const std::string v = std::string("libdatachannel ") + DCX_LIBDATACHANNEL_VERSION;
 #else
-        static const std::string v = "libdatachannel (unpinned build)";
+    static const std::string v = "libdatachannel (unpinned build)";
 #endif
-        return fill_out(v, out, cap);
-    });
+    return v;
+}
+
+extern "C" DCX_API int DCX_CALL dcx_library_version(char *out, int cap) {
+    DCX_GUARD_BUFFER({ return fill_out(library_version_string(), out, cap); });
 }
 
 extern "C" DCX_API int DCX_CALL dcx_last_error(char *out, int cap) {

@@ -54,7 +54,7 @@ concurrency:
 jobs:
   static-gates:
     name: static gates (lint + golden + sanitized header test)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -86,7 +86,7 @@ jobs:
     # instrumented too - no mixed-instrumentation false positives).
     name: full-stack ASan+UBSan (linux x86_64)
     needs: static-gates
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Acquire toolchain + OpenSSL
@@ -108,7 +108,7 @@ jobs:
     # binding's design (the mutex-guarded queue under real foreign threads).
     name: full-stack ThreadSanitizer (linux x86_64)
     needs: static-gates
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Acquire toolchain + OpenSSL
@@ -137,7 +137,7 @@ jobs:
           #      into our one .so; OpenSSL stays a dynamic NEEDED dep (present
           #      on every Linux target). -------------------------------------
           - name: linux-x86_64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             platform_id: x86_64-linux
             acquire: linux64
             cmake_args: ""
@@ -145,7 +145,7 @@ jobs:
           # ---- Linux x86 (32-bit) - the same source build under -m32 against
           #      the i386 OpenSSL. ------------------------------------------
           - name: linux-x86
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             platform_id: x86-linux
             acquire: linux32
             cmake_args: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so -DOPENSSL_INCLUDE_DIR=/usr/include"
@@ -153,14 +153,14 @@ jobs:
           # ---- macOS (host arch arm64) - Homebrew OpenSSL; universal +
           #      notarized dylib is a separate release build (header note). --
           - name: macos
-            os: macos-14
+            os: macos-15
             platform_id: universal-mac
             acquire: brew
             cmake_args: ""
 
           # ---- Windows x86_64 - vcpkg static OpenSSL ----------------------
           - name: windows-x86_64
-            os: windows-2022
+            os: windows-2025
             platform_id: x86_64-win32
             acquire: vcpkg
             vcpkg_triplet: x64-windows-static
@@ -168,7 +168,7 @@ jobs:
 
           # ---- Windows x86 (32-bit) - vcpkg static + the generated .def ---
           - name: windows-x86
-            os: windows-2022
+            os: windows-2025
             platform_id: x86-win32
             acquire: vcpkg
             vcpkg_triplet: x86-windows-static
@@ -265,7 +265,7 @@ jobs:
     name: commit native libs to src/code
     needs: build-matrix
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
