@@ -328,6 +328,35 @@ def check_lcb_antipatterns(path, cleaned):
     return problems
 
 
+# The mirror image: LCB constructs that leak into .livecodescript. Braces have
+# no meaning in LiveCode Script (`{}` / `{...}` array literals are LCB-only;
+# build arrays by key assignment, and test emptiness by counting `the keys of`
+# a VARIABLE - a bare `is empty` on an array is vacuously true), and a function
+# result cannot be subscripted (`f(x)["k"]` does not parse - put it into a
+# local first). Both leaked from the .lcb layer once (the DataChannelXT
+# selftest's dcSelectedCandidatePair assertions) and cost an OXT compile error,
+# so the class is caught statically now. String bodies are blanked in cleaned
+# lines, so braces inside literals (e.g. the quickshare demo's embedded
+# JavaScript) never trip this.
+LCS_ANTIPATTERNS = [
+    (re.compile(r"[{}]"),
+     "braces are not LiveCode Script - `{}`/`{...}` array literals are LCB-only "
+     "(build arrays by assignment; count `the keys of` a variable for emptiness)"),
+    (re.compile(r"\)\s*\["),
+     "cannot subscript a function result in LiveCode Script - "
+     "put it into a local variable first"),
+]
+
+
+def check_lcs_antipatterns(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        for pat, msg in LCS_ANTIPATTERNS:
+            if pat.search(line):
+                problems.append(Problem(path, lineno, msg))
+    return problems
+
+
 def check_lcb_module(path, cleaned):
     """A library/module/widget must be explicitly closed with the matching
     `end library`/`end module`/`end widget`. OXT otherwise consumes the whole
@@ -459,6 +488,7 @@ def check_file(path):
         problems += check_lcb_lowercase_names(path, cleaned)
     else:
         problems += check_livecodescript_blocks(path, cleaned)
+        problems += check_lcs_antipatterns(path, cleaned)
     # universal xTalk rules (both dialects): no name that spells a reserved token,
     # and no invalid `does not <op>` negation.
     problems += check_prefixed_token_shadows(path, cleaned)
