@@ -51,11 +51,16 @@ target_link_libraries(enetxt PRIVATE enet)
 
 if(ENETXT_BUILD_TESTS)
   enable_testing()
-  add_executable(enet_spike_test tests/enet_spike_test.cpp)
-  target_compile_options(enet_spike_test PRIVATE -Wall -Wextra)
-  target_include_directories(enet_spike_test SYSTEM PRIVATE ${enet_SOURCE_DIR}/include)
-  # The spike drives ENet directly (the loopback proof) AND calls the shim's
-  # exports through the shared library (the export/firewall proof).
-  target_link_libraries(enet_spike_test PRIVATE enetxt enet)
-  add_test(NAME enet_spike_test COMMAND enet_spike_test)
+
+  # The Phase 1 gate: the whole exported ABI over a live loopback. Links ONLY
+  # the shared library — every call goes through the real export surface.
+  add_executable(enet_smoke_test tests/enet_smoke_test.cpp)
+  target_compile_options(enet_smoke_test PRIVATE -Wall -Wextra)
+  target_link_libraries(enet_smoke_test PRIVATE enetxt)
+  add_test(NAME enet_smoke_test COMMAND enet_smoke_test)
+
+  # Codec + handle-table unit test: header-only, no ENet, runs anywhere.
+  add_executable(record_handle_test tests/record_handle_test.cpp)
+  target_compile_options(record_handle_test PRIVATE -Wall -Wextra)
+  add_test(NAME record_handle_test COMMAND record_handle_test)
 endif()

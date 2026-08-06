@@ -1,0 +1,776 @@
+library org.openxtalk.library.enet
+
+-- enet.lcb - the LCB binding for enetxt (library org.openxtalk.library.enet).
+-- It declares one `private foreign handler` per enx_* symbol in src/enx_abi.h
+-- and wraps each in a `public en*` handler that hides every handle, pre-sizes
+-- and reuses the poll/scratch buffers, walks the big-endian KV records by
+-- byte arithmetic, and never throws into script.
+--
+-- THE MODEL (the one ENet fact an xTalk author must know): PUMP OR NOTHING.
+-- ENet has no threads of its own - nothing connects, sends, or receives until
+-- enPoll services the host. Run enPoll on a timer (the helpers stack does it
+-- for you); its interval is the latency floor - 16-33 ms feels real-time,
+-- 100+ ms is fine for chat. Delivery of QUEUED sends also rides the pump (or
+-- an explicit enFlush).
+--
+-- The FFI idiom for byte buffers (carried from TorrentXT - the hard-won
+-- lesson). An LCB Data does NOT auto-bridge to a C `void*` (the Language
+-- Reference is explicit: "No automatic bridging from Data or String to
+-- Pointer exists" - a Data marshals as an MCDataRef). So:
+--   * OUTPUT buffers (C fills them) are raw blocks from the engine <builtin>
+--     MCMemoryAllocate, passed as a real Pointer. C returns bytes-written (or
+--     the negative of the capacity it needed, so we grow and retry), then we
+--     copy the written bytes back into a Data with MCDataCreateWithBytes and
+--     walk them.
+--   * INPUT buffers (C reads them) pass MCDataGetBytePtr(theData) - the
+--     read-only pointer to a Data's own bytes - together with the byte count.
+--   * records are walked with `the code of (byte I of D)` (big-endian u16)
+--     and `byte X to Y of D` for sub-ranges.
+--   * every foreign call sits inside `unsafe ... end unsafe`; all `variable`s
+--     are declared at the top of their handler.
+--
+-- The numeric constants below MIRROR src/enx_record.h; tools/check-record-
+-- registry.py proves they never drift.
+--
+-- Runtime behaviour needs an OXT pass to confirm (OXT cannot compile/run .lcb
+-- headlessly); the static gate tools/check-livecodescript.py is run on every
+-- edit.
+
+use com.livecode.foreign
+
+metadata version is "0.1.0"
+metadata author is "Seth Morrow Software"
+metadata title is "enetxt"
+
+-- ===================================================================== --
+--  Constants
+-- ===================================================================== --
+
+-- Must equal ENX_ABI_VERSION in src/enx_abi.h; _checkABI() throws on skew.
+constant kABIVersion is 2
+
+-- libfoundation MCStringEncoding value for UTF-8 (ASCII=0, Windows1252=1,
+-- MacRoman=2, ISO8859_1=3, UTF8=4). Used by _decodeText / _encodeText.
+constant kEncodingUtf8 is 4
+
+-- The per-message size budget, mirroring ENX_MAX_MESSAGE in enx_abi.h: sends
+-- above it fail with error -4 (too large), never truncated. Packets are
+-- MESSAGES (game state, chat, control); bulk belongs to TorrentXT.
+constant kMaxMessage is 60000
+
+-- Reusable buffer capacities (the single-thread performance playbook:
+-- allocate once, reuse every poll, never rebuild). Grown on demand when the
+-- shim reports a bigger -needed. The drain default holds one max-size packet
+-- with room to spare; scratch covers version/error strings and status records.
+constant kDrainCap is 65536
+constant kScratchCap is 2048
+
+-- Record field value types (mirror enx_record.h FieldType -> kType*).
+constant kTypeInt is 0
+constant kTypeReal is 1
+constant kTypeUtf8 is 2
+constant kTypeRaw is 3
+constant kTypeHex is 4
+
+-- Record field ids (mirror enx_record.h FieldId -> kField*).
+constant kFieldEnHost is 1
+constant kFieldEnPeer is 2
+constant kFieldEnChannel is 3
+constant kFieldEnPayload is 4
+constant kFieldEnData is 5
+constant kFieldEnAddress is 6
+constant kFieldEnState is 7
+constant kFieldEnRtt is 8
+constant kFieldEnPacketLoss is 9
+constant kFieldEnPacketsSent is 10
+constant kFieldEnPacketsLost is 11
+constant kFieldEnBytesSent is 12
+constant kFieldEnBytesReceived is 13
+constant kFieldEnPeerCount is 14
+constant kFieldEnError is 15
+
+-- Stable event type codes (mirror enx_record.h EventType -> kEvent*).
+constant kEventConnect is 1
+constant kEventDisconnect is 2
+constant kEventReceive is 3
+constant kEventError is 4
+
+-- ENet peer states (mirror enx_record.h PeerState -> kPeerState*; ENet's own
+-- numbering, static_asserted in the shim). enPeerStatus's "state" field is
+-- one of these. Most scripts only branch on Connected / Disconnected.
+constant kPeerStateDisconnected is 0
+constant kPeerStateConnecting is 1
+constant kPeerStateAcknowledgingConnect is 2
+constant kPeerStateConnectionPending is 3
+constant kPeerStateConnectionSucceeded is 4
+constant kPeerStateConnected is 5
+constant kPeerStateDisconnectLater is 6
+constant kPeerStateDisconnecting is 7
+constant kPeerStateAcknowledgeDisconnect is 8
+constant kPeerStateZombie is 9
+
+-- Delivery modes for enSend/enBroadcast (mirror enx_record.h SendFlag ->
+-- kSend*). Reliable is the safe default; Unreliable is sequenced-but-
+-- droppable (stale-able state updates); Unsequenced is fire-and-forget.
+constant kSendReliable is 0
+constant kSendUnreliable is 1
+constant kSendUnsequenced is 2
+
+-- ===================================================================== --
+--  Module state: the reusable poll/scratch buffers
+-- ===================================================================== --
+
+-- Reusable raw buffers for the fill-a-buffer FFI (allocated via the verified
+-- engine <builtin> MCMemoryAllocate; an LCB Data does not bridge to a void*).
+-- Each pairs a Pointer with its current byte capacity. They persist for the
+-- process - bounded reuse, the single-thread playbook - because there is no
+-- deterministic library-unload hook to free them at.
+variable sDrainPtr as Pointer
+variable sDrainCap as Integer
+variable sScratchPtr as Pointer
+variable sScratchCap as Integer
+
+-- ===================================================================== --
+--  Foreign handlers (one per enx_* symbol in enx_abi.h). Buffer params are
+--  `Pointer` - we hand them MCMemoryAllocate blocks (output) or
+--  MCDataGetBytePtr pointers (input), never a Data value; short strings are
+--  ZStringUTF8. All cdecl. Never rename these binds.
+-- ===================================================================== --
+
+private foreign handler _enx_abi_version() returns CInt binds to "c:enetxt>enx_abi_version!cdecl"
+private foreign handler _enx_initialize() returns CInt binds to "c:enetxt>enx_initialize!cdecl"
+private foreign handler _enx_deinitialize() returns CInt binds to "c:enetxt>enx_deinitialize!cdecl"
+private foreign handler _enx_version_string(in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:enetxt>enx_version_string!cdecl"
+private foreign handler _enx_last_error(in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:enetxt>enx_last_error!cdecl"
+private foreign handler _enx_clear_error() returns nothing binds to "c:enetxt>enx_clear_error!cdecl"
+
+private foreign handler _enx_host_create_server(in pBindHost as ZStringUTF8, in pPort as CInt, in pMaxPeers as CInt, in pChannels as CInt, in pInBW as CInt, in pOutBW as CInt) returns CInt binds to "c:enetxt>enx_host_create_server!cdecl"
+private foreign handler _enx_host_create_client(in pMaxPeers as CInt, in pChannels as CInt, in pInBW as CInt, in pOutBW as CInt) returns CInt binds to "c:enetxt>enx_host_create_client!cdecl"
+private foreign handler _enx_host_destroy(in pHost as CInt) returns CInt binds to "c:enetxt>enx_host_destroy!cdecl"
+
+private foreign handler _enx_connect(in pHost as CInt, in pRemoteHost as ZStringUTF8, in pPort as CInt, in pChannels as CInt, in pData as CInt) returns CInt binds to "c:enetxt>enx_connect!cdecl"
+private foreign handler _enx_disconnect(in pPeer as CInt, in pData as CInt) returns CInt binds to "c:enetxt>enx_disconnect!cdecl"
+private foreign handler _enx_disconnect_now(in pPeer as CInt, in pData as CInt) returns CInt binds to "c:enetxt>enx_disconnect_now!cdecl"
+private foreign handler _enx_reset_peer(in pPeer as CInt) returns CInt binds to "c:enetxt>enx_reset_peer!cdecl"
+
+private foreign handler _enx_send(in pPeer as CInt, in pChannel as CInt, in pData as Pointer, in pLen as CInt, in pFlags as CInt) returns CInt binds to "c:enetxt>enx_send!cdecl"
+private foreign handler _enx_broadcast(in pHost as CInt, in pChannel as CInt, in pData as Pointer, in pLen as CInt, in pFlags as CInt) returns CInt binds to "c:enetxt>enx_broadcast!cdecl"
+private foreign handler _enx_flush(in pHost as CInt) returns CInt binds to "c:enetxt>enx_flush!cdecl"
+
+private foreign handler _enx_set_peer_timeout(in pPeer as CInt, in pLimit as CInt, in pMinMs as CInt, in pMaxMs as CInt) returns CInt binds to "c:enetxt>enx_set_peer_timeout!cdecl"
+private foreign handler _enx_set_peer_ping_interval(in pPeer as CInt, in pMs as CInt) returns CInt binds to "c:enetxt>enx_set_peer_ping_interval!cdecl"
+private foreign handler _enx_set_host_bandwidth(in pHost as CInt, in pInBW as CInt, in pOutBW as CInt) returns CInt binds to "c:enetxt>enx_set_host_bandwidth!cdecl"
+
+private foreign handler _enx_peer_status(in pPeer as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:enetxt>enx_peer_status!cdecl"
+private foreign handler _enx_host_status(in pHost as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:enetxt>enx_host_status!cdecl"
+
+private foreign handler _enx_poll(in pHost as CInt, in pOut as Pointer, in pCap as CInt) returns CInt binds to "c:enetxt>enx_poll!cdecl"
+
+-- ===================================================================== --
+--  Engine Foundation <builtin> foreign handlers
+-- ===================================================================== --
+-- These bind to the engine's own libfoundation, not to our shim. They are the
+-- sanctioned bridge between LCB Data/Pointer/String and raw C buffers. NOTE:
+-- a `<builtin>` handler resolves by its NAME matching the engine symbol, so
+-- these - unlike every other private handler in this file - carry NO leading
+-- `_`. Renaming any of them breaks the binding.
+private foreign handler MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+private foreign handler MCStringEncode(in pString as String, in pEncoding as CInt, in pIsExternalRep as CBool, out rData as Data) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+
+-- ===================================================================== --
+--  Private helpers
+-- ===================================================================== --
+
+-- Throw a clear error if the loaded native library's ABI does not match this
+-- binding. Better a legible throw at startup than a crash at first use.
+private handler _checkABI()
+   variable tABI as Integer
+   unsafe
+      put _enx_abi_version() into tABI
+   end unsafe
+   if tABI is not kABIVersion then
+      throw "enetxt native library ABI does not match the LCB binding; rebuild and repackage the native library."
+   end if
+end handler
+
+-- Ensure the reusable drain buffer holds at least pNeed bytes. A grow frees
+-- the old block and allocates fresh (MCMemoryReallocate is not a confirmed
+-- <builtin>); it only happens when the shim reports a -needed past the
+-- current capacity, which is rare. Capacity 0 doubles as "not allocated yet".
+private handler _ensureDrain(in pNeed as Integer)
+   variable tOk as Boolean
+   if sDrainCap < pNeed then
+      if sDrainCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sDrainPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sDrainPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "enetxt: failed to allocate the drain buffer."
+      end if
+      put pNeed into sDrainCap
+   end if
+end handler
+
+private handler _ensureScratch(in pNeed as Integer)
+   variable tOk as Boolean
+   if sScratchCap < pNeed then
+      if sScratchCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sScratchPtr)
+         end unsafe
+      end if
+      put false into tOk
+      unsafe
+         put MCMemoryAllocate(pNeed, sScratchPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "enetxt: failed to allocate the scratch buffer."
+      end if
+      put pNeed into sScratchCap
+   end if
+end handler
+
+-- Copy the pLen bytes the shim wrote into our raw buffer back into a fresh
+-- Data the record walkers can index by byte. Empty Data on a non-positive
+-- length or an allocation failure.
+private handler _bufToData(in pPtr as Pointer, in pLen as Integer) returns Data
+   variable tData as Data
+   variable tOk as Boolean
+   put the empty data into tData
+   if pLen > 0 then
+      put false into tOk
+      unsafe
+         put MCDataCreateWithBytes(pPtr, pLen, tData) into tOk
+      end unsafe
+      if not tOk then
+         put the empty data into tData
+      end if
+   end if
+   return tData
+end handler
+
+-- Read a big-endian u16 at 1-based byte offset pOffset (the wire is network
+-- order; this is the inverse of the shim's put_u16).
+private handler _readU16(in pData as Data, in pOffset as Integer) returns Integer
+   variable tHi as Integer
+   variable tLo as Integer
+   put the code of (byte pOffset of pData) into tHi
+   put the code of (byte (pOffset + 1) of pData) into tLo
+   return tHi * 256 + tLo
+end handler
+
+-- Decode pLen bytes of UTF-8 (1-based pStart) into a String via the engine's
+-- MCStringDecode (declared above); LCB has no `textDecode` handler.
+private handler _decodeText(in pData as Data, in pStart as Integer, in pLen as Integer) returns String
+   variable tSub as Data
+   variable tStr as String
+   variable tOk as Boolean
+   if pLen <= 0 then
+      return ""
+   end if
+   put byte pStart to (pStart + pLen - 1) of pData into tSub
+   put "" into tStr
+   unsafe
+      put MCStringDecode(tSub, kEncodingUtf8, false, tStr) into tOk
+   end unsafe
+   if tOk then
+      return tStr
+   end if
+   return ""
+end handler
+
+-- Encode a String to UTF-8 bytes (the inverse; used by enSendText /
+-- enBroadcastText so a text payload rides the same byte path as a Data one).
+private handler _encodeText(in pText as String) returns Data
+   variable tData as Data
+   variable tOk as Boolean
+   put the empty data into tData
+   put false into tOk
+   unsafe
+      put MCStringEncode(pText, kEncodingUtf8, false, tData) into tOk
+   end unsafe
+   if not tOk then
+      put the empty data into tData
+   end if
+   return tData
+end handler
+
+-- Map a record field id to its script-facing array key. "" means "skip"
+-- (an unknown id, which the registry checker prevents in practice).
+private handler _fieldKey(in pId as Integer) returns String
+   if pId is kFieldEnHost then
+      return "host"
+   else if pId is kFieldEnPeer then
+      return "peer"
+   else if pId is kFieldEnChannel then
+      return "channel"
+   else if pId is kFieldEnPayload then
+      return "payload"
+   else if pId is kFieldEnData then
+      return "data"
+   else if pId is kFieldEnAddress then
+      return "address"
+   else if pId is kFieldEnState then
+      return "state"
+   else if pId is kFieldEnRtt then
+      return "rtt"
+   else if pId is kFieldEnPacketLoss then
+      return "packetLoss"
+   else if pId is kFieldEnPacketsSent then
+      return "packetsSent"
+   else if pId is kFieldEnPacketsLost then
+      return "packetsLost"
+   else if pId is kFieldEnBytesSent then
+      return "bytesSent"
+   else if pId is kFieldEnBytesReceived then
+      return "bytesReceived"
+   else if pId is kFieldEnPeerCount then
+      return "peerCount"
+   else if pId is kFieldEnError then
+      return "error"
+   else
+      return ""
+   end if
+end handler
+
+-- Map a stable event code to the semantic message name the poll dispatcher
+-- sends (see examples/enet-helpers.livecodescript).
+private handler _eventName(in pCode as Integer) returns String
+   if pCode is kEventConnect then
+      return "enetConnect"
+   else if pCode is kEventDisconnect then
+      return "enetDisconnect"
+   else if pCode is kEventReceive then
+      return "enetReceive"
+   else if pCode is kEventError then
+      return "enetError"
+   else
+      return "enetEvent"
+   end if
+end handler
+
+-- Walk one bare kvrecord starting at 1-based pStart into an Array, using the
+-- field-id -> key mapping. Raw fields become Data; everything else a String
+-- (lossless for display and `the number`-parsable for ints).
+private handler _parseRecord(in pData as Data, in pStart as Integer) returns Array
+   variable tRec as Array
+   variable tOffset as Integer
+   variable tCount as Integer
+   variable tI as Integer
+   variable tId as Integer
+   variable tType as Integer
+   variable tLen as Integer
+   variable tKey as String
+   put {} into tRec
+   put pStart into tOffset
+   put _readU16(pData, tOffset) into tCount
+   add 2 to tOffset
+   repeat with tI from 1 up to tCount
+      put the code of (byte tOffset of pData) into tId
+      put the code of (byte (tOffset + 1) of pData) into tType
+      add 2 to tOffset
+      put _readU16(pData, tOffset) into tLen
+      add 2 to tOffset
+      put _fieldKey(tId) into tKey
+      if tKey is not "" then
+         if tType is kTypeRaw then
+            if tLen > 0 then
+               put byte tOffset to (tOffset + tLen - 1) of pData into tRec[tKey]
+            else
+               put the empty data into tRec[tKey]
+            end if
+         else
+            put _decodeText(pData, tOffset, tLen) into tRec[tKey]
+         end if
+      end if
+      add tLen to tOffset
+   end repeat
+   return tRec
+end handler
+
+-- ===================================================================== --
+--  Public API: lifecycle & diagnostics
+-- ===================================================================== --
+
+-- Initialise the native layer (refcounted; extra calls are cheap no-ops).
+-- Verifies the ABI first (throws a clear error on skew). Call once at
+-- startup, and pair with enDeinitialize at quit. Returns 0 on success.
+public handler enInitialize() returns Integer
+   variable tR as Integer
+   _checkABI()
+   unsafe
+      put _enx_initialize() into tR
+   end unsafe
+   return tR
+end handler
+
+-- Balance enInitialize. The FINAL deinitialize also destroys every host
+-- still alive (and retires its peers) so a quitting app cannot leak
+-- sockets. The app MUST call this before quitting (e.g. on closeStack) -
+-- there is no automatic unload hook. Idempotent. Returns 0 on success.
+public handler enDeinitialize() returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_deinitialize() into tR
+   end unsafe
+   return tR
+end handler
+
+-- "enet A.B.C" - which pinned library this binary linked.
+public handler enLibraryVersion() returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _enx_version_string(sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _enx_version_string(sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+-- The module-static last-error string ("" when there is no error).
+public handler enLastError() returns String
+   variable tCount as Integer
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _enx_last_error(sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _enx_last_error(sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return ""
+   end if
+   return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
+end handler
+
+public handler enClearError()
+   unsafe
+      _enx_clear_error()
+   end unsafe
+end handler
+
+-- ===================================================================== --
+--  Public API: hosts
+-- ===================================================================== --
+
+-- Bind pPort and listen. pBindHost "" (or "*") binds every interface; an IP
+-- or name binds one. pMaxPeers 1..4095; pChannels 1..255 (fixed for the
+-- host's life - choose deliberately); bandwidth 0 = unlimited (bytes/sec).
+-- Returns a positive host handle, or 0 on failure (see enLastError).
+public handler enHostCreateServer(in pBindHost as String, in pPort as Integer, in pMaxPeers as Integer, in pChannels as Integer, in pInBW as Integer, in pOutBW as Integer) returns Integer
+   variable tHost as Integer
+   _checkABI()
+   unsafe
+      put _enx_host_create_server(pBindHost, pPort, pMaxPeers, pChannels, pInBW, pOutBW) into tHost
+   end unsafe
+   return tHost
+end handler
+
+-- An unbound host: it can only initiate connections (enConnect). A pure
+-- client wants pMaxPeers 1; a mesh node may want more.
+public handler enHostCreateClient(in pMaxPeers as Integer, in pChannels as Integer, in pInBW as Integer, in pOutBW as Integer) returns Integer
+   variable tHost as Integer
+   _checkABI()
+   unsafe
+      put _enx_host_create_client(pMaxPeers, pChannels, pInBW, pOutBW) into tHost
+   end unsafe
+   return tHost
+end handler
+
+-- Destroy the host, its socket, and every peer handle riding it. Idempotent;
+-- a stale handle is a successful no-op. Returns 0.
+public handler enHostDestroy(in pHost as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_host_destroy(pHost) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: peers
+-- ===================================================================== --
+
+-- Begin connecting pHost to pRemoteHost:pPort. Returns the peer handle NOW
+-- (optimistically); the enetConnect event confirms it, or enetDisconnect
+-- reports the failure (ENet signals a timed-out connect as a disconnect).
+-- pChannels must not exceed the host's channel count; pData is a u32 the far
+-- side receives in ITS enetConnect event (a protocol version, a room id...).
+-- NOTE: a hostname here resolves DNS synchronously and can block briefly -
+-- pass an IP when that matters. 0 on failure (see enLastError).
+public handler enConnect(in pHost as Integer, in pRemoteHost as String, in pPort as Integer, in pChannels as Integer, in pData as Integer) returns Integer
+   variable tPeer as Integer
+   unsafe
+      put _enx_connect(pHost, pRemoteHost, pPort, pChannels, pData) into tPeer
+   end unsafe
+   return tPeer
+end handler
+
+-- Polite disconnect: queued outbound traffic drains first, the far side is
+-- told (it sees pData), and YOUR enetDisconnect event arrives via enPoll -
+-- which is when the peer handle retires. Returns 0 or a negative error.
+public handler enDisconnect(in pPeer as Integer, in pData as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_disconnect(pPeer, pData) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Abrupt disconnect: one last unsequenced notification to the far side, NO
+-- local event - the handle retires immediately.
+public handler enDisconnectNow(in pPeer as Integer, in pData as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_disconnect_now(pPeer, pData) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Silent teardown: no notification either way, no event, immediate retire.
+-- (The far side will time the connection out.)
+public handler enResetPeer(in pPeer as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_reset_peer(pPeer) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: sending
+-- ===================================================================== --
+
+-- Queue pData (0..60000 bytes) to one peer on pChannel with pFlags (kSend*).
+-- Delivery rides the next pump (enPoll) or an explicit enFlush. Returns 0,
+-- or a negative error (-2 stale, -3 bad channel/flags, -4 over budget).
+public handler enSend(in pPeer as Integer, in pChannel as Integer, in pData as Data, in pFlags as Integer) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen is 0 then
+      -- a zero-length packet is legal; hand the shim the scratch pointer so
+      -- there is a real (unread) address to pass
+      _ensureScratch(kScratchCap)
+      unsafe
+         put _enx_send(pPeer, pChannel, sScratchPtr, 0, pFlags) into tR
+      end unsafe
+      return tR
+   end if
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+      put _enx_send(pPeer, pChannel, tPtr, tLen, pFlags) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Text convenience: UTF-8 encode, then the same byte path as enSend. The far
+-- side receives bytes; decode with textDecode(pEvent["payload"], "utf-8") in
+-- LiveCode Script (or treat as bytes).
+public handler enSendText(in pPeer as Integer, in pChannel as Integer, in pText as String, in pFlags as Integer) returns Integer
+   return enSend(pPeer, pChannel, _encodeText(pText), pFlags)
+end handler
+
+-- Queue one packet to EVERY connected peer of pHost (the server-fanout
+-- primitive - one call, N deliveries). Same budget and flags as enSend.
+public handler enBroadcast(in pHost as Integer, in pChannel as Integer, in pData as Data, in pFlags as Integer) returns Integer
+   variable tR as Integer
+   variable tPtr as Pointer
+   variable tLen as Integer
+   put the number of bytes in pData into tLen
+   if tLen is 0 then
+      _ensureScratch(kScratchCap)
+      unsafe
+         put _enx_broadcast(pHost, pChannel, sScratchPtr, 0, pFlags) into tR
+      end unsafe
+      return tR
+   end if
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+      put _enx_broadcast(pHost, pChannel, tPtr, tLen, pFlags) into tR
+   end unsafe
+   return tR
+end handler
+
+public handler enBroadcastText(in pHost as Integer, in pChannel as Integer, in pText as String, in pFlags as Integer) returns Integer
+   return enBroadcast(pHost, pChannel, _encodeText(pText), pFlags)
+end handler
+
+-- Push queued packets onto the wire NOW without servicing inbound. Useful
+-- right after a burst of sends when the next enPoll tick is milliseconds
+-- away and latency matters.
+public handler enFlush(in pHost as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_flush(pHost) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: tuning
+-- ===================================================================== --
+
+-- Retransmission-timeout scaling: pLimit is a multiplier on the mean RTT
+-- before escalation, bounded by pMinMs/pMaxMs (0 = ENet's default for each).
+public handler enSetPeerTimeout(in pPeer as Integer, in pLimit as Integer, in pMinMs as Integer, in pMaxMs as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_set_peer_timeout(pPeer, pLimit, pMinMs, pMaxMs) into tR
+   end unsafe
+   return tR
+end handler
+
+-- How often ENet pings an idle peer (keeps RTT fresh and NATs open).
+public handler enSetPeerPingInterval(in pPeer as Integer, in pMs as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_set_peer_ping_interval(pPeer, pMs) into tR
+   end unsafe
+   return tR
+end handler
+
+-- Throttle a host (bytes/second; 0 = unlimited) - ENet shapes its sends and
+-- advertises the window to peers.
+public handler enSetHostBandwidth(in pHost as Integer, in pInBW as Integer, in pOutBW as Integer) returns Integer
+   variable tR as Integer
+   unsafe
+      put _enx_set_host_bandwidth(pHost, pInBW, pOutBW) into tR
+   end unsafe
+   return tR
+end handler
+
+-- ===================================================================== --
+--  Public API: status
+-- ===================================================================== --
+
+-- One live snapshot of a peer: keys host, peer, address, state (kPeerState*),
+-- rtt (ms), packetLoss (0..1), packetsSent, packetsLost, bytesSent,
+-- bytesReceived. {} for a stale handle (a retired peer is "gone", not an
+-- error). ONE FFI round-trip.
+public handler enPeerStatus(in pPeer as Integer) returns Array
+   variable tCount as Integer
+   variable tRec as Array
+   put {} into tRec
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _enx_peer_status(pPeer, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _enx_peer_status(pPeer, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tRec
+   end if
+   return _parseRecord(_bufToData(sScratchPtr, tCount), 1)
+end handler
+
+-- One live snapshot of a host: keys host, address (the bound socket; a
+-- client host shows its ephemeral port), peerCount. {} for a stale handle.
+public handler enHostStatus(in pHost as Integer) returns Array
+   variable tCount as Integer
+   variable tRec as Array
+   put {} into tRec
+   _ensureScratch(kScratchCap)
+   unsafe
+      put _enx_host_status(pHost, sScratchPtr, sScratchCap) into tCount
+   end unsafe
+   if tCount < 0 then
+      _ensureScratch(-tCount)
+      unsafe
+         put _enx_host_status(pHost, sScratchPtr, sScratchCap) into tCount
+      end unsafe
+   end if
+   if tCount <= 0 then
+      return tRec
+   end if
+   return _parseRecord(_bufToData(sScratchPtr, tCount), 1)
+end handler
+
+-- ===================================================================== --
+--  Public API: the drain (THE PUMP)
+-- ===================================================================== --
+
+-- Service pHost and return every pending event as a List of Arrays, each
+-- with "code" (kEvent*), "name" (the semantic message: enetConnect,
+-- enetDisconnect, enetReceive, enetError), and the event's fields (host,
+-- peer, address, data / channel, payload / error). ONE FFI round-trip per
+-- call (the single-thread playbook); the shim's one-slot stash + ENet's own
+-- queue make any buffer size lossless and ordered, so a grow-and-retry here
+-- is a rare, safe event, not a correctness worry.
+--
+-- PUMP OR NOTHING: call this on a timer even when you expect nothing -
+-- connects, sends, retransmissions, and pings all progress inside it. The
+-- helpers stack (enStartPolling) does it for you.
+public handler enPoll(in pHost as Integer) returns List
+   variable tEvents as List
+   variable tCount as Integer
+   variable tData as Data
+   variable tOffset as Integer
+   variable tI as Integer
+   variable tCode as Integer
+   variable tBodyLen as Integer
+   variable tEvent as Array
+   variable tTries as Integer
+   put [] into tEvents
+   _ensureDrain(kDrainCap)
+   put 0 into tTries
+   repeat forever
+      unsafe
+         put _enx_poll(pHost, sDrainPtr, sDrainCap) into tCount
+      end unsafe
+      -- -needed is always far below the small error codes (-1..-6): the
+      -- smallest possible entry needs more than a dozen bytes. Grow and
+      -- retry; anything else negative is a real error -> empty list.
+      if tCount < -6 and tTries < 4 then
+         _ensureDrain(-tCount)
+         add 1 to tTries
+      else
+         exit repeat
+      end if
+   end repeat
+   if tCount <= 0 then
+      return tEvents
+   end if
+   -- walk [count:u16] then count x [type:u16][bodyLen:u16][kvrecord]
+   put _bufToData(sDrainPtr, sDrainCap) into tData
+   put 3 into tOffset
+   repeat with tI from 1 up to tCount
+      put _readU16(tData, tOffset) into tCode
+      add 2 to tOffset
+      put _readU16(tData, tOffset) into tBodyLen
+      add 2 to tOffset
+      put _parseRecord(tData, tOffset) into tEvent
+      put tCode into tEvent["code"]
+      put _eventName(tCode) into tEvent["name"]
+      push tEvent onto back of tEvents
+      add tBodyLen to tOffset
+   end repeat
+   return tEvents
+end handler
+
+end library

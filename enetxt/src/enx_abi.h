@@ -16,7 +16,16 @@
 #ifndef ENX_ABI_H
 #define ENX_ABI_H
 
-#define ENX_ABI_VERSION 1
+/* v2: Phase 1 — hosts, peers, connect/disconnect, send/broadcast/flush,
+ * tuning, status records, the enPoll drain. (v1 was the Phase 0 slice.) */
+#define ENX_ABI_VERSION 2
+
+/* The family's per-message budget, enforced BOTH ways: enx_send/enx_broadcast
+ * refuse anything larger (ENX_ERR_TOO_LARGE, never a silent truncation), and
+ * an INBOUND packet over it is dropped WHOLE with an E_ERROR event. Keeps
+ * every payload field far under the u16 field-length ceiling and keeps bulk
+ * where it belongs (TorrentXT). */
+#define ENX_MAX_MESSAGE 60000
 
 #if defined(_WIN32)
 #  define ENX_API __declspec(dllexport)
@@ -31,6 +40,7 @@
 #define ENX_ERR_GENERIC  (-1)
 #define ENX_ERR_STALE    (-2)
 #define ENX_ERR_ARG      (-3)
+#define ENX_ERR_TOO_LARGE (-4)
 #define ENX_ERR_NATIVE   (-5)
 #define ENX_ERR_THROWN   (-6)
 

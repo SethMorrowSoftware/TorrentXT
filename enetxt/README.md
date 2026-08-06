@@ -1,32 +1,108 @@
-# enetxt (Phase 0)
+# enetxt
 
-**ENet — reliable-UDP real-time messaging — for OpenXTalk / the xTalk family.**
-The third leg of the real-time stack: TorrentXT moves bulk, DataChannelXT
-reaches browsers through NATs, enetxt will carry game-grade many-peer traffic
-(state sync, presence, live collab) with reliable, unreliable-sequenced, and
-unsequenced delivery per channel.
+**ENet — reliable-UDP real-time networking — for OpenXTalk / the xTalk
+family.** Game-grade many-peer messaging from plain xTalk script: reliable,
+unreliable-sequenced, and unsequenced delivery on independent channels,
+sub-frame latency on a LAN, one broadcast to fan out to every peer.
 
-**Status: Phase 0** — the milestone-0 spike from `TorrentXT`'s
-`docs/NEXT-EXTENSIONS-PLAN.md` Part III: the pinned ENet (v1.3.18, MIT) builds
-via FetchContent into the family's bare-token shared library (`enetxt.so`),
-the `enx_` export + exception-firewall pattern is proven, and
-`tests/enet_spike_test.cpp` drives a one-process loopback — connect (with
-connect data), reliable echo both ways byte-for-byte, an unsequenced packet on
-a second channel, graceful disconnect — clean under ASan/UBSan.
+enetxt binds [ENet](https://github.com/lsalzman/enet) (v1.3.18, MIT — the
+reliable-UDP library a generation of games shipped on) behind a flat
+`extern "C"` shim with a thin LCB layer on top, the proven shape of its
+siblings TorrentXT (libtorrent), dataChannelXT (libdatachannel), and cryptoXT
+(libsodium):
+
+```
+ENet v1.3.18 (static)                          sockets + the reliability protocol
+   |- C++ shim   src/enet_shim.cpp  ->  enetxt.{so,dll,dylib}   (ABI: enx_*, v2)
+        |- LCB binding  src/enet.lcb      (org.openxtalk.library.enet; public en*)
+             |- examples/enet-helpers.livecodescript   (the pump)
+```
+
+It completes the family's real-time story: **enetxt** for many peers at game
+cadence where someone is reachable (LAN, port forward, rented box);
+**dataChannelXT** for NAT-traversed pairs and browsers; **TorrentXT** for
+bulk. The 60 000-byte packet budget here is the seam — when a payload stops
+being a message, move it to torrents.
+
+## What it can do
+
+- **Hosts and peers, not sockets.** `enHostCreateServer` /
+  `enHostCreateClient` / `enConnect`, with generation-tagged integer handles
+  everywhere — a stale handle is always a harmless no-op.
+- **Three delivery modes per send** — reliable (acked, ordered), unreliable
+  (sequenced, droppable: perfect for state you overwrite every tick),
+  unsequenced (fire-and-forget) — on up to 255 independent channels, so
+  reliable traffic can never stall the real-time lane.
+- **One-call fanout.** `enBroadcast` queues one packet to every connected
+  peer — the server-relay primitive.
+- **Live stats.** `enPeerStatus` is one FFI round-trip: state, RTT, packet
+  loss, byte counters, address. Plus tuning: timeouts, ping interval,
+  bandwidth throttles.
+- **Pump-driven by design.** ENet has no threads; the helpers' poll loop IS
+  the transport ("pump or nothing"), which makes rule 1 of the family — never
+  call script from a foreign thread — true by construction.
+
+## Quick taste
+
+```livecodescript
+start using stack "enetHelpers"
+put enHostCreateServer("", 27099, 32, 2, 0, 0) into sServer
+enStartPolling sServer, the long id of this card, 33   -- the heartbeat
+
+on enetConnect pEvent
+   enSendText pEvent["peer"], 0, "welcome!", 0          -- 0 = reliable
+end enetConnect
+
+on enetReceive pEvent
+   enBroadcast sServer, 0, pEvent["payload"], 0         -- relay to everyone
+end enetReceive
+```
+
+`docs/getting-started.md` walks the rest (the client side, delivery modes,
+the protocol-version trick); `examples/enet-lan-chat.livecodescript` is the
+complete two-machine demo.
+
+## Install
+
+enetxt ships as a standard OXT extension: the LCB module plus the
+per-platform native library bundled under `src/code/<arch>-<platform>/`
+(`x86_64-linux`, `x86-linux`, `x86_64-win32`, `x86-win32`, `universal-mac`).
+Installing the packaged extension makes the engine resolve the `c:enetxt>`
+binding automatically. See `docs/getting-started.md`.
+
+One rule the app must follow: **call `enDeinitialize` before quitting**
+(e.g. on `closeStack`) — there is no automatic unload hook.
+
+## Documentation
+
+| Doc | What is in it |
+|---|---|
+| `docs/getting-started.md` | install, first server+client, delivery modes |
+| `docs/api-reference.md`   | every `en*` handler, event, key, and constant |
+| `docs/architecture.md`    | the pump model, the lossless stash drain, handles |
+| `docs/building.md`        | building on all five targets (minutes, not hours) |
+
+## Development
+
+`tests/enet_smoke_test.cpp` drives the ENTIRE exported ABI over a live
+one-process loopback — connect data, reliable echo, broadcast, byte-exact
+payloads, the keyhole partial-drain (lossless at any buffer size), handle
+retirement, teardown — and runs under **ASan+UBSan with ENet itself
+instrumented**. `record_handle_test` + the Python golden pin the wire format;
+`check-record-registry.py` enforces registry/ABI/budget sync; the
+LiveCodeScript static gate carries all three of the family's OXT-compile
+antipattern rules.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENETXT_BUILD_TESTS=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-
-# the sanitizer lane (gcc; the knob instruments ENet too):
-cmake -S . -B build-asan -DENETXT_BUILD_TESTS=ON -DENETXT_SANITIZE=address
-cmake --build build-asan --parallel && ./build-asan/enet_spike_test
+cmake --build build --parallel && ctest --test-dir build --output-on-failure
 ```
 
-Phase 1 (next): the full `enx_` surface — gen-tagged host/peer handle tables,
-the family record codec, the pump-driven `enPoll` drain (ENet has no threads;
-the poll loop IS the transport's heartbeat), send/broadcast, tuning + stats —
-then the LCB binding (`org.openxtalk.library.enet`, public `en*`), static
-gates, docs, CI, and a chat/whiteboard demo. See `CLAUDE.md` for the carried
-rules.
+See `CLAUDE.md` for the engineering rules and `docs/building.md` for the
+sanitizer lane. Binding-side runtime behaviour is verified statically; needs
+an OXT pass (`tests/enet-selftest.livecodescript`).
+
+## License
+
+enetxt is MIT (matching the family). It statically links
+[ENet](https://github.com/lsalzman/enet) (MIT).
