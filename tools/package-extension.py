@@ -49,6 +49,7 @@ import hashlib
 import os
 import platform
 import shutil
+import subprocess
 import sys
 
 # ----------------------------------------------------------------- constants --
@@ -137,6 +138,34 @@ def sha256(path):
     return h.hexdigest()
 
 
+def strip_in_place(path):
+    """Strip a committed artifact of everything the engine does not need.
+
+    A committed binary is a SHIPPED artifact: its debug symbol table is pure
+    payload for every user, and the absolute build paths baked into it leak the
+    build machine's directory layout into the release. `strip --strip-unneeded`
+    drops the static symbol table and debug sections while keeping .dynsym, the
+    only table the engine's `c:torrentxt>` bindings resolve through, so the
+    extension keeps working and gets substantially smaller.
+
+    Best effort by design: on a host with no `strip` (or a cross-built artifact
+    this host's binutils will not touch) packaging must still succeed, because
+    an unstripped binary is a size problem, not a correctness problem. Returns
+    a short status string for the caller to report.
+    """
+    tool = shutil.which("strip")
+    if tool is None:
+        return "not stripped (no strip on PATH)"
+    before = os.path.getsize(path)
+    try:
+        subprocess.run([tool, "--strip-unneeded", path],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        return "not stripped (%s)" % (exc,)
+    after = os.path.getsize(path)
+    return "stripped %d -> %d bytes" % (before, after)
+
+
 def copy_into_tree(src_lib, platform_id, dry_run):
     """Copy `src_lib` to src/code/<platform_id>/torrentxt<suffix>, creating the
     directory. Idempotent: if the destination already holds byte-identical
@@ -157,6 +186,10 @@ def copy_into_tree(src_lib, platform_id, dry_run):
     # timestamp/mode noise into a committed artifact; a plain content copy keeps
     # diffs about bytes, not metadata.
     shutil.copyfile(src_lib, dest)
+    # Strip the COPY, never the build tree's own output: a developer iterating
+    # under a debugger keeps their symbols, and only the shipped artifact is
+    # slimmed. Idempotent - stripping an already-stripped file is a no-op.
+    print("  " + strip_in_place(dest))
     return ("updated" if existed else "created"), dest
 
 

@@ -14,13 +14,16 @@ script "torrentSelfTest"
 -- only one TorrentXT session may be live per OXT process, so close any client/demo
 -- stack first.
 --
--- COVERAGE NOTE (honest): the checks below exercise the v8 surface. The v9-v11
--- additions (btDhtBep44SignBuf, btDhtPutSigned, btDhtGetPeers, btAddInfohash,
--- btRp1Enable / btRp1SetToken / btRp1Send / btRp1Poll, btMapPort / btUnmapPort)
--- have native coverage in tests/torrent_smoke_test.cpp and rp1_integration_test.cpp,
--- but their .lcb wrappers are so far verified statically only; the rp1 wrappers are
--- exercised for real by examples/torrent-rp1-chat.livecodescript (two machines).
--- Extending this harness to them is a known follow-up.
+-- COVERAGE NOTE (honest): the harness now reaches the v9-v11 surface too -
+-- btDhtBep44SignBuf, btDhtPutSigned, btDhtGetPeers, btAddInfohash, btMapPort /
+-- btUnmapPort, and btRp1Enable / btRp1SetToken / btRp1Send / btRp1Poll - in the
+-- signed-puts section below. What it can assert there is the non-destructive,
+-- single-process half: determinism, fail-closed rejection, and clean handling
+-- of "no mapper" / "no peer". A real rp1 message exchange needs two machines
+-- (examples/torrent-rp1-chat.livecodescript), and the DHT results arrive later
+-- as events. Native coverage lives in tests/torrent_smoke_test.cpp and
+-- rp1_integration_test.cpp; this file proves the .lcb wrappers, once an engine
+-- runs it (verified statically until then).
 --
 -- WHAT IT CHECKS: every non-destructive public handler returns a sane value and
 -- the round-trips work (create+seed -> file table; add web seed -> list it ->
@@ -254,6 +257,52 @@ command stRun
    stAssert "btDhtGetImmutable accepts the target (async)", (btDhtGetImmutable(sSession, tTarget) is 0)
    stAssert "btDhtPutMutable signs + queues", (btDhtPutMutable(sSession, tKey["publicKey"], tKey["secretKey"], "", textEncode("v1", "UTF-8")) is 0)
    stAssert "btDhtGetMutable accepts the key (async)", (btDhtGetMutable(sSession, tKey["publicKey"], "") is 0)
+
+   stSection "signed puts, rendezvous, NAT mapping, rp1 (the v9-v11 surface)"
+   -- btDhtBep44SignBuf hands back the EXACT bytes libtorrent signs, so a
+   -- signature can be produced off-box (a hardware key, another machine) and
+   -- fed to btDhtPutSigned. It is a pure function of (salt, seq, value), so
+   -- determinism is the property worth pinning; byte-exact compares need
+   -- caseSensitive, since `is` would otherwise fold 0x41 onto 0x61.
+   local tBuf, tBuf2, tBufSeq2
+   put btDhtBep44SignBuf("", "1", textEncode("signed-v1", "UTF-8")) into tBuf
+   stAssert "btDhtBep44SignBuf returns bytes", (the number of bytes of tBuf > 0)
+   put btDhtBep44SignBuf("", "1", textEncode("signed-v1", "UTF-8")) into tBuf2
+   set the caseSensitive to true
+   stAssert "btDhtBep44SignBuf is deterministic", (tBuf is tBuf2)
+   put btDhtBep44SignBuf("", "2", textEncode("signed-v1", "UTF-8")) into tBufSeq2
+   stAssert "a different seq changes the signing buffer", (tBufSeq2 is not tBuf)
+   -- Fail closed on a signature that is not even hex, rather than queueing a
+   -- garbage item into the DHT.
+   stAssert "btDhtPutSigned rejects a malformed signature", \
+      (btDhtPutSigned(sSession, tKey["publicKey"], "", "1", textEncode("signed-v1", "UTF-8"), "not-a-signature") < 0)
+   -- Classic BEP5 rendezvous: any 40-hex id is legal, it need not name a real
+   -- torrent - that is what makes it a presence primitive.
+   stAssert "btDhtGetPeers accepts a rendezvous id (async)", \
+      (btDhtGetPeers(sSession, tTarget) is 0)
+   -- A phantom swarm: joined by info-hash with no metadata, which is where the
+   -- rp1 peer-wire transport meets its peers.
+   local tPhantom
+   put btAddInfohash(sSession, tTarget, sTempDir) into tPhantom
+   stAssert "btAddInfohash joins a metadata-less swarm", (tPhantom > 0)
+   -- NAT mapping is best-effort by nature: 0 means "no mapper active"
+   -- (UPnP/NAT-PMP off, or a router that will not play), which is a legitimate
+   -- outcome on a CI box or a locked-down LAN, not a failure. Either way it
+   -- must not throw, and unmapping must tolerate whatever it returns.
+   local tMapId
+   put btMapPort(sSession, 0, btListenPort(sSession), true) into tMapId
+   stAssert "btMapPort returns a mapping id or 0 (no mapper)", (tMapId >= 0)
+   stAssert "btUnmapPort tolerates that id", (btUnmapPort(sSession, tMapId) >= 0)
+   stAssert "btUnmapPort on a stale id is a harmless no-op", \
+      (btUnmapPort(sSession, 999999) >= 0)
+   -- rp1: enable the extension, set a token, drain. A send with no connected
+   -- peer must fail cleanly (there is nobody to send to), never crash.
+   stAssert "btRp1Enable turns the extension on", (btRp1Enable(sSession) is 0)
+   stAssert "btRp1SetToken accepts a token", \
+      (btRp1SetToken(sSession, textEncode("selftest-token", "UTF-8")) is 0)
+   stAssert "btRp1Poll drains a list", (stCount(btRp1Poll(sSession)) >= 0)
+   stAssert "btRp1Send to a non-peer fails cleanly", \
+      (btRp1Send(sSession, 999999, textEncode("nobody is listening", "UTF-8")) < 0)
 
    stSection "not auto-checked - confirm by hand"
    stNote "btMoveStorage + btRemoveTorrent(deleteFiles=true) are destructive;"

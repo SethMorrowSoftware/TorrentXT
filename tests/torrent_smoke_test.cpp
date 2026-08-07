@@ -107,6 +107,58 @@ static void test_session_lifecycle() {
     int s3 = btx_session_new();
     CHECK(s3 > 0);
     CHECK(btx::test::live_session_count() == 1);
+
+    /* The DHT-state ROUND TRIP on a live session. btx_dht_load_state was the
+     * one export nothing here drove: the save half was covered only on a bogus
+     * handle, and the load half only OXT-side by the selftest. The pair is what
+     * lets an app keep its routing table across runs, so prove both halves and
+     * the -needed grow-and-retry the .lcb layer relies on. */
+    {
+        char big[65536];
+        int n = btx_dht_save_state(s3, big, static_cast<int>(sizeof big));
+        CHECK(n > 0);                       /* a live session yields real bytes */
+        if (n > 0) {
+            /* Feeding those exact bytes back is accepted. */
+            CHECK(btx_dht_load_state(s3, big, n) == BTX_OK);
+
+            /* The buffer contract: too small reports a need as a negative and
+             * writes nothing past the caller's byte. Do NOT assert the need
+             * equals the `n` measured above - a live session's DHT state is a
+             * MUTATING structure (nodes arrive, the routing table ages), so
+             * two serialisations milliseconds apart may legitimately differ in
+             * size. Asserting they match passes on a quiescent machine and
+             * fails on a networked CI runner, which is exactly what it did. */
+            char tiny[1] = {'\0'};
+            int needed = btx_dht_save_state(s3, tiny, 1);
+            CHECK(needed < 0);
+            CHECK(-needed > 0);
+            CHECK(tiny[0] == '\0');
+            /* The grow-and-retry the .lcb layer performs: a buffer sized to the
+             * reported need takes it (or reports a new, larger need if the
+             * state grew again in between - never a silent truncation). */
+            std::vector<char> grown(static_cast<size_t>(-needed));
+            int again = btx_dht_save_state(s3, grown.data(),
+                                           static_cast<int>(grown.size()));
+            CHECK(again != 0);
+            CHECK(again <= static_cast<int>(grown.size()));
+        }
+        /* Empty/NULL input is an explicit argument error, checked by OUR code
+         * before anything reaches libtorrent. */
+        CHECK(btx_dht_load_state(s3, big, 0) == BTX_ERR_INVALID_ARG);
+        CHECK(btx_dht_load_state(s3, nullptr, 4) == BTX_ERR_INVALID_ARG);
+        /* DO NOT add a malformed-blob probe here. Feeding garbage to
+         * btx_dht_load_state ABORTS THE PROCESS on libtorrent 2.0.10 (the apt
+         * build): lt::read_session_params trips an assertion inside libtorrent,
+         * which is not a C++ exception, so the BTX_GUARD firewall cannot catch
+         * it. The pinned 2.0.11 source build tolerates the same input, which is
+         * why this only shows up in the lane that links the system library.
+         * That asymmetry is a REAL hazard for an app that persists DHT state
+         * and feeds back a truncated file, and hardening the shim (bdecode and
+         * validate before handing the blob over, so we fail closed per family
+         * rule 4) is the fix - a shim change, which per suite rule 5 must ship
+         * with all four committed binaries refreshed. Tracked, not done here. */
+    }
+
     btx_session_free(s3);
     CHECK(btx::test::live_session_count() == 0);
 }
