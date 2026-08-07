@@ -99,8 +99,8 @@ cmake --build build --parallel && ctest --test-dir build --output-on-failure
 ```
 
 See `CLAUDE.md` for the engineering rules and `docs/building.md` for the
-sanitizer lane. Binding-side runtime behaviour is verified statically; needs
-an OXT pass (`tests/enet-selftest.livecodescript`).
+sanitizer lane. Binding-side runtime behaviour is confirmed in OXT: the
+selftest (`tests/enet-selftest.livecodescript`) ran green on 2026-08-07.
 
 ## License
 

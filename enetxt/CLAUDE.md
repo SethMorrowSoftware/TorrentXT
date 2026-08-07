@@ -8,8 +8,11 @@ code in this repository.
 > milestones 0–3 are built: the full `enx_` ABI (v2), the LCB layer
 > (`org.openxtalk.library.enet`, public `en*`), helpers, the LAN chat demo,
 > the OXT selftest, all static gates, CI, and the committed linux binary.
-> Runtime behaviour is verified statically; needs an OXT pass
-> (`tests/enet-selftest.livecodescript` + the demo on two machines).
+> The OXT runtime pass happened 2026-08-07: `tests/enet-selftest.livecodescript`
+> runs green in OXT — all tests pass. That retires the `MCStringEncode`
+> first-runtime-use flag from the pre-pass audit (the selftest's `enSendText`
+> legs exercise that bind). Still un-exercised: the LAN chat demo between two
+> real machines.
 
 ## The rules that carry over unchanged
 
