@@ -151,7 +151,7 @@ constant kQsVerify = "BTXQSVERIFY"
 -- (both IPs hidden) and NO torrent is created. Requires the OnionXT extension +
 -- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
 -- ABI; verified statically here, needs an on-engine OXT pass with a running Tor
--- daemon (the project convention). See docs/ONIONXT-INTEGRATION-PLAN.md.
+-- daemon (the project convention). See the suite's docs/ONIONXT-INTEGRATION-PLAN.md.
 constant kTorCodePrefix = "BTXTOR1:"   -- marks an anonymous (Tor) share code
 constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync + go request
 constant kOnionVer = 1                 -- stream protocol version
@@ -1152,7 +1152,7 @@ end qsMaybeDecryptFinished
 -- an anonymous transfer creates no torrent and makes no DHT call (the mutual-
 -- exclusion invariant). Every ox* handler is OnionXT's published ABI; this is
 -- verified statically (tools/check-livecodescript.py) and NEEDS an on-engine OXT
--- pass with a running Tor daemon before any runtime claim. See
+-- pass with a running Tor daemon before any runtime claim. See the suite's
 -- docs/ONIONXT-INTEGRATION-PLAN.md and its VERIFY register (section 12.3).
 
 -- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both

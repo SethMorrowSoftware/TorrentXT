@@ -156,6 +156,24 @@ arrives as a `dhtGetPeers` event carrying `target` and `peers` (a newline-separa
 `ip:port` list; IPv6 is bracketed, `[addr]:port`).
 - **Usage:** command - `btDhtGetPeers sSession, tRendezvousHex`.
 
+### `btMapPort(in pSession as Integer, in pExternalPort as Integer, in pLocalPort as Integer, in pIsTcp as Boolean) returns Integer`
+Ask the LAN router for a **UPnP / NAT-PMP port mapping**: forward
+`pExternalPort` on the router to `pLocalPort` on this machine (`pIsTcp` picks
+TCP or UDP). Returns a mapping id (`> 0`) to pass to `btUnmapPort`, or `0` if no
+mapper is active (UPnP/NAT-PMP disabled) or the port is bad. The mapping is
+asynchronous: the **actual** external port the router assigns (it may differ
+from what you asked for) and which mapper won arrive later as a `portMapped`
+event (keys `externalPort`, `transport`); a failure arrives as `portMapError`,
+and the machine's learned external IP as an `externalIp` event. NOTE: this is
+the **clear-web** path - the resulting IP/port are public, so it is not
+anonymous (use the Tor onion path for that).
+- **Usage:** function - `put btMapPort(sSession, 8080, 8080, true) into tMapId`.
+
+### `btUnmapPort(in pSession as Integer, in pMappingId as Integer) returns Integer`
+Withdraw a mapping created by `btMapPort`. Idempotent - a stale or unknown
+mapping id is a harmless no-op.
+- **Usage:** command - `btUnmapPort sSession, tMapId`.
+
 ---
 
 ## Filtering & streaming
@@ -773,6 +791,9 @@ From `_alertName` in `src/torrent.lcb` and the alert registry in
 | `rp1Handshake` | 27 | `peer`, `infoHashV1`, `btPeerId`, `endpoint`, `supportsRp1`, `token` | the peer's extended handshake was seen |
 | `rp1Message` | 28 | `peer`, `infoHashV1`, `payload` | one `rp1` message arrived (drained by `btRp1Poll`) |
 | `rp1PeerDisconnected` | 29 | `peer`, `infoHashV1` | the peer connection closed |
+| `portMapped` | 30 | `externalPort`, `transport`, `message` | a `btMapPort` router mapping succeeded; `externalPort` is what the router actually assigned, `transport` is `upnp` or `natpmp` |
+| `portMapError` | 31 | `transport`, `errorCode`, `errorMessage`, `message` | a port-mapping attempt failed |
+| `externalIp` | 32 | `externalIp` | libtorrent learned this machine's external IP (from a router or from peers) |
 
 The `rp1*` events are returned by **`btRp1Poll`** (not `btPoll`), in the same
 record shape. The full set of event-array key names available across all alerts
@@ -780,8 +801,9 @@ record shape. The full set of event-array key names available across all alerts
 `140..145`): `torrent`, `message`, `errorCode`, `errorMessage`, `piece`, `state`,
 `prevState`, `tracker`, `numPeers`, `resumeData`, `infoHashV1`, `infoHashV2`,
 `torrentName`, `endpoint`, DHT items `target`, `value`, `publicKey`, `secretKey`,
-`seed`, `signature`, `seq`, `salt`, `authoritative`, `numSuccess`, `peers`, and
-rp1 items `peer`, `btPeerId`, `supportsRp1`, `token`, `payload`. Which subset a given
+`seed`, `signature`, `seq`, `salt`, `authoritative`, `numSuccess`, `peers`,
+rp1 items `peer`, `btPeerId`, `supportsRp1`, `token`, `payload`, and the
+connectivity items `externalIp`, `externalPort`, `transport`. Which subset a given
 alert populates is the shim's choice per alert; the column above reflects the
 intended mapping and is implemented in `torrent_shim.cpp`, the source of truth for
 which subset each alert populates.

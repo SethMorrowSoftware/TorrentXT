@@ -161,13 +161,13 @@ These are load-bearing and enforced in the code:
 
 ## API at a glance
 
-75 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
+85 public `bt*` handlers (full signatures in **[api-reference](docs/api-reference.md)**):
 
 | Group | Handlers |
 |---|---|
 | Session | `btStartSession` · `btStopSession` · `btLastError` · `btClearError` · `btSessionPause` · `btSessionResume` · `btSessionIsPaused` · `btListenPort` · `btFindTorrent` · `btDhtAnnounce` |
 | Settings | `btSetInt` · `btSetBool` · `btSetString` · `btGetSetting` · `btSetEncryption` |
-| Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` · `btAddMagnetEx` · `btAddTorrentFileEx` |
+| Add / remove | `btAddMagnet` · `btAddTorrentFile` · `btAddTorrentWithResume` · `btRemoveTorrent` · `btAddMagnetEx` · `btAddTorrentFileEx` · `btAddInfohash` |
 | Filter / streaming | `btIpFilterAdd` · `btIpFilterClear` · `btSetPieceDeadline` · `btClearPieceDeadlines` |
 | Control | `btPause` · `btResume` · `btForceRecheck` · `btForceReannounce` · `btScrapeTracker` · `btClearTorrentError` |
 | Priorities / limits | `btSetFilePriority` · `btSetFilePriorities` · `btSetPiecePriority` · `btSetTorrentLimits` · `btSetMaxConnections` · `btSetMaxUploads` |
@@ -176,8 +176,10 @@ These are load-bearing and enforced in the code:
 | Inspect | `btTorrentStatus` · `btTorrentCount` · `btTorrentHandleAt` · `btInfoHash` · `btPieceBitfield` · `btPeerList` · `btFileList` · `btPieceAvailability` |
 | Trackers / seeds | `btTrackers` · `btAddTracker` · `btWebSeeds` · `btAddWebSeed` · `btRemoveWebSeed` |
 | Events | `btPoll` |
-| DHT | `btDhtAddBootstrap` · `btDhtState` · `btDhtSaveState` · `btDhtLoadState` |
-| DHT key-value (BEP44) | `btDhtKeypair` · `btDhtPutImmutable` · `btDhtGetImmutable` · `btDhtPutMutable` · `btDhtGetMutable` |
+| DHT | `btDhtAddBootstrap` · `btDhtState` · `btDhtSaveState` · `btDhtLoadState` · `btDhtGetPeers` |
+| DHT key-value (BEP44) | `btDhtKeypair` · `btDhtPutImmutable` · `btDhtGetImmutable` · `btDhtPutMutable` · `btDhtGetMutable` · `btDhtBep44SignBuf` · `btDhtPutSigned` |
+| Connectivity (NAT) | `btMapPort` · `btUnmapPort` |
+| rp1 transport | `btRp1Enable` · `btRp1SetToken` · `btRp1Send` · `btRp1Poll` |
 | Create / seed | `btCreateTorrent` |
 | Resume | `btSaveResumeData` |
 
@@ -205,6 +207,11 @@ A simple starter, two flagship demos, plus the shared poll-dispatcher utility:
   color-coded transfers table, shareable channel cards, and an immutable "quick
   drop" (pin text, share a 40-char code). The DHT says *where*, BitTorrent moves
   *what*. A built-in **"What is this?"** button explains it in plain language.
+- **[`examples/torrent-rp1-chat.livecodescript`](examples/torrent-rp1-chat.livecodescript)**
+  — the **rp1 peer-wire transport** demo: two machines exchange short messages
+  directly over the BitTorrent peer wire (no torrent payload at all), using the
+  DHT to find each other. The smallest working proof of `btRp1Enable` /
+  `btRp1SetToken` / `btRp1Send` / `btRp1Poll`.
 - **[`examples/torrent-helpers.livecodescript`](examples/torrent-helpers.livecodescript)**
   — the reusable **poll dispatcher** (`btStartPolling` / `btStopPolling`) and
   formatting sugar (`btFormatBytes`, `btStateName`). `start using` it to drive
@@ -224,7 +231,8 @@ A simple starter, two flagship demos, plus the shared poll-dispatcher utility:
 - **[TorrentXT-IMPLEMENTATION-PLAN.md](docs/TorrentXT-IMPLEMENTATION-PLAN.md)** — the
   original design brief, kept for the *why* (engine choice, ABI design, risk
   register).
-- **[NEXT-EXTENSIONS-PLAN.md](docs/NEXT-EXTENSIONS-PLAN.md)** — the forward plan
+- **[NEXT-EXTENSIONS-PLAN.md](../docs/NEXT-EXTENSIONS-PLAN.md)** — the forward plan
+  (now a suite-level document in the monorepo's top-level `docs/`)
   for the next native wraps (libsodium, ENet, libdatachannel) **and** the
   consolidated OXT/LiveCode engine playbook: every FFI / LCB / runtime gotcha
   we have uncovered, so the next wraps avoid the same mistakes.
@@ -246,10 +254,13 @@ sanitizer builds, and the per-platform notes.
 
 ## Status
 
-The public API spans **75 `bt*` handlers** (ABI v8) — essentially the full
-practical libtorrent surface. The shim, the LCB binding, the test suite, and four
-of five platform binaries are built and gated by CI; the shim is exercised under
-ASan/UBSan against real libtorrent on every change. Because OpenXTalk has no
+The public API spans **85 `bt*` handlers** (ABI v11) — essentially the full
+practical libtorrent surface, plus BEP44 signed mutable items, NAT port mapping,
+and the rp1 peer-wire transport. The shim, the LCB binding, the test suite, and
+four of five platform binaries are built; the suite CI runs the static gates on
+every push, and the full native matrix (ASan/UBSan against real libtorrent) lives
+in this member's own workflow, run when TorrentXT is worked on in isolation (it
+is inert inside the monorepo). Because OpenXTalk has no
 headless way to compile or run `.lcb`, runtime behaviour is marked "verified
 statically; needs an OXT pass" and confirmed by a human in the IDE — the project
 does not claim runtime behaviour it cannot observe. Remaining: the signed macOS

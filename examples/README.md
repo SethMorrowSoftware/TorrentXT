@@ -10,7 +10,7 @@ session automatically. No helper stacks, no manual layout.
 | File | What it is | Needs cryptoXT? |
 |------|------------|-----------------|
 | `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. Optionally send anonymously over Tor, serve a **folder** as a browsable `.onion` page, or hand out a **direct web link** any browser can open (with automatic router port-opening). | Only for the optional passphrase lock |
-| _(moved)_ **No Cloud Quick Share** | The revamped Quick Share dashboard has graduated into its own standalone-ready project at [`../nocloudquickshare/`](../nocloudquickshare/) (rebranded away from the TorrentXT name, ready to move to its own repository). It keeps the polished two-column dashboard, the plain-English 3-way share choice, the hardened HTTP/Tor server, and all the quality-of-life touches. See that folder's `README.md` and `CLAUDE.md`. | Only for the optional passphrase lock |
+| _(moved)_ **No Cloud Quick Share** | The revamped Quick Share dashboard graduated into its own standalone project (rebranded away from the TorrentXT name) and is **not part of this repository**. It keeps the polished two-column dashboard, the plain-English 3-way share choice, the hardened HTTP/Tor server, and all the quality-of-life touches. The `torrent-quickshare` demo above remains the in-repo original. | Only for the optional passphrase lock |
 | `torrent-client.livecodescript` | A full multi-torrent client: add magnets / `.torrent` files / URLs, seed a folder, and manage many torrents with a live Files / Peers / Trackers / Log inspector. Shares the family design system (palette, flat inputs, platform-monospace tables, brand band) while staying resizable, plus clipboard auto-detect, a Copied! flash, and standalone readiness. | No |
 | `torrent-dht-channels.livecodescript` | A decentralized "channels" app: publish files under your own key, follow others by their key, no server anywhere (the DHT is the directory). Shares newquickshare's polished design system (rounded cards, flat inputs, platform monospace, metrics-proof labels) plus clipboard card-detect, Enter-to-act, click-to-copy, and standalone readiness. | Only for private (passphrase) channels |
 | `torrent-rp1-chat.livecodescript` | A two-machine **messaging** demo: two peers meet on a shared "room" id and chat directly over the `rp1` peer-wire extension, with no tracker, no server, and no file transfer at all. | No |
@@ -113,11 +113,12 @@ while a genuinely missing asset still returns 404. Two things to know:
   it with **relative** asset paths (or a matching base) - absolute paths like `/app.js`
   resolve above the token and 404. Over Tor (served at the root) absolute paths are fine.
 
-There is a **ready-made demo app** in [`quickshare-webapp/`](quickshare-webapp/): drag that
-folder onto Quick Share and share it to see static assets, correct MIME types, HTTP Range
-(a `<audio>` seek), automatic SPA routing (deep links + refresh), a live `GET /_qs/info`
-call, and a gallery of SVG/PNG images - the same folder working over Tor or the web link.
-See its [README](quickshare-webapp/README.md).
+To try it, drag any static-site folder onto Quick Share and share it: static assets get
+correct MIME types, HTTP Range works (seek an `<audio>` element), unresolved
+extension-less paths fall back to `index.html` (SPA routing, deep links + refresh), and
+the built-in `GET /_qs/info` route answers live JSON - the same folder works over Tor or
+the web link. (A ready-made demo webapp folder ships with the standalone No Cloud Quick
+Share project, which is not part of this repository.)
 
 **Give it a backend.** The server also does **dynamic routes**, so a hosted app can call
 back into your stack instead of being purely static. A built-in demo route answers

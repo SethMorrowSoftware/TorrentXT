@@ -10,8 +10,17 @@ script "torrentSelfTest"
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI, starts a
 -- TorrentXT session, runs ~70 checks, and shows a green/red list. Needs the loaded
--- org.openxtalk.library.torrent (v8+). Run it STANDALONE - only one TorrentXT
--- session may be live per OXT process, so close any client/demo stack first.
+-- org.openxtalk.library.torrent (v8+; the current ABI is v11). Run it STANDALONE -
+-- only one TorrentXT session may be live per OXT process, so close any client/demo
+-- stack first.
+--
+-- COVERAGE NOTE (honest): the checks below exercise the v8 surface. The v9-v11
+-- additions (btDhtBep44SignBuf, btDhtPutSigned, btDhtGetPeers, btAddInfohash,
+-- btRp1Enable / btRp1SetToken / btRp1Send / btRp1Poll, btMapPort / btUnmapPort)
+-- have native coverage in tests/torrent_smoke_test.cpp and rp1_integration_test.cpp,
+-- but their .lcb wrappers are so far verified statically only; the rp1 wrappers are
+-- exercised for real by examples/torrent-rp1-chat.livecodescript (two machines).
+-- Extending this harness to them is a known follow-up.
 --
 -- WHAT IT CHECKS: every non-destructive public handler returns a sane value and
 -- the round-trips work (create+seed -> file table; add web seed -> list it ->
