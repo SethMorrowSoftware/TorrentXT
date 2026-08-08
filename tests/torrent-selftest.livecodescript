@@ -23,7 +23,18 @@ script "torrentSelfTest"
 -- (examples/torrent-rp1-chat.livecodescript), and the DHT results arrive later
 -- as events. Native coverage lives in tests/torrent_smoke_test.cpp and
 -- rp1_integration_test.cpp; this file proves the .lcb wrappers, once an engine
--- runs it (verified statically until then).
+-- runs it (verified statically until then). THIS file has not been run on an
+-- engine yet. What has: on 2026-08-08 the suite selftest
+-- (tests/suite-selftest.livecodescript at the repository root) ran green on a
+-- real OXT engine and exercised 11 of the bt* handlers - btStartSession,
+-- btLastError/btClearError, btListenPort, btSetBool, btSetInt (including its
+-- rejection of an unknown key), btDhtKeypair (deterministic from a seed),
+-- btPoll, btDhtBep44SignBuf (canonical and deterministic), btDhtPutSigned
+-- (accepting a SodiumXT signature and REFUSING one made for another seq), and
+-- btStopSession. So the session lifecycle and the signed-put path are observed.
+-- The rest of the v9-v11 surface this file covers - btDhtGetPeers,
+-- btAddInfohash, btMapPort/btUnmapPort, btRp1Enable/btRp1SetToken/btRp1Send/
+-- btRp1Poll - is still static, and running THIS file is what changes that.
 --
 -- WHAT IT CHECKS: every non-destructive public handler returns a sane value and
 -- the round-trips work (create+seed -> file table; add web seed -> list it ->
