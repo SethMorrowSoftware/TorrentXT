@@ -464,6 +464,49 @@ def check_does_not_operator(path, cleaned):
     return problems
 
 
+def check_zero_arg_statement_calls(path, text):
+    """A zero-argument call written `foo()` in STATEMENT position.
+
+    LiveCodeScript has no "call a function and discard the result" statement.
+    A line that starts with an identifier is parsed as a COMMAND, and whatever
+    follows is its argument list - so `dcCleanup()` asks the engine to pass the
+    expression `()` to the command `dcCleanup`, and `()` is not an expression.
+    It is a compile error, and because a .livecodescript compiles as one unit it
+    takes the WHOLE FILE with it, usually reported at some unrelated line.
+
+    Three things make this worth a gate rather than a lesson in a header:
+
+      - The one-argument spelling `dcFreePeer(sPeerA)` is FINE, because `(sPeerA)`
+        IS an expression. So the broken form looks exactly like the working one
+        that sits next to it, and reading the file does not distinguish them.
+      - In EXPRESSION position `dcCleanup() is 0` is correct and required. Same
+        eight characters, opposite verdicts, decided by what is to the left.
+      - This is LiveCodeScript only. LiveCode BUILDER allows `sPrepare()` as a
+        statement, and both sodium.lcb and coinxt.lcb use it hundreds of times
+        on paths that have run green on a real engine. Flagging .lcb here would
+        be ~90 false positives and would get the whole rule switched off.
+
+    Found the hard way: the suite self-test failed on an engine at
+    `dcCleanup()`, folded in from datachannelxt's harness. Three of the four
+    sites had a working bare call within a few lines of them.
+    """
+    if path.endswith(".lcb"):
+        return []
+    out, continued = [], False
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        line = raw.split("--", 1)[0] if '"' not in raw.split("--", 1)[0] else raw
+        stripped = line.strip()
+        # A continuation line is part of the PREVIOUS statement, so an
+        # identifier + () there is an ordinary call inside an expression.
+        was_continued, continued = continued, stripped.endswith("\\")
+        if was_continued or not stripped:
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)$", stripped)
+        if m:
+            out.append((lineno, m.group(1)))
+    return out
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -474,6 +517,8 @@ def check_file(path):
 
     problems = []
     problems += find_smart_quotes(path, text)
+    for lineno, name in check_zero_arg_statement_calls(path, text):
+        problems.append(Problem(path, lineno, "a zero-argument call written %s() in statement position does not compile in LiveCodeScript (the engine parses `()` as the command's argument, and `()` is not an expression). Write it bare: %s" % (name, name)))
 
     is_lcb = path.endswith(".lcb")
     line_comment_tokens = ["--"] if is_lcb else ["--", "#"]
