@@ -665,13 +665,26 @@ end tcRowTop
 
 -- ---- session lifecycle (adopts a still-live session, like the demo) ----------
 command tcEnsureSession
-   local tErr, tRemembered
+   local tErr, tRemembered, tAdopted
    if sSession is not empty and sSession is not 0 then
       exit tcEnsureSession
    end if
+   -- Probe the remembered handle with NESTED ifs, never one and-chain: xTalk
+   -- does NOT short-circuit "and" (LCB does - do not carry that habit here), so
+   -- a chained guard still evaluates btSetBool with an EMPTY handle on a first
+   -- open, and empty cannot convert to the LCB Integer parameter - the throw
+   -- aborts openStack before btStartSession ever runs and the client sits dead.
+   put false into tAdopted
    put the uSession of this stack into tRemembered
-   if tRemembered is a number and tRemembered > 0 \
-         and btSetBool(tRemembered, "enable_dht", true) is 0 then
+   if tRemembered is a number then
+      if tRemembered > 0 then
+         -- btSetBool doubles as the liveness probe: only a live handle returns 0
+         if btSetBool(tRemembered, "enable_dht", true) is 0 then
+            put true into tAdopted
+         end if
+      end if
+   end if
+   if tAdopted then
       put tRemembered into sSession
       tcLogMsg "Re-adopted the still-live session (handle" && sSession & ")."
    else
