@@ -181,17 +181,45 @@ command stRun
    stSection "session + ABI"
    -- btStartSession is the one handler that can throw (on ABI skew); a clean
    -- start IS the ABI check passing.
-   local tStartOk
+   local tStartOk, tNewSession
    put false into tStartOk
+   -- RELEASE A SESSION THIS HARNESS ITSELF LEFT BEHIND, before asking for one.
+   -- TorrentXT allows exactly ONE session per process, the latch is in the C
+   -- shim, and the only key is the integer handle - nothing exported can free a
+   -- session you can no longer name. So a run that died before its teardown
+   -- orphans it for the whole engine launch. Safe to repeat and safe when
+   -- TorrentXT is absent: btStopSession on a stale handle is a documented
+   -- no-op, and the try covers the absent case.
    try
-      put btStartSession() into sSession
+      if sSession is not empty and sSession > 0 then
+         btStopSession sSession
+      end if
+   catch tErr
+      -- TorrentXT absent, or already released; nothing to free.
+   end try
+   put 0 into sSession
+   -- START INTO A TEMPORARY. This used to be `put btStartSession() into
+   -- sSession`, which on a REFUSAL wrote 0 over a still-live handle in the same
+   -- statement - destroying the only key to the very session it had just been
+   -- refused, and guaranteeing that every later run in this launch would be
+   -- refused too. Commit to sSession only on success.
+   try
+      put btStartSession() into tNewSession
       put true into tStartOk
    catch tErr
-      put 0 into sSession
+      put 0 into tNewSession
    end try
+   if tNewSession is not empty and tNewSession > 0 then
+      put tNewSession into sSession
+   end if
    stAssert "btStartSession did not throw (ABI matches)", tStartOk
    if sSession is 0 or sSession is empty then
-      stNote "Could not start a session - is another TorrentXT stack open?"
+      -- NAME BOTH CAUSES. The shim cannot tell them apart and neither can this
+      -- harness, so asserting the one it cannot know sent operators hunting for
+      -- a window that was not open. See OXT-PASS-RUNBOOK trap 5.1.1.
+      stNote "Could not start a session. Either another TorrentXT stack owns it"
+      stNote "(close that stack and re-run), or an earlier run in THIS engine"
+      stNote "launch lost its handle - quit and relaunch OXT."
       stNote (btLastError())
       stPaint
       exit stRun
