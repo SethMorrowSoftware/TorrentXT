@@ -263,14 +263,16 @@ in this member's own workflow, run when TorrentXT is worked on in isolation (it
 is inert inside the monorepo). Because OpenXTalk has no
 headless way to compile or run `.lcb`, runtime behaviour is marked "verified
 statically; needs an OXT pass" and confirmed by a human in the IDE — the project
-does not claim runtime behaviour it cannot observe. An engine pass on
-**2026-08-08** (the suite selftest, green) observed the session lifecycle and the
-signed-put path: `btStartSession` → `btListenPort` → settings → `btDhtKeypair` →
-`btDhtBep44SignBuf` → `btDhtPutSigned` → `btStopSession`, including
-`btDhtPutSigned` **refusing** a signature minted for a different sequence number.
-The wider surface in `tests/torrent-selftest.livecodescript` (~70 checks) has not
-yet had an engine run. Remaining: that selftest run, the signed macOS universal
-dylib, and the optional visual dashboard widget.
+does not claim runtime behaviour it cannot observe. That confirmation has now
+happened at full width: an engine pass on **2026-08-08** (the suite selftest,
+green) observed the session lifecycle and the signed-put path, including
+`btDhtPutSigned` **refusing** a signature minted for a different sequence number,
+and on **2026-08-10** the whole member selftest
+(`tests/torrent-selftest.livecodescript`, 96 checks) ran green on a real engine,
+twice in one day, folded into the suite harness — the v9-v11 surface
+(`btDhtGetPeers`, `btAddInfohash`, `btMapPort`/`btUnmapPort`, the `btRp1*`
+quartet) included. Remaining: the signed macOS universal dylib, the two-machine
+rp1/DHT demos, and the optional visual dashboard widget.
 
 ## License
 

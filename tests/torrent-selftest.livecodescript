@@ -22,19 +22,19 @@ script "torrentSelfTest"
 -- of "no mapper" / "no peer". A real rp1 message exchange needs two machines
 -- (examples/torrent-rp1-chat.livecodescript), and the DHT results arrive later
 -- as events. Native coverage lives in tests/torrent_smoke_test.cpp and
--- rp1_integration_test.cpp; this file proves the .lcb wrappers, once an engine
--- runs it (verified statically until then). THIS file has not been run on an
--- engine yet. What has: on 2026-08-08 the suite selftest
--- (tests/suite-selftest.livecodescript at the repository root) ran green on a
--- real OXT engine and exercised 11 of the bt* handlers - btStartSession,
--- btLastError/btClearError, btListenPort, btSetBool, btSetInt (including its
--- rejection of an unknown key), btDhtKeypair (deterministic from a seed),
--- btPoll, btDhtBep44SignBuf (canonical and deterministic), btDhtPutSigned
--- (accepting a SodiumXT signature and REFUSING one made for another seq), and
--- btStopSession. So the session lifecycle and the signed-put path are observed.
--- The rest of the v9-v11 surface this file covers - btDhtGetPeers,
--- btAddInfohash, btMapPort/btUnmapPort, btRp1Enable/btRp1SetToken/btRp1Send/
--- btRp1Poll - is still static, and running THIS file is what changes that.
+-- rp1_integration_test.cpp; this file proves the .lcb wrappers, and AN ENGINE
+-- HAS NOW RUN IT: on 2026-08-10 every check in this file executed green on a
+-- real OXT engine - 96 checks, zero failures, twice in one day - folded into
+-- the suite selftest (tests/suite-selftest.livecodescript at the repository
+-- root), which carries this harness verbatim with only btStartSession rewired
+-- to share the suite's single session. That includes the whole v9-v11 surface
+-- (btDhtGetPeers, btAddInfohash, btMapPort/btUnmapPort, btRp1Enable/
+-- btRp1SetToken/btRp1Send/btRp1Poll), which had been static since it landed.
+-- The 2026-08-08 suite pass had already observed the session lifecycle and
+-- the signed-put path, including btDhtPutSigned accepting a SodiumXT
+-- signature and REFUSING one made for another seq. A standalone paste of THIS
+-- file has still not happened and is no longer load-bearing; run it standalone
+-- only to chase something the folded run reported.
 --
 -- WHAT IT CHECKS: every non-destructive public handler returns a sane value and
 -- the round-trips work (create+seed -> file table; add web seed -> list it ->
