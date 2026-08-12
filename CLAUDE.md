@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working in the TorrentXT member of the xtalk-suite monorepo (`torrentxt/`).
 
 > **Read `docs/TorrentXT-IMPLEMENTATION-PLAN.md` first** — it is the full spec (the
 > engine decision, the C ABI design, the phased plan, the risk register). This file

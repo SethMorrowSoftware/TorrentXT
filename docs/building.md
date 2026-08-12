@@ -134,9 +134,11 @@ dynamic floor, and that floor is a property of the *build host*.
 **For broad portability (Phase 4, not yet wired):** build the **release** `.so`
 inside a **manylinux2014-style image** (glibc ~2.17, matching the sibling extension
 Box2Dxt) so it loads on the older distros the OXT user base runs. This is a
-build-environment choice, not a CMake flag — when that lane lands, `commit-binaries`
-ships its output instead of the stock-runner build. Until then, ship/expect the
-modern-distro floor above (a deliberate "ship now, perfect in Phase 4" choice).
+build-environment choice, not a CMake flag — when that lane lands, its artifact is
+what gets installed into `src/code/` (by a maintainer, or by the suite's
+`release-binaries.yml` assembly) instead of the stock-runner build. Until then,
+ship/expect the modern-distro floor above (a deliberate "ship now, perfect in
+Phase 4" choice).
 
 ### macOS — universal + codesign/notarize
 
@@ -227,15 +229,18 @@ binary reports "unchanged" and writes nothing). **A native-library change is onl
 
 ---
 
-## CI (`.github/workflows/build.yml`)
+## CI (root `.github/workflows/native-torrentxt.yml`)
 
-The jobs:
+In the xtalk-suite monorepo, GitHub Actions runs only the ROOT workflows: the
+member's own `.github/workflows/build.yml` is kept for isolated development but
+is **inert here**. TorrentXT's lanes live in the root `native-torrentxt.yml`
+(scoped by `paths:` so only a torrentxt touch builds it), and the compiler-free
+gates below run for every member in the root `suite-gates.yml`. The jobs:
 
-- **`static-gates`** (ubuntu, every push/PR, < 1 min, **no libtorrent**): runs
-  `check-livecodescript.py`, `tests/record_golden_test.py`,
-  `tools/check-record-registry.py`, and builds + runs
-  `record_handle_test` directly with gcc ASan+UBSan. This is the gate that must
-  always stay green.
+- **static gates** (in `suite-gates.yml`, every push/PR, < 1 min, **no
+  libtorrent**): `check-livecodescript.py`, `tests/record_golden_test.py`,
+  `tools/check-record-registry.py`, and the rest of the suite's gate set. This
+  is the gate that must always stay green.
 - **`sanitize`** (ubuntu): builds the shim + smoke test under gcc ASan+UBSan against
   the apt libtorrent and runs them — the memory-safety gate, kept separate so the
   committed binaries stay clean Release builds.
@@ -243,15 +248,13 @@ The jobs:
   configures + builds the library with `TORRENTXT_BUILD_TESTS=ON` and runs `ctest`,
   acquiring libtorrent per-OS (apt / Homebrew / vcpkg, FetchContent for 32-bit
   Linux). Each lane stages its binary via `package-extension.py` and uploads it as
-  the artifact `native-<platform-id>`.
-- **`commit-binaries`** (ubuntu, push to **`main`** only): downloads those artifacts
-  and commits the **self-contained** ones into `src/code/<arch-platform>/`
-  (`[skip ci]`), deciding per file with `readelf` — a `.so` that dynamically `NEEDED`s
-  libtorrent, or any `.dylib`, is skipped. All four `.so`/`.dll` lanes static-link
-  libtorrent (Windows via vcpkg `*-static`; both Linux lanes via FetchContent at the
-  pinned v2.0.11), so `x86_64-linux`, `x86-linux`, `x86_64-win32` and `x86-win32` are
-  committed. (The two Linux libs are built on stock runners, so they carry the glibc/
-  OpenSSL floor noted under *Linux — the glibc floor* until the manylinux lane lands.) **macOS is the one platform not shipped from CI**: the lane builds the
+  the artifact `native-<platform-id>`. **CI never commits a binary**: the lanes
+  fire on every push, so a commit step would land binaries nobody asked for on
+  somebody else's change. Committed binaries under `src/code/` trace to a human
+  decision — a maintainer installing an artifact, or the suite's manual
+  `release-binaries.yml` assembly (which installs, verifies, and refreshes the
+  manifests via `tools/install-release-binaries.py`).
+  **macOS is the one platform not shipped from CI**: the lane builds the
   host arch (arm64) against Homebrew, which is neither universal nor self-contained;
   the real universal + codesigned + notarized dylib is a separate release build (see
   the `README.md` in `src/code/universal-mac/` and the macOS section above). Gated to

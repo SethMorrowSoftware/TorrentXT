@@ -1,27 +1,77 @@
 #!/usr/bin/env python3
-"""check-livecodescript.py - the static gate for the script layer (plan §8.4).
+"""check-livecodescript.py - the static gate for the script layer.
 
 OXT is a GUI runtime: there is NO headless way to compile or run .lcb /
-.livecodescript. So we catch what is statically catchable and let the human do
-the OXT pass for the rest. This checker enforces, across every .lcb and example:
+.livecodescript, so the static checks below are the only automated safety net
+the script layer gets. Each check encodes a gotcha that OXT compilation (or
+silent misbehaviour) would otherwise punish; every one was paid for on a real
+engine somewhere in this family.
 
-  1. No smart / curly quotes anywhere (U+2018/2019/201C/201D) - even in a
-     comment or string they fail OXT compilation. ASCII " and ' only.
-  2. Balanced strings (no stray unterminated " on a logical line).
-  3. Balanced blocks: handler/if/repeat (+ unsafe in .lcb; switch/try in
-     .livecodescript), matched by kind, with line numbers on mismatch.
-  4. Every `unsafe ... end unsafe` bracket balanced (.lcb) - every foreign call
-     must be wrapped.
-  5. Constants declared before first use (.lcb) - OXT resolves constants by
-     lexical position; a forward reference silently evaluates to nothing.
-  6. No prefixed name that spells a reserved token (both dialects) - e.g. `tExt`
-     is t-e-x-t = `text`, which xTalk evaluates as the keyword, not a variable.
+THIS FILE IS THE UNIFIED CHECKER, KEPT BYTE-IDENTICAL ACROSS EVERY MEMBER.
+The suite used to carry two independent implementations (one lineage in
+sodiumxt/onionxt/coinxt/riptide, another in torrentxt/enetxt/datachannelxt),
+each with real checks the other lacked - sodiumxt's copy famously did not know
+`switch`, so it reported phantom imbalances in dispatchers the other lineage
+parsed fine, and would have hidden a real one. This file is the union of both
+lineages. Do not edit one copy: edit every member's copy identically (they are
+the same bytes), and the suite gate tools/check-checker-drift.py FAILS the
+build if any copy differs from the others, so a fix applied to one member can
+no longer silently miss the suite. tools/test-checker.py at the suite root
+holds the fixture tests for every rule here; extend it in the same change as
+any new rule.
 
-It is a lexer-level checker, NOT a compiler: it neutralizes comments and strings
-and reasons about block keywords. It errs toward NOT raising false positives;
-where a construct is ambiguous statically it is skipped (documented inline).
+The checks, and the engine lesson each encodes:
 
-    python3 tools/check-livecodescript.py [paths...]    # default: scan repo
+  1.  ASCII only. Smart/curly quotes fail OXT compilation outright; en/em
+      dashes break house style; the proven siblings contain zero non-ASCII
+      bytes, so ANY non-ASCII character is reported. A non-UTF-8 file is
+      refused outright.
+  2.  Unterminated strings and /* block comments (lexer-level).
+  3.  Balanced blocks, matched by kind and dialect: handler/if/repeat
+      (+ unsafe in .lcb; switch/try in .livecodescript), with line numbers.
+      An LCB library/module/widget must close with its matching `end`.
+  4.  Constants declared before first use, BOTH dialects - OXT resolves a
+      constant by lexical position; a forward reference silently evaluates
+      to nothing (LCS) or empty (LCB). LCS spells it `constant k = ...`,
+      LCB `constant k is ...`; both shapes are checked.
+  5.  Declarations at the top of a handler, .lcb ONLY - a `variable` below
+      the handler's first statement has broken whole-LCB compilation (the
+      torrentxt lesson), and this is the check the house rule always claimed
+      to have. It is deliberately NOT applied to .livecodescript: mid-handler
+      `local` is legal LCS and stands at ~150 sites in ENGINE-PASSED code
+      (onionxt's live-Tor-proven source above all), so flagging it would
+      manufacture violations in the family's most-proven files. The LCS
+      top-of-handler habit stays a style convention, not a gate.
+  6.  The prefixed-token-shadow trap: a t/p/s/k-prefixed name whose full
+      spelling lowercases to a reserved token (`tExt` is t-e-x-t = `text`)
+      compiles and silently misbehaves. Both dialects.
+  7.  `does not begin/end with` / `does not contain` - not xTalk; the parser
+      errors on `does`. Both dialects.
+  8.  A zero-argument call written `foo()` in STATEMENT position
+      (.livecodescript only - LCB allows it): `()` is not an expression, and
+      one such line takes the whole file with it (the dcCleanup() lesson).
+  9.  Engine-hostile constructs that COMPILE and silently do the wrong thing
+      (.livecodescript only): `repeat with ... step N` (the increment is not
+      honoured; the cxHexDecode lesson) and `throw` inside a `catch` block
+      (the error never reaches the caller; the cxMnemonicValidate fail-open).
+      `return` inside a catch is FINE and engine-proven; only `throw` is
+      flagged.
+  10. LCB-only: a foreign type used without `use com.livecode.foreign`;
+      textEncode/textDecode inside a module (they are LCS-only); `the empty
+      list` / `the empty array` (LCB wants the literals `[]` / `{}`); an
+      all-lowercase `variable` name (OXT warns it may become reserved).
+  11. LCS-only: braces (LCB array literals leaking into script) and
+      subscripting a function result (`f(x)["k"]` does not parse).
+  12. `put X into Y after Z` - a `put` takes `into` OR `after`/`before`,
+      never both. Both dialects.
+
+It is a lexer-level checker, NOT a compiler: it neutralizes comments and
+string contents, merges backslash continuations into logical lines, and
+reasons about block keywords. It errs toward NOT raising false positives;
+where a construct is ambiguous statically it is skipped.
+
+    python3 tools/check-livecodescript.py [paths...]
+    # default: scan the whole member tree (pruning .git and build dirs)
 
 Exit code 0 = clean, 1 = problems found.
 """
@@ -29,12 +79,84 @@ import os
 import re
 import sys
 
-SMART_QUOTES = {
-    "‘": "LEFT SINGLE QUOTE",
-    "’": "RIGHT SINGLE QUOTE",
-    "“": "LEFT DOUBLE QUOTE",
-    "”": "RIGHT DOUBLE QUOTE",
+# The four curly quotes fail OXT compilation; the dashes violate house style;
+# everything else non-ASCII is off-convention and flagged generically.
+BANNED_CHARS = {
+    "‘": "left single curly quote (use ASCII ')",
+    "’": "right single curly quote (use ASCII ')",
+    "“": 'left double curly quote (use ASCII ")',
+    "”": 'right double curly quote (use ASCII ")',
+    "–": "en dash (use a hyphen)",
+    "—": "em dash (use a hyphen)",
 }
+
+# Reserved xTalk / LCB tokens for the shadow-trap check. Only identifiers that
+# start with a prefix letter (t/p/s/k) and are not written all-lowercase are
+# ever tested against this set, so an over-broad entry is harmless unless a
+# prefixed identifier collides with it - which is exactly the trap. This is
+# the UNION of both lineages' sets; extend it when a new one is found
+# on-engine, in every copy (the drift gate holds them identical).
+RESERVED = {
+    "a", "an", "after", "add", "and", "are", "as", "before", "begin", "boolean",
+    "break", "by", "byte", "char", "character", "codepoint", "codeunit",
+    "command", "constant", "continue", "data", "default", "divide", "do", "each",
+    "element", "else", "empty", "end", "event", "exit", "false", "for", "foreign",
+    "from", "function", "get", "getter", "global", "handler", "if", "in",
+    "integer", "into", "is", "it", "item", "key", "kind", "library", "line",
+    "list", "local", "me", "metadata", "module", "multiply", "next", "not",
+    "nothing", "number", "of", "on", "or", "otherwise", "paragraph", "pass",
+    "pointer", "private", "property", "public", "put", "real", "repeat", "result",
+    "return", "sentence", "set", "setter", "sort", "string", "subtract", "target",
+    "text", "the", "then", "this", "throw", "to", "token", "true", "trueword",
+    "type", "unsafe", "until", "use", "value", "variable", "where", "while",
+    "with", "without", "word",
+    # Atomic engine tokens that START with a prefix letter - the realistic
+    # traps (`tOp` lowercases to the object property `top`). Compound
+    # properties like `textFont` are deliberately absent: that CamelCase is
+    # how you legitimately write the property.
+    "tab", "tan", "there", "time", "title", "tool", "top",
+    "param", "params", "pi", "player", "point", "pow", "print",
+    "script", "scroll", "second", "seconds", "seek", "selection", "send",
+    "sin", "size", "space", "sqrt", "stack", "start", "stop", "style", "sum",
+    "keys",
+}
+
+# Foreign types live in com.livecode.foreign; a .lcb that names one without
+# `use com.livecode.foreign` gets a "not declared" compile error.
+FOREIGN_TYPES = {
+    "pointer", "cbool", "cchar", "cuchar", "cschar", "cshort", "cushort",
+    "cint", "cuint", "clong", "culong", "cfloat", "cdouble", "csize",
+    "zstringutf8", "zstringutf16", "zstringnative", "naturalfloat", "naturaluint",
+}
+
+# LCB-only constructs that look like LiveCode Script but are NOT valid LCB.
+# `the empty data` IS valid (the sibling midi.lcb uses it); the list/array
+# empties are NOT - LCB wants the literals `[]` and `{}`.
+LCB_ANTIPATTERNS = [
+    (re.compile(r"\bthe\s+empty\s+list\b"),
+     "`the empty list` is not valid LCB - use the list literal `[]`"),
+    (re.compile(r"\bthe\s+empty\s+array\b"),
+     "`the empty array` is not valid LCB - use the array literal `{}`"),
+]
+
+# The mirror image: LCB constructs that leak into .livecodescript. Braces have
+# no meaning in LiveCode Script, and a function result cannot be subscripted
+# (`f(x)["k"]` does not parse - put it into a local first). String bodies are
+# blanked in cleaned lines, so braces inside literals never trip this.
+LCS_ANTIPATTERNS = [
+    (re.compile(r"[{}]"),
+     "braces are not LiveCode Script - `{}`/`{...}` array literals are LCB-only "
+     "(build arrays by assignment; count `the keys of` a variable for emptiness)"),
+    (re.compile(r"\)\s*\["),
+     "cannot subscript a function result in LiveCode Script - "
+     "put it into a local variable first"),
+]
+
+# xTalk has NO `does not begin with` / `does not end with` / `does not contain`
+# operator: the parser errors on `does` (confirmed on-engine in OXT). Negate
+# with `not (X begins with Y)` or use `X is not ...`.
+DOES_NOT_OPERATOR = re.compile(r"\bdoes\s+not\s+(begin|end|contain)s?\b",
+                               re.IGNORECASE)
 
 
 class Problem:
@@ -45,31 +167,29 @@ class Problem:
         return "%s:%d: %s" % (self.path, self.line, self.msg)
 
 
-def find_smart_quotes(path, text):
-    """Flag any non-ASCII byte. Smart quotes (the common case) fail OXT
-    compilation outright; the broader rule is that OXT source is pure ASCII -
-    the proven sibling extensions contain zero non-ASCII bytes - so even a stray
-    en-dash or section sign in a comment is off-convention and is reported."""
+def find_banned_chars(path, text):
+    """Flag the named troublemakers with their story, and any other non-ASCII
+    byte generically: OXT source in this family is pure ASCII, even comments."""
     out = []
     for i, line in enumerate(text.splitlines(), 1):
         for col, ch in enumerate(line, 1):
-            if ch in SMART_QUOTES:
+            if ch in BANNED_CHARS:
                 out.append(Problem(path, i,
-                           "smart quote %s (U+%04X) at col %d - OXT rejects it; use ASCII"
-                           % (SMART_QUOTES[ch], ord(ch), col)))
+                           "banned character at column %d: %s (U+%04X)"
+                           % (col, BANNED_CHARS[ch], ord(ch))))
             elif ord(ch) > 127:
                 out.append(Problem(path, i,
-                           "non-ASCII character %r (U+%04X) at col %d - OXT source "
-                           "must be pure ASCII; replace it" % (ch, ord(ch), col)))
+                           "non-ASCII character %r (U+%04X) at column %d - OXT "
+                           "source must be pure ASCII; replace it"
+                           % (ch, ord(ch), col)))
     return out
 
 
 def clean_logical_lines(path, text, line_comment_tokens):
     """Yield (lineno, cleaned) with block comments, line comments and string
-    *contents* neutralized, and backslash line-continuations merged. String
-    bodies become spaces so keywords inside them are never seen; the surrounding
-    quotes are kept so quote-balance can still be checked.
-    """
+    CONTENTS neutralized, and backslash line-continuations merged. String
+    bodies become spaces so keywords inside them are never seen; the
+    surrounding quotes are kept so quote balance can still be checked."""
     problems = []
     raw = text.split("\n")
 
@@ -107,7 +227,7 @@ def clean_logical_lines(path, text, line_comment_tokens):
                     in_string = False
                 j += 1
                 continue
-            # not in string/comment
+            # not in string / not in block comment
             if two == "/*":
                 in_block_comment = True
                 j += 2
@@ -117,7 +237,6 @@ def clean_logical_lines(path, text, line_comment_tokens):
                 out.append('"')
                 j += 1
                 continue
-            # line comment tokens
             stripped_rest = line[j:]
             hit = None
             for tok in line_comment_tokens:
@@ -130,16 +249,12 @@ def clean_logical_lines(path, text, line_comment_tokens):
             j += 1
         if in_string:
             problems.append(Problem(path, lineno,
-                            "unterminated string literal (odd number of ASCII double-quotes)"))
+                            "unterminated string literal (odd number of ASCII "
+                            "double-quotes)"))
         cleaned.append((lineno, "".join(out)))
     if in_block_comment:
         problems.append(Problem(path, len(raw), "unterminated /* block comment"))
     return cleaned, problems
-
-
-def first_token(s):
-    m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", s)
-    return m.group(1).lower() if m else ""
 
 
 def tokens(s):
@@ -147,7 +262,8 @@ def tokens(s):
 
 
 def check_lcb_blocks(path, cleaned):
-    """Block balance for LiveCode Builder."""
+    """Block balance for LiveCode Builder. LCB has no switch; an `end switch`
+    in a .lcb is caught by the unexpected-`end` catch-all."""
     problems = []
     stack = []  # (kind, lineno)
     for lineno, line in cleaned:
@@ -164,26 +280,24 @@ def check_lcb_blocks(path, cleaned):
             kind = toks[1]
             if kind in ("library", "module", "widget"):
                 continue  # module-level closer (validated by check_lcb_module)
-            if kind in ("handler", "if", "repeat", "unsafe", "foreach"):
-                want = "foreach" if kind == "foreach" else kind
+            if kind in ("handler", "if", "repeat", "unsafe"):
                 if not stack:
-                    problems.append(Problem(path, lineno, "`end %s` with no open block" % kind))
+                    problems.append(Problem(path, lineno,
+                                    "`end %s` with no open block" % kind))
                 else:
                     topkind, topline = stack[-1]
-                    if topkind != want and not (kind == "repeat" and topkind == "repeat"):
+                    if topkind != kind:
                         problems.append(Problem(path, lineno,
                                         "`end %s` does not match `%s` opened at line %d"
                                         % (kind, topkind, topline)))
-                        stack.pop()
-                    else:
-                        stack.pop()
+                    stack.pop()
                 continue
             # `end <something else>` - in LCB only the above are valid; flag.
             problems.append(Problem(path, lineno, "unexpected `end %s`" % kind))
             continue
 
         # ---- openers ----
-        # handler forms; foreign handler and `handler type` are single-line, no body.
+        # handler forms; foreign handler and `handler type` are single-line.
         ti = 0
         if t0 in ("public", "private"):
             ti = 1
@@ -201,7 +315,7 @@ def check_lcb_blocks(path, cleaned):
         if t0 == "if" and s.rstrip().lower().endswith("then"):
             stack.append(("if", lineno))
             continue
-        if t0 in ("else",):
+        if t0 == "else":
             continue  # else / else if: continuation
         if t0 == "repeat":
             stack.append(("repeat", lineno))
@@ -211,15 +325,17 @@ def check_lcb_blocks(path, cleaned):
             continue
 
     for kind, lineno in stack:
-        problems.append(Problem(path, lineno, "`%s` block opened here is never closed" % kind))
+        problems.append(Problem(path, lineno,
+                        "`%s` block opened here is never closed" % kind))
     return problems
 
 
 def check_livecodescript_blocks(path, cleaned):
-    """Block balance for LiveCode Script (.livecodescript)."""
+    """Block balance for LiveCode Script, switch and try included."""
     problems = []
-    stack = []  # (kind, name, lineno)
-    HANDLER_KW = ("on", "command", "function", "getprop", "setprop", "before", "after", "private")
+    stack = []  # (kind, lineno)
+    HANDLER_KW = ("on", "command", "function", "getprop", "setprop",
+                  "before", "after")
     for lineno, line in cleaned:
         s = line.strip()
         if not s:
@@ -232,9 +348,10 @@ def check_livecodescript_blocks(path, cleaned):
         if t0 == "end" and len(toks) >= 2:
             kind = toks[1]
             if not stack:
-                problems.append(Problem(path, lineno, "`end %s` with no open block" % kind))
+                problems.append(Problem(path, lineno,
+                                "`end %s` with no open block" % kind))
                 continue
-            topkind, topname, topline = stack[-1]
+            topkind, topline = stack[-1]
             if kind in ("if", "repeat", "switch", "try"):
                 if topkind != kind:
                     problems.append(Problem(path, lineno,
@@ -250,116 +367,191 @@ def check_livecodescript_blocks(path, cleaned):
                 stack.pop()
             continue
 
-        # handler openers
+        # handler openers (`private command foo` / `command foo` / `on foo` ...)
         hk = t0
-        nameidx = 1
         if t0 == "private" and len(toks) >= 2 and toks[1] in ("command", "function"):
             hk = toks[1]
-            nameidx = 2
-        if hk in HANDLER_KW and hk not in ("private",):
-            name = toks[nameidx] if nameidx < len(toks) else ""
-            stack.append(("handler", name, lineno))
+        if hk in HANDLER_KW:
+            stack.append(("handler", lineno))
             continue
         if t0 == "if" and s.rstrip().lower().endswith("then"):
-            stack.append(("if", "", lineno))
+            stack.append(("if", lineno))
             continue
-        if t0 == "else":
-            continue
+        if t0 in ("else", "catch", "finally", "case", "default"):
+            continue  # continuations, not new blocks
         if t0 == "repeat":
-            stack.append(("repeat", "", lineno))
+            stack.append(("repeat", lineno))
             continue
         if t0 == "switch":
-            stack.append(("switch", "", lineno))
+            stack.append(("switch", lineno))
             continue
         if t0 == "try":
-            stack.append(("try", "", lineno))
+            stack.append(("try", lineno))
             continue
 
-    for kind, name, lineno in stack:
-        problems.append(Problem(path, lineno, "`%s` block opened here is never closed" % kind))
+    for kind, lineno in stack:
+        problems.append(Problem(path, lineno,
+                        "`%s` block opened here is never closed" % kind))
     return problems
 
 
-def check_lcb_constants(path, cleaned):
-    """Constants must be declared before first use (OXT resolves by position)."""
+def check_constants_before_use(path, cleaned, is_script):
+    """Constants must be declared before first use - OXT resolves them by
+    lexical position, and a forward reference silently evaluates to nothing.
+    LCS spells the declaration `constant k = ...`, LCB `constant k is ...`."""
     problems = []
+    if is_script:
+        decl_rx = re.compile(r"\s*constant\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    else:
+        decl_rx = re.compile(r"\s*constant\s+([A-Za-z_][A-Za-z0-9_]*)\s+is\b")
     decl_line = {}
     for lineno, line in cleaned:
-        m = re.match(r"\s*constant\s+([A-Za-z_][A-Za-z0-9_]*)\s+is\b", line)
+        m = decl_rx.match(line)
         if m:
-            name = m.group(1)
-            if name not in decl_line:
-                decl_line[name] = lineno
-    # find first use of each declared constant
+            decl_line.setdefault(m.group(1), lineno)
     for name, dline in decl_line.items():
         pat = re.compile(r"\b" + re.escape(name) + r"\b")
         for lineno, line in cleaned:
-            # skip the declaration line itself
-            if lineno == dline:
-                continue
+            if lineno >= dline:
+                break
             if pat.search(line):
-                if lineno < dline:
-                    problems.append(Problem(path, lineno,
-                                    "constant `%s` used before its declaration at line %d "
-                                    "(OXT would evaluate it as empty)" % (name, dline)))
+                problems.append(Problem(path, lineno,
+                                "constant `%s` used before its declaration at "
+                                "line %d (OXT resolves constants by lexical "
+                                "position; this evaluates as empty)"
+                                % (name, dline)))
                 break
     return problems
 
 
-# LCB-only constructs that look like LiveCode Script but are NOT valid LCB.
-# `the empty data` IS valid (used in the sibling midi.lcb); the list/array empties
-# are NOT - LCB requires the literals `[]` and `{}` (confirmed against the LCB
-# Language Reference). This catches the class locally so it never reaches an OXT
-# compile again.
-LCB_ANTIPATTERNS = [
-    (re.compile(r"\bthe\s+empty\s+list\b"),
-     "`the empty list` is not valid LCB - use the list literal `[]`"),
-    (re.compile(r"\bthe\s+empty\s+array\b"),
-     "`the empty array` is not valid LCB - use the array literal `{}`"),
-]
-
-
-def check_lcb_antipatterns(path, cleaned):
+def check_declarations_at_top(path, cleaned, is_script):
+    """Every LCB handler's `variable` declarations sit ABOVE its first
+    statement - a nested `variable` has broken whole-LCB compilation (the
+    torrentxt lesson); this is the check the house rule always claimed to
+    have. .lcb ONLY, and measured before it was scoped that way: mid-handler
+    `local` is legal LiveCode Script and stands at ~150 sites in
+    engine-passed .livecodescript (onionxt's live-Tor-proven source above
+    all), so applying it there would manufacture violations in the family's
+    most-proven files. `constant`/`global` are not flagged either - only the
+    declaration form observed to break compilation."""
     problems = []
+    if is_script:
+        return problems
+    decl_words = ("variable",)
+    decl_name = "a `variable`"
+    nested = ("if", "repeat", "switch", "try", "unsafe")
+    in_handler = False
+    body_started = False
+    depth = 0
     for lineno, line in cleaned:
-        for pat, msg in LCB_ANTIPATTERNS:
-            if pat.search(line):
-                problems.append(Problem(path, lineno, msg))
+        s = line.strip()
+        if not s:
+            continue
+        toks = tokens(s)
+        if not toks:
+            continue
+        t0 = toks[0]
+        if not in_handler:
+            hk = t0
+            ti = 0
+            if t0 in ("public", "private") and len(toks) >= 2:
+                hk = toks[1]
+                ti = 1
+            if hk == "handler" and not (ti + 1 < len(toks) and
+                                        toks[ti + 1] == "type"):
+                in_handler = True
+                body_started = False
+                depth = 0
+            elif hk == "unsafe" and ti + 1 < len(toks) and \
+                    toks[ti + 1] == "handler":
+                in_handler = True
+                body_started = False
+                depth = 0
+            continue
+        # inside a handler: track nested block depth so `end if` does not
+        # read as the handler's own closer
+        if t0 == "end" and len(toks) >= 2 and toks[1] in nested:
+            depth = max(depth - 1, 0)
+            body_started = True
+            continue
+        if t0 == "end":
+            if depth == 0:
+                in_handler = False
+            continue
+        if t0 in decl_words:
+            if body_started:
+                problems.append(Problem(path, lineno,
+                                "%s declared below the handler's first "
+                                "statement - declarations go at the TOP of the "
+                                "handler (a nested declaration has broken "
+                                "whole-script compilation)" % decl_name))
+            continue
+        if t0 in nested:
+            if t0 == "if" and not s.rstrip().lower().endswith("then"):
+                pass  # single-line if: no block opened
+            else:
+                depth += 1
+        body_started = True
     return problems
 
 
-# The mirror image: LCB constructs that leak into .livecodescript. Braces have
-# no meaning in LiveCode Script (`{}` / `{...}` array literals are LCB-only;
-# build arrays by key assignment, and test emptiness by counting `the keys of`
-# a VARIABLE - a bare `is empty` on an array is vacuously true), and a function
-# result cannot be subscripted (`f(x)["k"]` does not parse - put it into a
-# local first). Both leaked from the .lcb layer once (the DataChannelXT
-# selftest's dcSelectedCandidatePair assertions) and cost an OXT compile error,
-# so the class is caught statically now. String bodies are blanked in cleaned
-# lines, so braces inside literals (e.g. the quickshare demo's embedded
-# JavaScript) never trip this.
-LCS_ANTIPATTERNS = [
-    (re.compile(r"[{}]"),
-     "braces are not LiveCode Script - `{}`/`{...}` array literals are LCB-only "
-     "(build arrays by assignment; count `the keys of` a variable for emptiness)"),
-    (re.compile(r"\)\s*\["),
-     "cannot subscript a function result in LiveCode Script - "
-     "put it into a local variable first"),
-]
+def check_shadow_trap(path, cleaned):
+    """Flag a t/p/s/k-prefixed name (any mixed-case spelling) that lowercases
+    to a reserved token - e.g. `tExt` -> `text`. Both dialects: the shadowing
+    is an xTalk evaluation rule, not a dialect quirk."""
+    problems = []
+    seen = set()
+    for lineno, line in cleaned:
+        for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", line):
+            if ident[0] not in "tpsk":
+                continue
+            if ident == ident.lower():
+                continue  # a bare lowercase keyword, not a prefixed name
+            low = ident.lower()
+            if low in RESERVED and ident not in seen:
+                seen.add(ident)
+                problems.append(Problem(path, lineno,
+                                "name `%s` lowercases to the reserved token "
+                                "`%s` - xTalk evaluates it as that keyword, not "
+                                "a variable; rename it with a distinctive, "
+                                "multi-word stem (e.g. tExt -> tSuffix)"
+                                % (ident, low)))
+    return problems
 
 
-def check_lcs_antipatterns(path, cleaned):
+def check_does_not_operator(path, cleaned):
     problems = []
     for lineno, line in cleaned:
-        for pat, msg in LCS_ANTIPATTERNS:
-            if pat.search(line):
-                problems.append(Problem(path, lineno, msg))
+        if DOES_NOT_OPERATOR.search(line):
+            problems.append(Problem(path, lineno,
+                            "`does not begin/end with` / `does not contain` is "
+                            "not a valid xTalk operator - the parser errors on "
+                            "`does`; negate with `not (...)`, e.g. "
+                            "`not (X begins with Y)`, or use `X is not ...`"))
+    return problems
+
+
+def check_put_prepositions(path, cleaned):
+    """A `put` takes `into` OR `after`/`before`, never both. `put X into Y
+    after Y` is malformed: the engine rejects the stray preposition. Runs on
+    cleaned lines, so a literal 'after'/'into' inside a string never trips."""
+    problems = []
+    for lineno, line in cleaned:
+        m = re.match(r"\s*(?:then\s+)?put\b(.*)", line)
+        if not m:
+            continue
+        rest = m.group(1)
+        if re.search(r"\binto\b", rest) and re.search(r"\b(?:after|before)\b", rest):
+            problems.append(Problem(path, lineno,
+                            "a `put` uses both `into` and `after`/`before`; "
+                            "use one (`put X into Y` to replace, or "
+                            "`put X after Y` to append)"))
     return problems
 
 
 def check_lcb_module(path, cleaned):
     """A library/module/widget must be explicitly closed with the matching
-    `end library`/`end module`/`end widget`. OXT otherwise consumes the whole
+    `end library`/`end module`/`end widget`; OXT otherwise consumes the whole
     file looking for the closer and reports a syntax error at end-of-file."""
     problems = []
     opener = None  # (kind, lineno)
@@ -375,20 +567,69 @@ def check_lcb_module(path, cleaned):
             closed = True
             if opener and mc.group(1) != opener[0]:
                 problems.append(Problem(path, lineno,
-                    "`end %s` does not match the opening `%s`" % (mc.group(1), opener[0])))
+                                "`end %s` does not match the opening `%s`"
+                                % (mc.group(1), opener[0])))
     if opener and not closed:
         problems.append(Problem(path, opener[1],
-            "`%s` opened here is never closed - add `end %s` at the very end of "
-            "the file (OXT reports a syntax error at end-of-file otherwise)"
-            % (opener[0], opener[0])))
+                        "`%s` opened here is never closed - add `end %s` at the "
+                        "very end of the file (OXT reports a syntax error at "
+                        "end-of-file otherwise)" % (opener[0], opener[0])))
+    return problems
+
+
+def check_lcb_imports(path, cleaned):
+    """A foreign type without `use com.livecode.foreign` is a "not declared"
+    compile error; textEncode/textDecode are LCS-only and fail in a module."""
+    problems = []
+    used = set()
+    type_hit = None
+    text_hits = []
+    for lineno, line in cleaned:
+        m = re.match(r"\s*use\s+([A-Za-z0-9_.]+)", line)
+        if m:
+            used.add(m.group(1))
+            continue
+        for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", line):
+            low = ident.lower()
+            if type_hit is None and low in FOREIGN_TYPES:
+                type_hit = (lineno, ident)
+            if ident in ("textEncode", "textDecode"):
+                text_hits.append((lineno, ident))
+    if type_hit is not None and "com.livecode.foreign" not in used:
+        problems.append(Problem(path, type_hit[0],
+                        "foreign type `%s` used but `use com.livecode.foreign` "
+                        "is missing (it will not be declared on an OXT compile)"
+                        % type_hit[1]))
+    for lineno, ident in text_hits:
+        problems.append(Problem(path, lineno,
+                        "`%s` is a LiveCode Script function, not available to "
+                        "an LCB module; keep text<->Data conversion in script "
+                        "or pass Data" % ident))
+    return problems
+
+
+def check_lcb_antipatterns(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        for pat, msg in LCB_ANTIPATTERNS:
+            if pat.search(line):
+                problems.append(Problem(path, lineno, msg))
+    return problems
+
+
+def check_lcs_antipatterns(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        for pat, msg in LCS_ANTIPATTERNS:
+            if pat.search(line):
+                problems.append(Problem(path, lineno, msg))
     return problems
 
 
 def check_lcb_lowercase_names(path, cleaned):
-    """OXT warns that all-lowercase identifiers may become reserved words
-    ('All-lowercase name X may cause future syntax error'). The project naming
-    convention prefixes every name (t/p/s/k + CamelCase), so an all-lowercase
-    `variable` declaration is both a convention break and a future-error risk."""
+    """OXT warns that all-lowercase identifiers may become reserved words. The
+    naming convention prefixes every name (t/p/s/k + CamelCase), so an
+    all-lowercase `variable` declaration is a convention break AND a risk."""
     problems = []
     pat = re.compile(r"\bvariable\s+([a-z][a-z0-9_]*)\s+as\b")
     for lineno, line in cleaned:
@@ -396,71 +637,10 @@ def check_lcb_lowercase_names(path, cleaned):
         if m:
             name = m.group(1)
             problems.append(Problem(path, lineno,
-                "all-lowercase variable name `%s` - OXT warns it may cause a future "
-                "syntax error; use a prefixed CamelCase name (e.g. t%s)"
-                % (name, name.capitalize())))
-    return problems
-
-
-# A prefixed CamelCase name (t/p/s/k + UpperCamel, the project convention) whose
-# FULL lowercased spelling IS a reserved xTalk token. The classic trap: `tExt`
-# (intended as t + "Ext" for extension) spells t-e-x-t = `text`, so xTalk
-# evaluates it as the `text` keyword, not a variable - a silent, hair-pulling
-# bug that compiles. Only reserved words that BEGIN with a prefix letter
-# (t/p/s/k) can ever collide, so that is the entire set we need to carry. The
-# shape guard `[tpsk][A-Z]` means a normally-written lowercase keyword (`text`,
-# `the`, `put`) never matches - only an accidentally-keyword-spelling identifier
-# does, and such a name is always a real bug (the engine token wins every time).
-PREFIXED_TOKEN_SHADOWS = {
-    # t-
-    "the", "then", "this", "there", "to", "text", "time", "title", "top",
-    "tab", "tan", "true", "target",
-    # p-
-    "pi", "pass", "put", "params", "print",
-    # s-
-    "send", "set", "sin", "sqrt", "sort", "space", "start", "stop", "stack",
-    "script", "selection",
-    # k-
-    "keys",
-}
-
-
-def check_prefixed_token_shadows(path, cleaned):
-    """Flag a t/p/s/k-prefixed name that spells a reserved token (e.g. tExt ->
-    `text`). Applies to both .lcb and .livecodescript - the shadowing is an
-    xTalk evaluation rule, not a dialect quirk."""
-    problems = []
-    seen = set()
-    pat = re.compile(r"\b([tpsk][A-Z][A-Za-z0-9_]*)\b")
-    for lineno, line in cleaned:
-        for m in pat.finditer(line):
-            name = m.group(1)
-            if name in seen:
-                continue
-            if name.lower() in PREFIXED_TOKEN_SHADOWS:
-                seen.add(name)
-                problems.append(Problem(path, lineno,
-                    "name `%s` spells the reserved token `%s` - xTalk evaluates it "
-                    "as that keyword, not a variable; rename it with a distinctive, "
-                    "multi-word stem (e.g. tExt -> tSuffix)" % (name, name.lower())))
-    return problems
-
-
-# xTalk has NO `does not begin with` / `does not end with` / `does not contain`
-# operator: the parser errors on `does` (confirmed on-engine in OXT). The valid
-# negation is `not (X begins with Y)` / `not (X contains Y)`, or `X is not ...`.
-# Matched on cleaned lines so a `does not ...` inside a string or comment is ignored.
-DOES_NOT_OPERATOR = re.compile(r"\bdoes\s+not\s+(begin|end|contain)s?\b", re.IGNORECASE)
-
-
-def check_does_not_operator(path, cleaned):
-    problems = []
-    for lineno, line in cleaned:
-        if DOES_NOT_OPERATOR.search(line):
-            problems.append(Problem(path, lineno,
-                "`does not begin/end with` / `does not contain` is not a valid xTalk "
-                "operator - the parser errors on `does`; negate with `not (...)`, e.g. "
-                "`not (X begins with Y)` or `not (X contains Y)`, or use `X is not ...`"))
+                            "all-lowercase variable name `%s` - OXT warns it "
+                            "may cause a future syntax error; use a prefixed "
+                            "CamelCase name (e.g. t%s)"
+                            % (name, name.capitalize())))
     return problems
 
 
@@ -566,60 +746,76 @@ def check_file(path):
         return [Problem(path, 0, "not valid UTF-8: %s" % e)]
 
     problems = []
-    problems += find_smart_quotes(path, text)
+    problems += find_banned_chars(path, text)
     for lineno, kind in check_engine_hostile_constructs(path, text):
         problems.append(Problem(path, lineno, "%s" % ("a `repeat with ... step N` loop does not honour its increment on OXT; use `repeat while` with an explicit `add N to` (see cxHexDecode)" if kind == "step" else "a `throw` inside a `catch` block does not reach the caller on OXT; capture the error, close the try, and throw after `end try` (see the guards in coinxt.livecodescript)")))
     for lineno, name in check_zero_arg_statement_calls(path, text):
         problems.append(Problem(path, lineno, "a zero-argument call written %s() in statement position does not compile in LiveCodeScript (the engine parses `()` as the command's argument, and `()` is not an expression). Write it bare: %s" % (name, name)))
 
-    is_lcb = path.endswith(".lcb")
-    line_comment_tokens = ["--"] if is_lcb else ["--", "#"]
+    is_script = not path.endswith(".lcb")
+    # LCS accepts --, #, and // line comments; LCB accepts -- and /* */.
+    line_comment_tokens = ["--", "#", "//"] if is_script else ["--"]
     cleaned, cprob = clean_logical_lines(path, text, line_comment_tokens)
     problems += cprob
 
-    if is_lcb:
-        problems += check_lcb_module(path, cleaned)
-        problems += check_lcb_blocks(path, cleaned)
-        problems += check_lcb_constants(path, cleaned)
-        problems += check_lcb_antipatterns(path, cleaned)
-        problems += check_lcb_lowercase_names(path, cleaned)
-    else:
+    if is_script:
         problems += check_livecodescript_blocks(path, cleaned)
         problems += check_lcs_antipatterns(path, cleaned)
-    # universal xTalk rules (both dialects): no name that spells a reserved token,
-    # and no invalid `does not <op>` negation.
-    problems += check_prefixed_token_shadows(path, cleaned)
+    else:
+        problems += check_lcb_module(path, cleaned)
+        problems += check_lcb_blocks(path, cleaned)
+        problems += check_lcb_antipatterns(path, cleaned)
+        problems += check_lcb_lowercase_names(path, cleaned)
+        problems += check_lcb_imports(path, cleaned)
+    # rules that hold in both dialects
+    problems += check_constants_before_use(path, cleaned, is_script)
+    problems += check_declarations_at_top(path, cleaned, is_script)
+    problems += check_shadow_trap(path, cleaned)
     problems += check_does_not_operator(path, cleaned)
+    problems += check_put_prepositions(path, cleaned)
     return problems
+
+
+def discover(root):
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d != ".git" and not d.startswith("build")
+                       and d != "_deps" and d != "node_modules"]
+        for name in filenames:
+            if name.endswith(".lcb") or name.endswith(".livecodescript"):
+                found.append(os.path.join(dirpath, name))
+    return sorted(found)
 
 
 def gather(paths):
     files = []
     for p in paths:
         if os.path.isdir(p):
-            for root, _, names in os.walk(p):
-                if ".git" in root:
-                    continue
-                for n in names:
-                    if n.endswith(".lcb") or n.endswith(".livecodescript"):
-                        files.append(os.path.join(root, n))
+            files.extend(discover(p))
         elif p.endswith(".lcb") or p.endswith(".livecodescript"):
             files.append(p)
     return sorted(set(files))
 
 
 def main(argv):
-    paths = argv[1:] or ["src", "examples", "tests"]
-    files = gather(paths)
+    targets = gather(argv[1:]) if len(argv) > 1 else discover(".")
+    if not targets:
+        print("check-livecodescript: no .lcb or .livecodescript files found")
+        return 0
+
     all_problems = []
-    for f in files:
-        all_problems += check_file(f)
-    for prob in sorted(all_problems, key=lambda p: (p.path, p.line)):
-        print(prob)
+    for path in targets:
+        all_problems += check_file(path)
+
     if all_problems:
-        print("\n%d problem(s) in %d file(s)" % (all_problems.__len__(), len(files)))
+        for p in sorted(all_problems, key=lambda x: (x.path, x.line)):
+            print(p)
+        print("\ncheck-livecodescript: %d problem(s) in %d file(s)"
+              % (len(all_problems), len(targets)))
         return 1
-    print("check-livecodescript: %d file(s) OK" % len(files))
+
+    print("check-livecodescript: OK (%d file(s) checked)" % len(targets))
     return 0
 
 
