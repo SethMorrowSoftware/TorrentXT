@@ -180,7 +180,7 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-2026-12"
+constant kQsUiVersion = "qs-ui-720p-1"
 
 -- ---- lifecycle ---------------------------------------------------------------
 on openStack
@@ -268,7 +268,7 @@ command qsBuild
    qsClearGeneratedUI
    lock screen
    set the width of this stack to 620
-   set the height of this stack to 696
+   set the height of this stack to 640
    set the backgroundColor of this card to "237,239,243"
    set the title of this stack to "TorrentXT - Quick Share"
    -- title band
@@ -297,7 +297,7 @@ command qsBuild
    -- area, then the resulting code.
    qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
    qsField "qsSendPass", "304,74,596,98", false
-   qsField "qsDrop", "24,104,596,184", true
+   qsField "qsDrop", "24,104,596,168", true
    set the opaque of field "qsDrop" to true
    set the backgroundColor of field "qsDrop" to "245,247,250"
    set the borderWidth of field "qsDrop" to 1
@@ -309,58 +309,58 @@ command qsBuild
    set the text of field "qsDrop" to (return & "Drag a file or folder here to share" & return & "(a folder becomes a browsable page - or, if it has index.html, a hosted web app)")
    -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
    -- plaintext file shared over Tor is served this way; the URL appears at the right.
-   qsButton "qsWebCheck", "Serve as web download", "24,186,220,208"
+   qsButton "qsWebCheck", "Serve as web download", "24,170,220,192"
    set the style of button "qsWebCheck" to "checkbox"
    set the autoHilite of button "qsWebCheck" to false
-   qsField "qsWebLink", "226,186,520,208", true
+   qsField "qsWebLink", "226,170,520,192", true
    set the textFont of field "qsWebLink" to "Courier"
    set the textSize of field "qsWebLink" to 9
    set the opaque of field "qsWebLink" to true
    set the backgroundColor of field "qsWebLink" to "255,250,225"
-   qsButton "qsWebCopy", "Copy", "526,186,596,208"
-   qsLabel "qsSharing", "", "24,212,596,232", 10
+   qsButton "qsWebCopy", "Copy", "526,170,596,192"
+   qsLabel "qsSharing", "", "24,196,596,216", 10
    set the textStyle of field "qsSharing" to "bold"
-   qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,238,596,256", 10
-   qsField "qsCode", "24,258,490,292", true
+   qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,222,596,240", 10
+   qsField "qsCode", "24,242,490,276", true
    set the textFont of field "qsCode" to "Courier"
    set the textSize of field "qsCode" to 12
    set the opaque of field "qsCode" to true
    set the backgroundColor of field "qsCode" to "255,250,225"
-   qsButton "qsCopy", "Copy", "500,260,596,290"
+   qsButton "qsCopy", "Copy", "500,244,596,274"
    -- OPTIONAL live web editor (LAN-only). Tick it and set an edit password to make the
    -- web-shared FOLDER editable from a browser on your own network (visit the shared
    -- link with /_edit on the end). Off by default; needs cryptoXT for the password.
-   qsButton "qsEditToggle", "Enable web editing", "24,300,214,322"
+   qsButton "qsEditToggle", "Enable web editing", "24,284,214,306"
    set the style of button "qsEditToggle" to "checkbox"
    set the autoHilite of button "qsEditToggle" to false
-   qsLabel "qsEditPassCap", "Edit password:", "220,302,318,322", 10
-   qsField "qsEditPass", "322,300,486,322", false
-   qsLabel "qsEditHint", "LAN only", "492,302,596,322", 9
+   qsLabel "qsEditPassCap", "Edit password:", "220,286,318,306", 10
+   qsField "qsEditPass", "322,284,486,306", false
+   qsLabel "qsEditHint", "LAN only", "492,286,596,306", 9
    set the foregroundColor of field "qsEditHint" to "150,110,40"
    set the textAlign of field "qsEditHint" to "right"
    -- RECEIVE: paste a code, an optional passphrase (only if it is locked), download
-   qsSection "qsRecvSec", "Receive a file", "24,340,596,362"
-   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,368,596,386", 10
-   qsField "qsRecvCode", "24,390,490,422", false
+   qsSection "qsRecvSec", "Receive a file", "24,316,596,338"
+   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,344,596,362", 10
+   qsField "qsRecvCode", "24,366,490,398", false
    set the textFont of field "qsRecvCode" to "Courier"
    set the textSize of field "qsRecvCode" to 11
-   qsButton "qsGet", "Download", "500,390,596,422"
-   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,428,300,448", 10
-   qsField "qsRecvPass", "304,426,596,450", false
+   qsButton "qsGet", "Download", "500,366,596,398"
+   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,404,300,424", 10
+   qsField "qsRecvPass", "304,402,596,426", false
    -- TRANSFERS: see it working
-   qsSection "qsXferSec", "Transfers", "24,462,596,484"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,488,596,506", 9
+   qsSection "qsXferSec", "Transfers", "24,438,596,460"
+   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,464,596,482", 9
    set the tabStops of field "qsXferHead" to "210,330"
    set the textFont of field "qsXferHead" to "Courier"
    set the textSize of field "qsXferHead" to 9
-   qsList "qsXfers", "24,508,596,588", false
+   qsList "qsXfers", "24,486,596,550", false
    set the tabStops of field "qsXfers" to "210,330"
    set the textFont of field "qsXfers" to "Courier"
    set the textSize of field "qsXfers" to 10
-   qsLabel "qsStatus", "", "24,592,596,612", 10
+   qsLabel "qsStatus", "", "24,554,596,574", 10
    set the foregroundColor of field "qsStatus" to "90,96,105"
    -- a small activity log
-   qsList "qsLog", "24,618,596,684", true
+   qsList "qsLog", "24,580,596,632", true
    set the textSize of field "qsLog" to 9
    qsAddTips
    qsOnionPill

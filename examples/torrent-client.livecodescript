@@ -58,7 +58,7 @@ constant kTcAppVersion = "1.0.0"
 -- Bump when the generated UI changes; tcBuildUI rebuilds the controls on a
 -- mismatch so updating the script in a SAVED stack picks up the new layout
 -- instead of keeping the old controls (and dead buttons) around.
-constant kUiVersion = "client-ui-2027-02"
+constant kUiVersion = "client-ui-720p-1"
 -- prefs file header: 8-byte magic + 1-byte mode. The client keeps no secrets, so
 -- it only ever writes mode "P" (plain); the format matches the channels demo.
 constant kPrefMagic = "BTXPREF1"
@@ -332,7 +332,7 @@ command tcBuildUI
    if the uHeight of this stack is a number and the uHeight of this stack >= 500 then
       set the height of this stack to (the uHeight of this stack)
    else
-      set the height of this stack to 648
+      set the height of this stack to 640
    end if
    -- a slim brand title band (a plain filled graphic + auto-sized labels centered
    -- on its midline by MEASURED height - never guess font metrics)

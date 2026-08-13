@@ -116,7 +116,7 @@ constant kChAppVersion = "1.0.0"
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-ui-2027-02"
+constant kUiVersion = "channels-ui-720p-1"
 
 -- ---- UI design tokens ----------------------------------------------------------
 -- The same palette newquickshare settled on after its OXT passes, so the two
@@ -334,7 +334,7 @@ command chBuild
    -- (band, rounded cards, hairline dividers) is the newquickshare design
    -- system, OXT-pass-proven there, so the two demos read as one family
    set the width of this stack to 1180
-   set the height of this stack to 648
+   set the height of this stack to 640
    -- fixed-size dashboard: the layout is hand-placed, a free resize would tear it
    set the resizable of this stack to false
    set the backgroundColor of this card to kClrPage
@@ -357,7 +357,7 @@ command chBuild
    -- left = your channels + follows; right = transfers; bottom = drop + log
    chPanel "chCardLeft", "8,34,586,486"
    chPanel "chCardRight", "588,34,1172,486"
-   chPanel "chCardBottom", "8,490,1172,646"
+   chPanel "chCardBottom", "8,490,1172,638"
    -- ===== LEFT COLUMN (x 16..580): your channel + channels you follow =====
    chSection "chSecMine", "1.  Your channels - publish files under a channel of your own", "16,38,580,58"
    -- channel picker: switch the active channel, or make / delete one
@@ -441,7 +441,7 @@ command chBuild
    chMakeField "chFetchCode", "16,538,440,560", false
    chMakeButton "chFetchBtn", "Fetch", "448,538,530,560"
    chMakeField "chDropResult", "538,538,910,560", true
-   chMakeList "chLog", "16,564,1164,640", true
+   chMakeList "chLog", "16,564,1164,632", true
    set the textFont of field "chLog" to chMonoFont()
    set the textSize of field "chLog" to 9
    set the foregroundColor of field "chLog" to kClrInkSoft
