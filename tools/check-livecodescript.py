@@ -33,7 +33,11 @@ The checks, and the engine lesson each encodes:
   4.  Constants declared before first use, BOTH dialects - OXT resolves a
       constant by lexical position; a forward reference silently evaluates
       to nothing (LCS) or empty (LCB). LCS spells it `constant k = ...`,
-      LCB `constant k is ...`; both shapes are checked.
+      LCB `constant k is ...`; both shapes are checked - and the WRONG
+      dialect's spelling is refused outright (the antipattern sets), because
+      a mis-spelled declaration is INVISIBLE to this before-use check: the
+      carried `is` constants of 2026-08-13 sailed through this gate, a
+      fail-open in the gate itself.
   5.  Declarations at the top of a handler, .lcb ONLY - a `variable` below
       the handler's first statement has broken whole-LCB compilation (the
       torrentxt lesson), and this is the check the house rule always claimed
@@ -137,6 +141,11 @@ LCB_ANTIPATTERNS = [
      "`the empty list` is not valid LCB - use the list literal `[]`"),
     (re.compile(r"\bthe\s+empty\s+array\b"),
      "`the empty array` is not valid LCB - use the array literal `{}`"),
+    # the mirror of the LCS rule below: writing the two dialects side by side
+    # makes this slip natural in either direction
+    (re.compile(r"^\s*constant\s+[A-Za-z_][A-Za-z0-9_]*\s*="),
+     "`constant NAME = ...` is the LiveCode SCRIPT spelling - LCB declares "
+     "`constant NAME is ...`"),
 ]
 
 # The mirror image: LCB constructs that leak into .livecodescript. Braces have
@@ -150,6 +159,14 @@ LCS_ANTIPATTERNS = [
     (re.compile(r"\)\s*\["),
      "cannot subscript a function result in LiveCode Script - "
      "put it into a local variable first"),
+    # a declaration in the WRONG dialect's spelling is worse than a syntax
+    # error: the constants-before-use check only recognizes the correct
+    # spelling, so the mistake is invisible to it - a fail-open this rule
+    # closes (found 2026-08-13, when carried `is` constants passed the gate)
+    (re.compile(r"^\s*constant\s+[A-Za-z_][A-Za-z0-9_]*\s+is\b"),
+     "`constant NAME is ...` is the LiveCode BUILDER spelling - "
+     "LiveCodeScript declares `constant NAME = ...` (the engine refuses the "
+     "`is` form, and the before-use check cannot even see it)"),
 ]
 
 # xTalk has NO `does not begin with` / `does not end with` / `does not contain`
