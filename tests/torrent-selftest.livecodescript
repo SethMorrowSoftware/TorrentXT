@@ -9,7 +9,7 @@ script "torrentSelfTest"
 --
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI, starts a
--- TorrentXT session, runs ~70 checks, and shows a green/red list. Needs the loaded
+-- TorrentXT session, runs 96 checks, and shows a green/red list. Needs the loaded
 -- org.openxtalk.library.torrent (v8+; the current ABI is v11). Run it STANDALONE -
 -- only one TorrentXT session may be live per OXT process, so close any client/demo
 -- stack first.

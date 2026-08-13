@@ -123,22 +123,43 @@ MODULE-style find that yields plain `*_LIBRARIES`). Boost is required ≥ 1.70.
 
 ### Linux — the glibc floor
 
-**Current floor (what the committed libs require):** the bundled Linux `.so`s come
-straight from CI's stock `ubuntu-22.04` runners, so they require that host's
-**glibc (~2.35)** and **OpenSSL 3** (`libssl.so.3` / `libcrypto.so.3`) — i.e. they
-load on **Ubuntu 22.04+ and equally-recent distros**, *not* on older ones (Ubuntu
-20.04, CentOS 7, …). libtorrent is static-linked in and libstdc++/libgcc are static
-(CMake `-static-libstdc++ -static-libgcc`), so glibc + OpenSSL are the only remaining
-dynamic floor, and that floor is a property of the *build host*.
+**Current floor (what the committed x86-64 lib requires — measured 2026-08-13,
+not remembered):** the committed `x86_64-linux/torrentxt.so` came from the
+2026-08-12 release run on a stock `ubuntu-24.04` runner, so it references glibc
+symbols up to **GLIBC_2.38** and dynamically needs **OpenSSL 3**
+(`libssl.so.3` / `libcrypto.so.3`) — i.e. it loads on Ubuntu 24.04-class
+distros and newer, not on older ones. (An earlier revision of this section
+said "~2.35 / Ubuntu 22.04": the floor is a property of whichever build host
+produced the committed file, which is exactly why the release lane now asserts
+it instead of this file remembering it.) libtorrent is static-linked in and
+libstdc++/libgcc are static (CMake `-static-libstdc++ -static-libgcc`), so
+glibc + OpenSSL are the only remaining dynamic floor.
 
-**For broad portability (Phase 4, not yet wired):** build the **release** `.so`
-inside a **manylinux2014-style image** (glibc ~2.17, matching the sibling extension
-Box2Dxt) so it loads on the older distros the OXT user base runs. This is a
-build-environment choice, not a CMake flag — when that lane lands, its artifact is
-what gets installed into `src/code/` (by a maintainer, or by the suite's
-`release-binaries.yml` assembly) instead of the stock-runner build. Until then,
-ship/expect the modern-distro floor above (a deliberate "ship now, perfect in
-Phase 4" choice).
+**The portable lane is WIRED (2026-08-13), pending its first release run.**
+`release-binaries.yml` now builds the torrentxt `x86_64-linux` release inside a
+**manylinux_2_28 container** (AlmaLinux 8, **glibc 2.28**) with a pinned,
+hash-checked **static OpenSSL 3.5** and pinned Boost headers, so that artifact
+needs no libssl/libcrypto from the host at all and floors at glibc 2.28 —
+Ubuntu 20.04+, Debian 10+, RHEL/Rocky/Alma 8+, and anything newer. The job
+**asserts the floor where the artifact is born** (no dynamic
+libssl/libcrypto/libstdc++/libgcc_s/libboost; max referenced glibc symbol
+version <= 2.28), and the smoke test runs inside the same container, so a
+regression fails the job rather than shipping. Two deliberate narrowings,
+recorded rather than silent:
+
+- **glibc 2.28, not the manylinux2014 (~2.17) this section originally
+  sketched.** GitHub's node20-based actions (checkout, upload-artifact)
+  refuse to start in a glibc-2.17 container, and the only distro the lower
+  floor would add — CentOS 7 — has been EOL since June 2024. 2.28 is the
+  decided support baseline.
+- **`x86-linux` (32-bit) keeps the stock-runner floor.** No manylinux_2_28
+  i686 image exists; the 32-bit lane stays a modern-distro build, said here
+  instead of implied otherwise.
+
+The committed binary keeps the 2.38 floor above until the next
+`release-binaries.yml` dispatch re-commits it from the wired lane. The
+per-member `native-torrentxt.yml` matrix deliberately stays on stock runners:
+it exists for fast per-push feedback and its artifacts are never committed.
 
 ### macOS — universal + codesign/notarize
 

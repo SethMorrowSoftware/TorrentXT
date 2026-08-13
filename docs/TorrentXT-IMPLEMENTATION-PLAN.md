@@ -8,7 +8,7 @@
 > state. The extension is built: the shim, the LCB binding, the tests, and four of
 > five platform binaries ship today. Where this brief differs from the as-built
 > code, **the code and the current docs win** — most notably the teardown handler
-> shipped as **`btStopSession`** (not the `btStopSession` this brief sometimes names),
+> shipped as **`btStopSession`**,
 > and the out-buffer marshalling shipped via the engine `<builtin>`
 > `MCMemoryAllocate` path (not a pre-sized `Data` bridged to a `Pointer`; see the
 > FFI section of `docs/architecture.md`). For the call-by-call contract read
@@ -326,9 +326,10 @@ recycled slot.
   the `<builtin>` allocator path above — see the FFI section of `docs/architecture.md`.)*
 - **The `Data`⇄`Pointer` marshalling was the one empirically-unconfirmed FFI primitive.**
   It is *lower-stakes here* than for a hand-rolled engine, because we cross **status
-  records, not payload**. It is now implemented and statically gated; it still wants the
-  human OXT pass, and the **hex-over-string fallback** is recorded in
-  `docs/architecture.md` if a strict build resolves it badly.
+  records, not payload**. It is now implemented and observed: the 96-check member
+  harness drove every buffer handler on a real engine (2026-08-10, folded into the
+  suite selftest). The **hex-over-string fallback** stays recorded in
+  `docs/architecture.md` if a strict build ever resolves it badly.
 - **Reuse a persistent drain/status buffer in the poll hot path.** Rebuilding an N-byte
   `Data` every poll is O(N) interpreter work; allocate `sDrain` / `sStatus` once at a
   sane cap and reuse (the proven `midi.lcb` pattern).
@@ -472,12 +473,18 @@ Each phase ends at a **gate** with a concrete "done" definition. Do not start a 
 before its predecessor's gate is green.
 
 > **As-built status.** Phases 0–3 are implemented in `src/torrent_shim.cpp` +
-> `src/torrent.lcb` and gated by the test suite — pending only the human OXT pass
-> noted throughout the repo. Phase 4 is largely done: four of five platform
-> binaries are built and committed under `src/code/`, leaving only the macOS
-> universal dylib + notarization. Phase 5 (the visual widget) is the remaining
-> optional work. The phase list below is the original plan, kept for its gate
-> definitions.
+> `src/torrent.lcb` and gated by the test suite, and the human OXT pass this
+> note used to wait on has happened: the 96-check member harness ran green on a
+> real engine on 2026-08-10 (folded into the suite selftest, twice in one day,
+> the v9–v11 surface included) and again on 2026-08-12. What that harness
+> deliberately does not prove stays open, and the stronger phase gates below
+> are exactly it: the real-swarm interop gate (§8.5, a legal torrent verified
+> against its published hash), resume across a real session restart, the
+> two-machine seed/leech and rp1/DHT runs, and the packaged install on every
+> platform. Phase 4 is largely done: four of five platform binaries are built
+> and committed under `src/code/`, leaving only the macOS universal dylib +
+> notarization. Phase 5 (the visual widget) is the remaining optional work. The
+> phase list below is the original plan, kept for its gate definitions.
 
 - **Phase 0 — Spike & skeleton.** Stand up the CMake build of libtorrent+Boost on at
   least Linux x64; produce a `torrentxt` lib exporting `btx_abi_version`; wire the LCB
@@ -505,7 +512,9 @@ before its predecessor's gate is green.
 - **Phase 5 (optional) — The visual widget.** An LCB `widget` dashboard (overall +
   per-torrent progress, rates, peer count, a piece-completion grid driven by the
   bitfield snapshot), refreshing at ≤ 4 Hz on change. Pure presentation over the
-  Phase-1/2 status calls.
+  Phase-1/2 status calls. **Decided 2026-08-13: out of v1 scope.** The library is
+  complete without it; this phase stays recorded as a possible post-v1 addition,
+  so its absence is a decision with a date, not an open item.
 
 ---
 

@@ -64,7 +64,7 @@ required.
 
 | Platform | Arch | Status |
 |---|---|---|
-| Linux | x86-64 | ✅ committed (statically linked; self-contained on glibc 2.35+ / OpenSSL 3) |
+| Linux | x86-64 | ✅ committed (static libtorrent/libstdc++; measured floor today: glibc 2.38 + dynamic OpenSSL 3. The wired manylinux_2_28 release lane drops that to glibc 2.28 with static OpenSSL on its next release run — `docs/building.md`) |
 | Linux | x86 (32-bit) | ✅ committed |
 | Windows | x86-64 | ✅ committed |
 | Windows | x86 (32-bit) | ✅ committed |
@@ -271,8 +271,10 @@ and on **2026-08-10** the whole member selftest
 (`tests/torrent-selftest.livecodescript`, 96 checks) ran green on a real engine,
 twice in one day, folded into the suite harness — the v9-v11 surface
 (`btDhtGetPeers`, `btAddInfohash`, `btMapPort`/`btUnmapPort`, the `btRp1*`
-quartet) included. Remaining: the signed macOS universal dylib, the two-machine
-rp1/DHT demos, and the optional visual dashboard widget.
+quartet) included. Remaining: the signed macOS universal dylib and the two-machine
+rp1/DHT demos. The optional visual dashboard widget (plan phase 5) was
+**decided out of v1 scope on 2026-08-13**: it stays in the plan as a possible
+later phase, and its absence is a recorded decision, not a maturity gap.
 
 ## License
 
