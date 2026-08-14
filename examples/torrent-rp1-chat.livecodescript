@@ -17,7 +17,7 @@ script "rp1ChatApp"
 -- (SodiumXT sxSecretStream) on top of this same btRp1Send/rp1Message channel; the
 -- transport under test here is identical.
 --
--- HOW TO TEST (two machines, ideally on different networks):
+-- HOW TO USE (two machines, ideally on different networks):
 --   1. Install the TorrentXT extension on both, paste this script into a stack,
 --      and reopen the stack (that fires openStack and builds the UI).
 --   2. On BOTH sides type the SAME room name (any shared phrase) and click Join.
@@ -29,9 +29,22 @@ script "rp1ChatApp"
 -- run on the engine rather than a unit test: the native framing and control paths
 -- are covered by tests/torrent_smoke_test.cpp, but the actual peer exchange only
 -- happens between two running instances.
+--
+-- HONESTY (the suite convention): the rp1 surface is engine-proven in the
+-- member selftest, but this stack's two-machine exchange has no recorded
+-- engine run and the UI was unified onto the suite kit 2026-08-14 - verified
+-- statically; needs an OXT pass (the closing pass's section D is this same
+-- leg).
+--
+-- THE LOOK is the suite UI kit, carried verbatim between the marker lines
+-- (master: tools/ui-kit.livecodescript; the drift gate holds every copy
+-- byte-identical). Change the look in the master, never here.
 
 -- Bump when the generated UI changes so a saved stack rebuilds its controls.
-constant kRcUiVersion = "rp1-ui-2026-07"
+constant kRcUiVersion = "rp1-kit2-1"
+-- Seconds of joined-but-peerless silence before the watchdog names the usual
+-- causes (the wait itself continues - a peer can still arrive late).
+constant kRcLonelySecs = 45
 
 -- ---- script-local state (declared at top) ------------------------------------
 local sSession        -- the live session handle (0/empty = none)
@@ -39,8 +52,352 @@ local sPolling        -- "true" while the poll loops are armed
 local sRoomId         -- the 40-hex rendezvous id we joined (empty = not joined)
 local sTorrent        -- the phantom-swarm torrent handle
 local sPeers          -- array peerId -> "1" for rp1-capable connected peers
+local sJoinedAt       -- ms clock when Join succeeded (drives the watchdog)
+local sLonelyHinted   -- "true" once the no-peer hint has been given for this join
+
+-- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
+-- The family look as one carried block: the kit owns colors, chrome, and
+-- control construction; the adopting demo owns layout (explicit rects) and
+-- logic. Builders are idempotent (create-if-missing), so a rebuild on
+-- reopen is safe. Do not edit this block in place: change the master and
+-- re-carry it.
+constant kUiBg = "240,242,246"
+constant kUiCard = "255,255,255"
+constant kUiCardLine = "225,229,236"
+constant kUiAccent = "44,90,160"
+constant kUiAccentText = "255,255,255"
+constant kUiAccentSub = "199,216,241"
+constant kUiInk = "28,34,46"
+constant kUiInkSoft = "95,104,118"
+constant kUiMuted = "138,146,158"
+constant kUiOk = "23,128,63"
+constant kUiWarn = "150,110,40"
+constant kUiBad = "176,58,46"
+constant kUiFieldLine = "203,210,222"
+constant kUiCodeBg = "244,246,250"
+constant kUiCodeLine = "210,217,229"
+
+-- The platform's own terminal face for codes, keys, tables and logs, so
+-- the monospace surfaces look native instead of typewriter-Courier. A
+-- missing face substitutes the engine default - a soft, safe failure.
+function uiMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end uiMonoFont
+
+-- The window chrome every adopter shares: stack size, page ground, the
+-- title band, and the one status line under it (write it with uiStatus).
+-- pBandH is optional (default 30); a taller band leaves room for an
+-- adopter's tagline or status pill, placed by the adopter.
+command uiChrome pTitle, pWidth, pHeight, pBandH
+   local tFH
+   if pBandH is empty then
+      put 30 into pBandH
+   end if
+   set the width of this stack to pWidth
+   set the height of this stack to pHeight
+   set the backgroundColor of this card to kUiBg
+   set the title of this stack to pTitle
+   uiGfx "uiBand", "0,0," & pWidth & "," & pBandH
+   set the style of graphic "uiBand" to "rectangle"
+   set the filled of graphic "uiBand" to true
+   set the backgroundColor of graphic "uiBand" to kUiAccent
+   set the lineSize of graphic "uiBand" to 0
+   uiLabel "uiTitle", "  " & pTitle, "0,0," & pWidth & "," & pBandH, 15
+   set the foregroundColor of field "uiTitle" to kUiAccentText
+   set the textStyle of field "uiTitle" to "bold"
+   -- center the title on the band midline by MEASURED height (never guess
+   -- font metrics - the family's OXT passes clipped hand-sized labels)
+   put the formattedHeight of field "uiTitle" into tFH
+   if tFH > 0 and tFH < pBandH then
+      set the height of field "uiTitle" to tFH
+      set the top of field "uiTitle" to ((pBandH - tFH) div 2)
+   end if
+   uiLabel "uiStatus", empty, "16," & (pBandH + 4) & "," & (pWidth - 16) & "," & (pBandH + 22), 11
+end uiChrome
+
+-- The status line, colored by what it reports: "ok", "warn", "bad", or
+-- anything else for neutral/muted. Demos route probe results through this
+-- so a stack that cannot run says so in red, at the top, immediately.
+command uiStatus pText, pKind
+   put pText into field "uiStatus"
+   if pKind is "ok" then
+      set the foregroundColor of field "uiStatus" to kUiOk
+   else if pKind is "warn" then
+      set the foregroundColor of field "uiStatus" to kUiWarn
+   else if pKind is "bad" then
+      set the foregroundColor of field "uiStatus" to kUiBad
+   else
+      set the foregroundColor of field "uiStatus" to kUiInkSoft
+   end if
+end uiStatus
+
+-- A static caption at a FIXED rect (idempotent, borderless, transparent).
+-- Use uiWrap instead when the text may wrap or the exact height matters.
+command uiLabel pName, pText, pRect, pSize
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the borderWidth of field pName to 0
+   set the opaque of field pName to false
+   set the threeD of field pName to false
+   set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kUiInk
+   put pText into field pName
+end uiLabel
+
+-- A caption FIT to its measured text height (top pinned). The fit does
+-- double duty: it prevents clipping (hand-sized rects clipped text on a
+-- real Windows pass), and it makes `the height of field` equal the TEXT
+-- height, which midline centering relies on. GUARD: only resize on a sane
+-- measurement - a 0/blank formattedHeight (possible before the window is
+-- fully realized) would collapse the label. Empty labels are skipped
+-- (they receive their text later).
+command uiWrap pName, pText, pRect, pSize
+   local tOldDelim, tTop, tFH
+   uiLabel pName, pText, pRect, pSize
+   if pText is not empty then
+      put the itemDelimiter into tOldDelim
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the itemDelimiter to tOldDelim
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
+         set the top of field pName to tTop
+      end if
+   end if
+end uiWrap
+
+-- A small, muted caption (hints, toggle descriptions, empty states).
+command uiCap pName, pText, pRect
+   uiWrap pName, pText, pRect, 10
+   set the foregroundColor of field pName to kUiMuted
+end uiCap
+
+-- A numbered bold section header with a hairline divider placed below the
+-- label's ACTUAL (fit-to-text) bottom, so it tracks the real header
+-- height on any platform's line metrics.
+command uiSection pName, pText, pRect
+   local tOldDelim, tL, tR, tB
+   uiWrap pName, pText, pRect, 13
+   set the textStyle of field pName to "bold"
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 3 of pRect into tR
+   set the itemDelimiter to tOldDelim
+   put the bottom of field pName into tB
+   uiGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
+   set the style of graphic (pName & "Line") to "rectangle"
+   set the filled of graphic (pName & "Line") to true
+   set the backgroundColor of graphic (pName & "Line") to kUiCardLine
+   set the lineSize of graphic (pName & "Line") to 0
+end uiSection
+
+-- A one-line entry field, mono and flat ("modern input" chrome instead of
+-- the engine's sunken-3D default), because hex, addresses and paths are
+-- what this suite's demos edit.
+command uiInput pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to false
+   set the traversalOn of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   -- 4-item margins form ONLY: OXT ignored the single-number form on a
+   -- real engine pass
+   set the margins of field pName to "6,6,6,6"
+   set the textSize of field pName to 11
+   set the textFont of field pName to uiMonoFont()
+end uiInput
+
+-- A read-only output/log area: mono, flat, scrolling, hairline-bordered.
+command uiArea pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the traversalOn of field pName to false
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiCardLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   set the margins of field pName to "6,6,6,6"
+   set the vScrollbar of field pName to true
+   set the textSize of field pName to 10
+   set the textFont of field pName to uiMonoFont()
+end uiArea
+
+-- A row-selectable table: uiArea plus list behavior and tab stops
+-- ("230,340"-style comma lists). Pair it with a uiLabel header carrying
+-- the same tabStops, set by the adopter.
+command uiTable pName, pRect, pTabStops
+   uiArea pName, pRect
+   set the listBehavior of field pName to true
+   if pTabStops is not empty then
+      set the tabStops of field pName to pTabStops
+   end if
+end uiTable
+
+command uiButton pName, pLabel, pRect
+   if there is no button pName then
+      create button
+      set the name of the last button to pName
+   end if
+   set the rect of button pName to pRect
+   set the label of button pName to pLabel
+end uiButton
+
+-- A script-managed checkbox: autoHilite OFF because the family drives
+-- toggle state from script locals (a mode the environment cannot honour
+-- must never stay silently armed - the quickshare pill lesson), so the
+-- hilite is set explicitly by the adopter's state machine.
+command uiCheckbox pName, pLabel, pRect
+   uiButton pName, pLabel, pRect
+   set the style of button pName to "checkbox"
+   set the autoHilite of button pName to false
+end uiCheckbox
+
+-- Create-or-reuse a named graphic: the chrome layer (cards, pills,
+-- dividers, drop targets). Created BEFORE the controls that sit on it, so
+-- it stays behind them in z-order. roundRect + antialiased by default;
+-- callers restyle.
+command uiGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end uiGfx
+
+-- A dashboard card: a rounded, hairline-bordered, softly shadowed panel
+-- placed BEHIND a group of controls. It only groups visually; clicks on
+-- it fall through to the adopter's `default: pass mouseUp`.
+command uiPanel pName, pRect
+   local tShadow, tErr
+   uiGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kUiCard
+   set the lineSize of graphic pName to 1
+   -- a graphic strokes its outline in the foregroundColor; borderColor is
+   -- set too so whichever the engine honours, the hairline lands
+   set the foregroundColor of graphic pName to kUiCardLine
+   set the borderColor of graphic pName to kUiCardLine
+   -- soft drop shadow is an LC-9-era feature, so it is a PURE
+   -- enhancement: an engine without it just skips it (the try) and the
+   -- hairline still separates the card from the page
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end uiPanel
+
+-- A status pill: rounded chip + centered label, colored by state kind -
+-- "ok" green, "wait" amber, "bad" red, anything else the muted on-band
+-- blue. The adopter repaints it from ONE place so its handlers cannot
+-- disagree about the colors (the nocloud Tor-pill discipline).
+command uiPill pName, pText, pRect, pKind
+   local tOldDelim, tTop, tBot, tFH
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 2 of pRect into tTop
+   put item 4 of pRect into tBot
+   set the itemDelimiter to tOldDelim
+   uiGfx (pName & "Bg"), pRect
+   set the roundRadius of graphic (pName & "Bg") to (tBot - tTop)
+   set the filled of graphic (pName & "Bg") to true
+   set the lineSize of graphic (pName & "Bg") to 0
+   if pKind is "ok" then
+      set the backgroundColor of graphic (pName & "Bg") to "205,240,214"
+   else if pKind is "wait" then
+      set the backgroundColor of graphic (pName & "Bg") to "250,240,199"
+   else if pKind is "bad" then
+      set the backgroundColor of graphic (pName & "Bg") to "243,215,213"
+   else
+      set the backgroundColor of graphic (pName & "Bg") to "31,64,116"
+   end if
+   uiLabel pName, pText, pRect, 10
+   set the textAlign of field pName to "center"
+   if pKind is "ok" then
+      set the foregroundColor of field pName to "22,101,52"
+   else if pKind is "wait" then
+      set the foregroundColor of field pName to "133,98,14"
+   else if pKind is "bad" then
+      set the foregroundColor of field pName to "135,44,38"
+   else
+      set the foregroundColor of field pName to kUiAccentSub
+   end if
+   -- center the label on the chip midline by measured height
+   put the formattedHeight of field pName into tFH
+   if tFH > 0 and tFH < (tBot - tTop) then
+      set the height of field pName to tFH
+      set the top of field pName to (tTop + ((tBot - tTop - tFH) div 2))
+   end if
+end uiPill
+
+-- Click-to-copy feedback: flash the button's label to "Copied!" for
+-- 1200 ms, then restore the real label (stashed in uRealLabel).
+command uiCopyFlash pBtn
+   if there is no button pBtn then
+      exit uiCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("uiCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end uiCopyFlash
+
+command uiCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit uiCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end uiCopyFlashReset
+
+-- The honesty/custody footer every demo carries: what the stack is, what
+-- it is not, and its engine-evidence state.
+command uiFooter pText, pRect
+   uiWrap "uiFooter", pText, pRect, 11
+   set the textStyle of field "uiFooter" to "italic"
+   set the foregroundColor of field "uiFooter" to kUiMuted
+end uiFooter
+-- ==== SUITE UI KIT v2 END ====
 
 -- ---- lifecycle ---------------------------------------------------------------
+on preOpenStack
+   -- build before first paint so the window never flashes unstyled
+   rcBuild
+end preOpenStack
+
 on openStack
    rcBuild
    rcStart
@@ -49,6 +406,13 @@ end openStack
 on closeStack
    rcStop
 end closeStack
+
+on shutdownRequest
+   -- a quit does not always deliver closeStack, and a leaked session blocks
+   -- the whole process (one session per process)
+   rcStop
+   pass shutdownRequest
+end shutdownRequest
 
 on mouseUp
    switch the short name of the target
@@ -84,33 +448,24 @@ command rcBuild
    end if
    rcClearGeneratedUI
    lock screen
-   set the width of this stack to 560
-   set the height of this stack to 576
-   set the backgroundColor of this card to "237,239,243"
-   set the title of this stack to "TorrentXT - rp1 chat (transport test)"
-   -- title band
-   rcLabel "rcTitle", "  rp1 chat - serverless peer-to-peer over a phantom swarm", "0,0,560,40", 14
-   set the opaque of field "rcTitle" to true
-   set the backgroundColor of field "rcTitle" to "44,90,160"
-   set the foregroundColor of field "rcTitle" to "255,255,255"
-   set the textStyle of field "rcTitle" to "bold"
-   rcLabel "rcTagline", "Type the SAME room name on two machines and Join. No tracker, no server, no content - the DHT introduces you and messages ride the rp1 BEP10 extension.", "16,46,544,84", 10
-   set the foregroundColor of field "rcTagline" to "90,96,105"
+   uiChrome "rp1 chat - serverless peer-to-peer over a phantom swarm", 560, 576
+   uiCap "rcTagline", "Type the SAME room name on two machines and Join. No tracker, no server, no content - the DHT introduces you and messages ride the rp1 BEP10 extension.", "16,56,544,92"
    -- room + name + join
-   rcLabel "rcRoomCap", "Room (a shared phrase, or a 40-hex id):", "16,90,360,110", 10
-   rcField "rcRoom", "16,112,400,138", false
-   rcButton "rcJoin", "Join", "410,110,544,140"
-   rcLabel "rcNameCap", "Your name:", "16,146,120,166", 10
-   rcField "rcName", "120,144,300,168", false
-   -- status
-   rcLabel "rcStatus", "Not joined.", "16,176,544,196", 10
-   set the foregroundColor of field "rcStatus" to "90,96,105"
-   -- combined event + chat log
-   rcList "rcLog", "16,204,544,516"
-   set the textSize of field "rcLog" to 11
+   uiCap "rcRoomCap", "Room (a shared phrase, or a 40-hex id):", "16,96,360,114"
+   uiInput "rcRoom", "16,118,400,142"
+   uiButton "rcJoin", "Join", "410,116,544,146"
+   uiCap "rcNameCap", "Your name:", "16,152,120,170"
+   uiInput "rcName", "120,150,300,174"
+   -- combined event + chat log (the status line is the kit's, under the band)
+   uiArea "rcLog", "16,182,544,476"
    -- message box + send
-   rcField "rcMsg", "16,524,420,552", false
-   rcButton "rcSend", "Send", "430,522,544,554"
+   uiInput "rcMsg", "16,484,420,510"
+   uiButton "rcSend", "Send", "430,482,544,512"
+   uiFooter \
+         "PLAINTEXT on purpose: what you type is what crosses the wire, so" \
+         & " you can watch the transport work. Riptide layers its crypto on" \
+         & " this same channel. Verified statically; needs an OXT pass.", \
+         "16,518,544,570"
    rcAddTips
    set the uUiVersion of this stack to kRcUiVersion
    unlock screen
@@ -132,49 +487,6 @@ command rcClearGeneratedUI
    unlock screen
 end rcClearGeneratedUI
 
-command rcLabel pName, pText, pRect, pSize
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the borderWidth of field pName to 0
-   set the opaque of field pName to false
-   set the textSize of field pName to pSize
-   put pText into field pName
-end rcLabel
-
-command rcField pName, pRect, pLocked
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to pLocked
-   set the traversalOn of field pName to (not pLocked)
-end rcField
-
-command rcButton pName, pLabel, pRect
-   if there is no button pName then
-      create button
-      set the name of the last button to pName
-   end if
-   set the rect of button pName to pRect
-   set the label of button pName to pLabel
-end rcButton
-
-command rcList pName, pRect
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the vScrollbar of field pName to true
-   set the listBehavior of field pName to false
-end rcList
-
 command rcAddTips
    set the tooltip of field "rcRoom" to "A phrase both sides share becomes the rendezvous id (its SHA-1). Or paste a 40-hex id directly."
    set the tooltip of button "rcJoin" to "Join the phantom swarm for this room and start looking for peers."
@@ -188,6 +500,7 @@ command rcStart
    put the result into sSession
    if sSession is 0 or sSession is empty then
       rcLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      uiStatus "No session (another TorrentXT stack open?) - see the log.", "bad"
       put 0 into sSession
       exit rcStart
    end if
@@ -196,11 +509,19 @@ command rcStart
    btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
-   -- turn on rp1 BEFORE adding the swarm, so the swarm advertises the extension
+   -- turn on rp1 BEFORE adding the swarm, so the swarm advertises the
+   -- extension. This call IS the demo - a refused enable would previously
+   -- have "worked" all the way to two peers ignoring each other.
    btRp1Enable sSession
+   if the result is not empty and the result < 0 then
+      rcLog "Could not enable rp1 (" & the result & "):" && btLastError()
+      uiStatus "rp1 enable FAILED - see the log.", "bad"
+      exit rcStart
+   end if
    put "true" into sPolling
    put empty into sPeers
    rcLog "Ready. Type a room name and Join. Then wait for the DHT to find a peer."
+   uiStatus "Ready. Type a room name and Join.", "ok"
    send "rcPollOnce" to me in 0 milliseconds
    send "rcDashOnce" to me in 800 milliseconds
 end rcStart
@@ -239,9 +560,15 @@ command rcJoin
    -- advertise ourselves at the id right away (the torrent also announces on its
    -- own DHT schedule; this just makes the first meeting faster)
    btDhtAnnounce sSession, sRoomId, 0
+   if the result is not empty and the result < 0 then
+      rcLog "* announce refused (" & the result & "):" && btLastError() && "- the torrent's own schedule still announces"
+   end if
    put empty into sPeers
+   put the milliseconds into sJoinedAt
+   put empty into sLonelyHinted
    rcLog "Joined room" && tRoom & "  (id" && sRoomId & ")."
    rcLog "Waiting for a peer... give the DHT a few seconds."
+   uiStatus "In the room - waiting for a peer...", empty
 end rcJoin
 
 command rcPollOnce
@@ -318,35 +645,57 @@ command rcSendMessage
    put 0 into tSent
    repeat for each key tPeer in sPeers
       btRp1Send sSession, tPeer, textEncode(tLine, "utf-8")
-      add 1 to tSent
+      -- count only what the binding ACCEPTED: the old version incremented
+      -- unconditionally, so a total send failure still read as success
+      if the result is empty or the result >= 0 then
+         add 1 to tSent
+      else
+         rcLog "* send to peer" && tPeer && "refused (" & the result & "):" && btLastError()
+      end if
    end repeat
-   rcChatLine ("You: " & tBody)
-   set the text of field "rcMsg" to ""
+   if tSent > 0 then
+      rcChatLine ("You: " & tBody)
+      set the text of field "rcMsg" to ""
+   else
+      rcLog "* nothing sent - every peer refused; see the lines above"
+   end if
 end rcSendMessage
 
 command rcDashOnce
-   local tDht, tCount
+   local tDht, tCount, tNodes
    if sPolling is not "true" then
       exit rcDashOnce
    end if
+   send "rcDashOnce" to me in 1000 milliseconds
    put the number of keys of sPeers into tCount
    if sRoomId is empty then
-      set the text of field "rcStatus" to "Not joined."
-   else
-      put btDhtState(sSession) into tDht
-      set the text of field "rcStatus" to ("In a room - rp1 peers:" && tCount && "- DHT nodes:" && tDht["nodes"])
+      exit rcDashOnce
    end if
-   send "rcDashOnce" to me in 1000 milliseconds
+   put btDhtState(sSession) into tDht
+   put 0 into tNodes
+   if the number of lines of the keys of tDht > 0 then
+      put tDht["nodes"] into tNodes
+   end if
+   if tCount > 0 then
+      uiStatus "In a room - rp1 peers:" && tCount && "- DHT nodes:" && tNodes, "ok"
+   else
+      uiStatus "In a room - no peers yet - DHT nodes:" && tNodes, empty
+   end if
+   -- the lonely watchdog: a joined room with zero peers past the window gets
+   -- ONE spoken diagnosis (the wait continues; a peer can still arrive)
+   if tCount is 0 and sLonelyHinted is not "true" and sJoinedAt is a number then
+      if the milliseconds - sJoinedAt > kRcLonelySecs * 1000 then
+         put "true" into sLonelyHinted
+         rcLog "* no peer after" && kRcLonelySecs && "s. Checklist: same EXACT room phrase on both sides? Both stacks say DHT nodes > 0? UDP not firewalled? Both sides clicked Join?"
+         uiStatus "Still no peer - see the checklist in the log.", "warn"
+      end if
+   end if
 end rcDashOnce
 
 -- ---- small helpers -----------------------------------------------------------
 -- A received chat line (bold-ish marker so it stands out from system "*" lines).
 command rcChatLine pText
-   if there is no field "rcLog" then
-      exit rcChatLine
-   end if
-   put pText & return after field "rcLog"
-   set the vscroll of field "rcLog" to the formattedHeight of field "rcLog"
+   rcLog pText
 end rcChatLine
 
 command rcLog pMsg
@@ -354,6 +703,10 @@ command rcLog pMsg
       exit rcLog
    end if
    put pMsg & return after field "rcLog"
+   -- bounded like every other family log (this one could grow forever)
+   if the number of lines of field "rcLog" > 250 then
+      delete line 1 to 50 of field "rcLog"
+   end if
    set the vscroll of field "rcLog" to the formattedHeight of field "rcLog"
 end rcLog
 
@@ -385,10 +738,16 @@ end rcToHex
 -- A folder for the phantom swarm's (nonexistent) content. Nothing is written
 -- there; libtorrent just needs a valid save path for the add.
 function rcSaveFolder
-   local tBase
+   local tBase, tErr
    put specialFolderPath("temporary") & "/TorrentXT-rp1" into tBase
    if there is no folder tBase then
-      create folder tBase
+      try
+         create folder tBase
+      catch tErr
+         -- fall back to the temp dir itself; nothing is ever written for a
+         -- phantom swarm, so any valid path serves
+         return specialFolderPath("temporary")
+      end try
    end if
    return tBase
 end rcSaveFolder

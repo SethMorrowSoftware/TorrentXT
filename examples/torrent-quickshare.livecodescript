@@ -35,6 +35,18 @@ script "quickShareApp"
 --
 -- Single-thread playbook: a 250 ms poll drains events and a 1 s loop repaints the
 -- Transfers list. The heavy bytes move on libtorrent's own threads, never script.
+--
+-- HONESTY (the suite convention): the torrent surface this demo drives is
+-- engine-proven (the member selftest and the demo passes recorded in
+-- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
+-- 2026-08-14 - the rebuilt chrome is verified statically; needs an OXT
+-- re-pass. The clearweb socket + UPnP + local-IP layers below keep their own
+-- standing NEEDS-AN-ON-ENGINE-PASS notes (flagged VERIFY at each site), and
+-- every ox* call still needs the on-engine pass with a live Tor daemon.
+--
+-- THE LOOK is the suite UI kit, carried verbatim between the marker lines
+-- (master: tools/ui-kit.livecodescript; the drift gate holds every copy
+-- byte-identical). Change the look in the master, never here.
 
 -- ---- stack-local state -------------------------------------------------------
 local sSession          -- the live session handle (0/empty = none)
@@ -45,6 +57,13 @@ local sPendingKey       -- array: info-hash -> 32-byte file key, for a download 
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
 local sTempEnc          -- array: info-hash -> temp .enc path we made (cleaned on close)
+-- Fleet-audit fixes: a pasted code can wait forever for metadata (dead code,
+-- offline friend, cold DHT), so each magnet add gets ONE spoken diagnosis
+-- after its window (nothing is aborted); and every oxWrite goes through
+-- qsOxWriteChecked, which logs the FIRST failure per stream.
+local sMetaWait         -- array: torrent handle -> ms clock when the add started
+local sMetaHinted       -- array: torrent handle -> "true" once the hint was given
+local sOxWriteFailed    -- array: stream -> "true" once its first oxWrite failure logged
 
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
@@ -180,9 +199,355 @@ constant kTorControlPortTB = "9151"
 -- Bump when the generated UI changes; qsBuild rebuilds the controls on a mismatch
 -- so updating the script in a SAVED stack picks up the new layout (passphrase
 -- fields and all) instead of keeping the old controls around.
-constant kQsUiVersion = "qs-ui-720p-1"
+constant kQsUiVersion = "qs-kit2-1"
+-- seconds a magnet-style download may sit without metadata before the one-time
+-- diagnosis line is logged (the download itself keeps waiting)
+constant kQsMetaHintSecs = 60
+
+-- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
+-- The family look as one carried block: the kit owns colors, chrome, and
+-- control construction; the adopting demo owns layout (explicit rects) and
+-- logic. Builders are idempotent (create-if-missing), so a rebuild on
+-- reopen is safe. Do not edit this block in place: change the master and
+-- re-carry it.
+constant kUiBg = "240,242,246"
+constant kUiCard = "255,255,255"
+constant kUiCardLine = "225,229,236"
+constant kUiAccent = "44,90,160"
+constant kUiAccentText = "255,255,255"
+constant kUiAccentSub = "199,216,241"
+constant kUiInk = "28,34,46"
+constant kUiInkSoft = "95,104,118"
+constant kUiMuted = "138,146,158"
+constant kUiOk = "23,128,63"
+constant kUiWarn = "150,110,40"
+constant kUiBad = "176,58,46"
+constant kUiFieldLine = "203,210,222"
+constant kUiCodeBg = "244,246,250"
+constant kUiCodeLine = "210,217,229"
+
+-- The platform's own terminal face for codes, keys, tables and logs, so
+-- the monospace surfaces look native instead of typewriter-Courier. A
+-- missing face substitutes the engine default - a soft, safe failure.
+function uiMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end uiMonoFont
+
+-- The window chrome every adopter shares: stack size, page ground, the
+-- title band, and the one status line under it (write it with uiStatus).
+-- pBandH is optional (default 30); a taller band leaves room for an
+-- adopter's tagline or status pill, placed by the adopter.
+command uiChrome pTitle, pWidth, pHeight, pBandH
+   local tFH
+   if pBandH is empty then
+      put 30 into pBandH
+   end if
+   set the width of this stack to pWidth
+   set the height of this stack to pHeight
+   set the backgroundColor of this card to kUiBg
+   set the title of this stack to pTitle
+   uiGfx "uiBand", "0,0," & pWidth & "," & pBandH
+   set the style of graphic "uiBand" to "rectangle"
+   set the filled of graphic "uiBand" to true
+   set the backgroundColor of graphic "uiBand" to kUiAccent
+   set the lineSize of graphic "uiBand" to 0
+   uiLabel "uiTitle", "  " & pTitle, "0,0," & pWidth & "," & pBandH, 15
+   set the foregroundColor of field "uiTitle" to kUiAccentText
+   set the textStyle of field "uiTitle" to "bold"
+   -- center the title on the band midline by MEASURED height (never guess
+   -- font metrics - the family's OXT passes clipped hand-sized labels)
+   put the formattedHeight of field "uiTitle" into tFH
+   if tFH > 0 and tFH < pBandH then
+      set the height of field "uiTitle" to tFH
+      set the top of field "uiTitle" to ((pBandH - tFH) div 2)
+   end if
+   uiLabel "uiStatus", empty, "16," & (pBandH + 4) & "," & (pWidth - 16) & "," & (pBandH + 22), 11
+end uiChrome
+
+-- The status line, colored by what it reports: "ok", "warn", "bad", or
+-- anything else for neutral/muted. Demos route probe results through this
+-- so a stack that cannot run says so in red, at the top, immediately.
+command uiStatus pText, pKind
+   put pText into field "uiStatus"
+   if pKind is "ok" then
+      set the foregroundColor of field "uiStatus" to kUiOk
+   else if pKind is "warn" then
+      set the foregroundColor of field "uiStatus" to kUiWarn
+   else if pKind is "bad" then
+      set the foregroundColor of field "uiStatus" to kUiBad
+   else
+      set the foregroundColor of field "uiStatus" to kUiInkSoft
+   end if
+end uiStatus
+
+-- A static caption at a FIXED rect (idempotent, borderless, transparent).
+-- Use uiWrap instead when the text may wrap or the exact height matters.
+command uiLabel pName, pText, pRect, pSize
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the borderWidth of field pName to 0
+   set the opaque of field pName to false
+   set the threeD of field pName to false
+   set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kUiInk
+   put pText into field pName
+end uiLabel
+
+-- A caption FIT to its measured text height (top pinned). The fit does
+-- double duty: it prevents clipping (hand-sized rects clipped text on a
+-- real Windows pass), and it makes `the height of field` equal the TEXT
+-- height, which midline centering relies on. GUARD: only resize on a sane
+-- measurement - a 0/blank formattedHeight (possible before the window is
+-- fully realized) would collapse the label. Empty labels are skipped
+-- (they receive their text later).
+command uiWrap pName, pText, pRect, pSize
+   local tOldDelim, tTop, tFH
+   uiLabel pName, pText, pRect, pSize
+   if pText is not empty then
+      put the itemDelimiter into tOldDelim
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the itemDelimiter to tOldDelim
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
+         set the top of field pName to tTop
+      end if
+   end if
+end uiWrap
+
+-- A small, muted caption (hints, toggle descriptions, empty states).
+command uiCap pName, pText, pRect
+   uiWrap pName, pText, pRect, 10
+   set the foregroundColor of field pName to kUiMuted
+end uiCap
+
+-- A numbered bold section header with a hairline divider placed below the
+-- label's ACTUAL (fit-to-text) bottom, so it tracks the real header
+-- height on any platform's line metrics.
+command uiSection pName, pText, pRect
+   local tOldDelim, tL, tR, tB
+   uiWrap pName, pText, pRect, 13
+   set the textStyle of field pName to "bold"
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 3 of pRect into tR
+   set the itemDelimiter to tOldDelim
+   put the bottom of field pName into tB
+   uiGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
+   set the style of graphic (pName & "Line") to "rectangle"
+   set the filled of graphic (pName & "Line") to true
+   set the backgroundColor of graphic (pName & "Line") to kUiCardLine
+   set the lineSize of graphic (pName & "Line") to 0
+end uiSection
+
+-- A one-line entry field, mono and flat ("modern input" chrome instead of
+-- the engine's sunken-3D default), because hex, addresses and paths are
+-- what this suite's demos edit.
+command uiInput pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to false
+   set the traversalOn of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   -- 4-item margins form ONLY: OXT ignored the single-number form on a
+   -- real engine pass
+   set the margins of field pName to "6,6,6,6"
+   set the textSize of field pName to 11
+   set the textFont of field pName to uiMonoFont()
+end uiInput
+
+-- A read-only output/log area: mono, flat, scrolling, hairline-bordered.
+command uiArea pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the traversalOn of field pName to false
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiCardLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   set the margins of field pName to "6,6,6,6"
+   set the vScrollbar of field pName to true
+   set the textSize of field pName to 10
+   set the textFont of field pName to uiMonoFont()
+end uiArea
+
+-- A row-selectable table: uiArea plus list behavior and tab stops
+-- ("230,340"-style comma lists). Pair it with a uiLabel header carrying
+-- the same tabStops, set by the adopter.
+command uiTable pName, pRect, pTabStops
+   uiArea pName, pRect
+   set the listBehavior of field pName to true
+   if pTabStops is not empty then
+      set the tabStops of field pName to pTabStops
+   end if
+end uiTable
+
+command uiButton pName, pLabel, pRect
+   if there is no button pName then
+      create button
+      set the name of the last button to pName
+   end if
+   set the rect of button pName to pRect
+   set the label of button pName to pLabel
+end uiButton
+
+-- A script-managed checkbox: autoHilite OFF because the family drives
+-- toggle state from script locals (a mode the environment cannot honour
+-- must never stay silently armed - the quickshare pill lesson), so the
+-- hilite is set explicitly by the adopter's state machine.
+command uiCheckbox pName, pLabel, pRect
+   uiButton pName, pLabel, pRect
+   set the style of button pName to "checkbox"
+   set the autoHilite of button pName to false
+end uiCheckbox
+
+-- Create-or-reuse a named graphic: the chrome layer (cards, pills,
+-- dividers, drop targets). Created BEFORE the controls that sit on it, so
+-- it stays behind them in z-order. roundRect + antialiased by default;
+-- callers restyle.
+command uiGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end uiGfx
+
+-- A dashboard card: a rounded, hairline-bordered, softly shadowed panel
+-- placed BEHIND a group of controls. It only groups visually; clicks on
+-- it fall through to the adopter's `default: pass mouseUp`.
+command uiPanel pName, pRect
+   local tShadow, tErr
+   uiGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kUiCard
+   set the lineSize of graphic pName to 1
+   -- a graphic strokes its outline in the foregroundColor; borderColor is
+   -- set too so whichever the engine honours, the hairline lands
+   set the foregroundColor of graphic pName to kUiCardLine
+   set the borderColor of graphic pName to kUiCardLine
+   -- soft drop shadow is an LC-9-era feature, so it is a PURE
+   -- enhancement: an engine without it just skips it (the try) and the
+   -- hairline still separates the card from the page
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end uiPanel
+
+-- A status pill: rounded chip + centered label, colored by state kind -
+-- "ok" green, "wait" amber, "bad" red, anything else the muted on-band
+-- blue. The adopter repaints it from ONE place so its handlers cannot
+-- disagree about the colors (the nocloud Tor-pill discipline).
+command uiPill pName, pText, pRect, pKind
+   local tOldDelim, tTop, tBot, tFH
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 2 of pRect into tTop
+   put item 4 of pRect into tBot
+   set the itemDelimiter to tOldDelim
+   uiGfx (pName & "Bg"), pRect
+   set the roundRadius of graphic (pName & "Bg") to (tBot - tTop)
+   set the filled of graphic (pName & "Bg") to true
+   set the lineSize of graphic (pName & "Bg") to 0
+   if pKind is "ok" then
+      set the backgroundColor of graphic (pName & "Bg") to "205,240,214"
+   else if pKind is "wait" then
+      set the backgroundColor of graphic (pName & "Bg") to "250,240,199"
+   else if pKind is "bad" then
+      set the backgroundColor of graphic (pName & "Bg") to "243,215,213"
+   else
+      set the backgroundColor of graphic (pName & "Bg") to "31,64,116"
+   end if
+   uiLabel pName, pText, pRect, 10
+   set the textAlign of field pName to "center"
+   if pKind is "ok" then
+      set the foregroundColor of field pName to "22,101,52"
+   else if pKind is "wait" then
+      set the foregroundColor of field pName to "133,98,14"
+   else if pKind is "bad" then
+      set the foregroundColor of field pName to "135,44,38"
+   else
+      set the foregroundColor of field pName to kUiAccentSub
+   end if
+   -- center the label on the chip midline by measured height
+   put the formattedHeight of field pName into tFH
+   if tFH > 0 and tFH < (tBot - tTop) then
+      set the height of field pName to tFH
+      set the top of field pName to (tTop + ((tBot - tTop - tFH) div 2))
+   end if
+end uiPill
+
+-- Click-to-copy feedback: flash the button's label to "Copied!" for
+-- 1200 ms, then restore the real label (stashed in uRealLabel).
+command uiCopyFlash pBtn
+   if there is no button pBtn then
+      exit uiCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("uiCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end uiCopyFlash
+
+command uiCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit uiCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end uiCopyFlashReset
+
+-- The honesty/custody footer every demo carries: what the stack is, what
+-- it is not, and its engine-evidence state.
+command uiFooter pText, pRect
+   uiWrap "uiFooter", pText, pRect, 11
+   set the textStyle of field "uiFooter" to "italic"
+   set the foregroundColor of field "uiFooter" to kUiMuted
+end uiFooter
+-- ==== SUITE UI KIT v2 END ====
 
 -- ---- lifecycle ---------------------------------------------------------------
+on preOpenStack
+   -- build before first paint (fleet-audit fix): the first open used to flash
+   -- an unstyled window because only openStack built the UI
+   qsBuild
+end preOpenStack
+
 on openStack
    qsBuild
    qsStart
@@ -191,6 +556,15 @@ end openStack
 on closeStack
    qsStop
 end closeStack
+
+-- A quit (Cmd-Q / Alt-F4 / Dock) does not always deliver closeStack, and this
+-- is the stack with the MOST to leak: onion services, the socket listener, the
+-- UPnP port mapping, and temp .enc files. qsStop is idempotent, so arriving
+-- here after closeStack already ran is a safe no-op (fleet-audit fix).
+on shutdownRequest
+   qsStop
+   pass shutdownRequest
+end shutdownRequest
 
 -- ---- OS file drag-and-drop ---------------------------------------------------
 -- These bubble up from whatever control is under the pointer to this stack
@@ -210,14 +584,14 @@ end dragMove
 
 on dragLeave
    if there is a field "qsDrop" then
-      set the backgroundColor of field "qsDrop" to "245,247,250"
+      set the backgroundColor of field "qsDrop" to kUiCodeBg
    end if
 end dragLeave
 
 on dragDrop
    local tFiles
    if there is a field "qsDrop" then
-      set the backgroundColor of field "qsDrop" to "245,247,250"
+      set the backgroundColor of field "qsDrop" to kUiCodeBg
    end if
    put the dragData["files"] into tFiles
    if tFiles is empty then
@@ -267,103 +641,91 @@ command qsBuild
    end if
    qsClearGeneratedUI
    lock screen
-   set the width of this stack to 620
-   set the height of this stack to 640
-   set the backgroundColor of this card to "237,239,243"
+   -- the kit chrome at the retuned 620x640. The 40px band matches the old one
+   -- and leaves room for the Tor pill on its right (the adopter places band
+   -- extras - kit rule 1); the OS title keeps its established name.
+   uiChrome "Quick Share - send a file with a code", 620, 640, 40
    set the title of this stack to "TorrentXT - Quick Share"
-   -- title band
-   qsLabel "qsTitle", "  Quick Share - send a file with a code", "0,0,620,40", 15
-   set the opaque of field "qsTitle" to true
-   set the backgroundColor of field "qsTitle" to "44,90,160"
-   set the foregroundColor of field "qsTitle" to "255,255,255"
-   set the textStyle of field "qsTitle" to "bold"
-   qsLabel "qsTagline", "Send with a code, privately over Tor, or via a direct web link.", "24,46,244,74", 9
-   set the foregroundColor of field "qsTagline" to "90,96,105"
-   -- live Tor status pill (repainted only by qsOnionPill), sitting in the title band
-   qsLabel "qsTorPill", "Tor: off", "430,8,612,32", 10
-   set the opaque of field "qsTorPill" to true
-   set the backgroundColor of field "qsTorPill" to "33,72,132"
-   set the foregroundColor of field "qsTorPill" to "220,228,240"
-   set the textAlign of field "qsTorPill" to "right"
-   -- the two OPTIONAL transport toggles (mutually exclusive; each two-state, autoHilite
-   -- off, managed via sTorSend / sWebShare). Neither on = the classic BitTorrent code.
-   qsButton "qsTorToggle", "Send privately over Tor", "250,48,418,72"
-   set the style of button "qsTorToggle" to "checkbox"
-   set the autoHilite of button "qsTorToggle" to false
-   qsButton "qsWebShareToggle", "Share via web link", "424,48,600,72"
-   set the style of button "qsWebShareToggle" to "checkbox"
-   set the autoHilite of button "qsWebShareToggle" to false
+   -- the kit's status line: this layout was retuned edge-to-edge for 640
+   -- recently and its control rects are PRESERVED, so there is no free strip
+   -- under the band - the one status line lives where the status line always
+   -- did, between the transfers table and the log. Geometry is the caller's
+   -- (kit rule 1); the semantics (uiStatus, semantic colors) stay the kit's.
+   set the rect of field "uiStatus" to "24,554,596,574"
+   uiLabel "qsTagline", "Send with a code, privately over Tor, or via a direct web link.", "24,46,244,74", 9
+   set the foregroundColor of field "qsTagline" to kUiInkSoft
+   -- the live Tor status pill sits in the band and is created + repainted ONLY
+   -- by qsOnionPill (via the kit's uiPill), so its states cannot disagree.
+   -- The two OPTIONAL transport toggles (mutually exclusive; each two-state,
+   -- script-managed - uiCheckbox turns autoHilite off for exactly this).
+   -- Neither on = the classic BitTorrent code.
+   uiCheckbox "qsTorToggle", "Send privately over Tor", "250,48,418,72"
+   uiCheckbox "qsWebShareToggle", "Share via web link", "424,48,600,72"
    -- SEND: an OPTIONAL passphrase (set it BEFORE dropping to encrypt), the drop
    -- area, then the resulting code.
-   qsLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
-   qsField "qsSendPass", "304,74,596,98", false
-   qsField "qsDrop", "24,104,596,168", true
-   set the opaque of field "qsDrop" to true
-   set the backgroundColor of field "qsDrop" to "245,247,250"
-   set the borderWidth of field "qsDrop" to 1
-   set the threeD of field "qsDrop" to false
-   set the borderColor of field "qsDrop" to "175,185,200"
+   uiLabel "qsSendPassCap", "Lock with a passphrase (optional):", "24,76,300,96", 10
+   uiInput "qsSendPass", "304,74,596,98"
+   -- the drop target: a kit input restyled as a big quiet prose area (locked,
+   -- centered, prose face, code-box fill - the drag highlight restores to it)
+   uiInput "qsDrop", "24,104,596,168"
+   set the lockText of field "qsDrop" to true
+   set the traversalOn of field "qsDrop" to false
+   set the backgroundColor of field "qsDrop" to kUiCodeBg
    set the textAlign of field "qsDrop" to "center"
    set the textSize of field "qsDrop" to 13
-   set the foregroundColor of field "qsDrop" to "90,96,105"
+   set the textFont of field "qsDrop" to empty
+   set the foregroundColor of field "qsDrop" to kUiInkSoft
    set the text of field "qsDrop" to (return & "Drag a file or folder here to share" & return & "(a folder becomes a browsable page - or, if it has index.html, a hosted web app)")
    -- OPTIONAL: also serve a plaintext Tor share as a browser web download. Only a
    -- plaintext file shared over Tor is served this way; the URL appears at the right.
-   qsButton "qsWebCheck", "Serve as web download", "24,170,220,192"
-   set the style of button "qsWebCheck" to "checkbox"
-   set the autoHilite of button "qsWebCheck" to false
-   qsField "qsWebLink", "226,170,520,192", true
-   set the textFont of field "qsWebLink" to "Courier"
+   uiCheckbox "qsWebCheck", "Serve as web download", "24,170,220,192"
+   uiInput "qsWebLink", "226,170,520,192"
+   set the lockText of field "qsWebLink" to true
+   set the traversalOn of field "qsWebLink" to false
    set the textSize of field "qsWebLink" to 9
-   set the opaque of field "qsWebLink" to true
-   set the backgroundColor of field "qsWebLink" to "255,250,225"
-   qsButton "qsWebCopy", "Copy", "526,170,596,192"
-   qsLabel "qsSharing", "", "24,196,596,216", 10
+   set the backgroundColor of field "qsWebLink" to kUiCodeBg
+   set the borderColor of field "qsWebLink" to kUiCodeLine
+   uiButton "qsWebCopy", "Copy", "526,170,596,192"
+   uiLabel "qsSharing", "", "24,196,596,216", 10
    set the textStyle of field "qsSharing" to "bold"
-   qsLabel "qsCodeCap", "Your share code - give this to your friend:", "24,222,596,240", 10
-   qsField "qsCode", "24,242,490,276", true
-   set the textFont of field "qsCode" to "Courier"
+   uiLabel "qsCodeCap", "Your share code - give this to your friend:", "24,222,596,240", 10
+   -- the code boxes get the quiet code-box fill so they read as "copyable
+   -- output", not editable input (the family's channels-demo convention)
+   uiInput "qsCode", "24,242,490,276"
+   set the lockText of field "qsCode" to true
+   set the traversalOn of field "qsCode" to false
    set the textSize of field "qsCode" to 12
-   set the opaque of field "qsCode" to true
-   set the backgroundColor of field "qsCode" to "255,250,225"
-   qsButton "qsCopy", "Copy", "500,244,596,274"
+   set the backgroundColor of field "qsCode" to kUiCodeBg
+   set the borderColor of field "qsCode" to kUiCodeLine
+   uiButton "qsCopy", "Copy", "500,244,596,274"
    -- OPTIONAL live web editor (LAN-only). Tick it and set an edit password to make the
    -- web-shared FOLDER editable from a browser on your own network (visit the shared
    -- link with /_edit on the end). Off by default; needs cryptoXT for the password.
-   qsButton "qsEditToggle", "Enable web editing", "24,284,214,306"
-   set the style of button "qsEditToggle" to "checkbox"
-   set the autoHilite of button "qsEditToggle" to false
-   qsLabel "qsEditPassCap", "Edit password:", "220,286,318,306", 10
-   qsField "qsEditPass", "322,284,486,306", false
-   qsLabel "qsEditHint", "LAN only", "492,286,596,306", 9
-   set the foregroundColor of field "qsEditHint" to "150,110,40"
+   uiCheckbox "qsEditToggle", "Enable web editing", "24,284,214,306"
+   uiLabel "qsEditPassCap", "Edit password:", "220,286,318,306", 10
+   uiInput "qsEditPass", "322,284,486,306"
+   uiLabel "qsEditHint", "LAN only", "492,286,596,306", 9
+   set the foregroundColor of field "qsEditHint" to kUiWarn
    set the textAlign of field "qsEditHint" to "right"
    -- RECEIVE: paste a code, an optional passphrase (only if it is locked), download
-   qsSection "qsRecvSec", "Receive a file", "24,316,596,338"
-   qsLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,344,596,362", 10
-   qsField "qsRecvCode", "24,366,490,398", false
-   set the textFont of field "qsRecvCode" to "Courier"
-   set the textSize of field "qsRecvCode" to 11
-   qsButton "qsGet", "Download", "500,366,596,398"
-   qsLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,404,300,424", 10
-   qsField "qsRecvPass", "304,402,596,426", false
+   uiSection "qsRecvSec", "Receive a file", "24,316,596,338"
+   uiLabel "qsRecvCap", "Paste a code a friend sent you, then click Download:", "24,344,596,362", 10
+   uiInput "qsRecvCode", "24,366,490,398"
+   uiButton "qsGet", "Download", "500,366,596,398"
+   uiLabel "qsRecvPassCap", "Passphrase (only if the file is locked):", "24,404,300,424", 10
+   uiInput "qsRecvPass", "304,402,596,426"
    -- TRANSFERS: see it working
-   qsSection "qsXferSec", "Transfers", "24,438,596,460"
-   qsLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,464,596,482", 9
+   uiSection "qsXferSec", "Transfers", "24,438,596,460"
+   uiLabel "qsXferHead", "Name" & tab & "Direction" & tab & "Progress", "24,464,596,482", 9
    set the tabStops of field "qsXferHead" to "210,330"
-   set the textFont of field "qsXferHead" to "Courier"
-   set the textSize of field "qsXferHead" to 9
-   qsList "qsXfers", "24,486,596,550", false
-   set the tabStops of field "qsXfers" to "210,330"
-   set the textFont of field "qsXfers" to "Courier"
-   set the textSize of field "qsXfers" to 10
-   qsLabel "qsStatus", "", "24,554,596,574", 10
-   set the foregroundColor of field "qsStatus" to "90,96,105"
+   set the textFont of field "qsXferHead" to uiMonoFont()
+   uiTable "qsXfers", "24,486,596,550", "210,330"
    -- a small activity log
-   qsList "qsLog", "24,580,596,632", true
-   set the textSize of field "qsLog" to 9
-   qsAddTips
+   uiArea "qsLog", "24,580,596,632"
+   -- the pill must exist before qsAddTips sets its tooltip (it used to be
+   -- built inline here; now qsOnionPill creates it via uiPill)
    qsOnionPill
+   qsAddTips
    set the uUiVersion of this stack to kQsUiVersion
    unlock screen
 end qsBuild
@@ -384,63 +746,19 @@ command qsClearGeneratedUI
          delete button tI of this card
       end if
    end repeat
+   -- the Tor pill's chip is a qs-prefixed GRAPHIC (uiPill makes qsTorPillBg);
+   -- clear those too so a version bump rebuilds the band clean
+   repeat with tI = the number of graphics of this card down to 1
+      if the short name of graphic tI of this card begins with "qs" then
+         delete graphic tI of this card
+      end if
+   end repeat
    unlock screen
 end qsClearGeneratedUI
 
-command qsLabel pName, pText, pRect, pSize
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the borderWidth of field pName to 0
-   set the opaque of field pName to false
-   set the textSize of field pName to pSize
-   put pText into field pName
-end qsLabel
-
-command qsSection pName, pText, pRect
-   qsLabel pName, ("  " & pText), pRect, 11
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to "210,216,226"
-   set the foregroundColor of field pName to "30,40,60"
-   set the textStyle of field pName to "bold"
-end qsSection
-
-command qsField pName, pRect, pLocked
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to pLocked
-   set the traversalOn of field pName to (not pLocked)
-end qsField
-
-command qsButton pName, pLabel, pRect
-   if there is no button pName then
-      create button
-      set the name of the last button to pName
-   end if
-   set the rect of button pName to pRect
-   set the label of button pName to pLabel
-end qsButton
-
-command qsList pName, pRect, pIsLog
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the vScrollbar of field pName to true
-   if pIsLog then
-      set the listBehavior of field pName to false
-   else
-      set the listBehavior of field pName to true
-   end if
-end qsList
+-- The label/section/field/button/list builders that used to live here
+-- collapsed onto the suite UI kit above (uiLabel/uiSection/uiInput/uiButton/
+-- uiTable/uiArea/uiCheckbox); only genuinely quickshare-local helpers survive.
 
 command qsAddTips
    set the tooltip of field "qsSendPass" to "Leave blank to share normally. Type a passphrase to ENCRYPT the file; tell your friend the passphrase separately."
@@ -468,6 +786,7 @@ command qsStart
    put the result into sSession
    if sSession is 0 or sSession is empty then
       qsLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      uiStatus "No session (another TorrentXT stack open?) - see the log.", "bad"
       put 0 into sSession
       exit qsStart
    end if
@@ -518,6 +837,7 @@ command qsStart
    else
       qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
+   uiStatus "Ready - drag a file to share, or paste a code to download.", "ok"
    send "qsPollOnce" to me in 0 milliseconds
    send "qsDashOnce" to me in 800 milliseconds
 end qsStart
@@ -561,10 +881,30 @@ command qsPollOnce
 end qsPollOnce
 
 command qsDashOnce
+   local tNow, tWaitKey, tS, tWaitName, tWaitHash
    if sPolling is not "true" then
       exit qsDashOnce
    end if
    qsRefreshXfers
+   -- the metadata watchdog (fleet-audit fix): a pasted code with no metadata
+   -- after the window gets ONE spoken diagnosis; nothing is removed and the
+   -- download keeps waiting - the friend may simply be offline until later.
+   put the milliseconds into tNow
+   repeat for each key tWaitKey in sMetaWait
+      if sMetaHinted[tWaitKey] is not "true" and (tNow - sMetaWait[tWaitKey]) > (kQsMetaHintSecs * 1000) then
+         put "true" into sMetaHinted[tWaitKey]
+         put btTorrentStatus(tWaitKey) into tS
+         put tS["name"] into tWaitName
+         put toLower(tS["infoHashV1"]) into tWaitHash
+         if tWaitHash is not empty and sXferName[tWaitHash] is not empty then
+            put sXferName[tWaitHash] into tWaitName
+         end if
+         if tWaitName is empty then
+            put "that code" into tWaitName
+         end if
+         qsLog "* still no details for" && quote & tWaitName & quote && "after" && kQsMetaHintSecs && "s - dead code/magnet? your friend offline? DHT still bootstrapping? UDP blocked? Still trying."
+      end if
+   end repeat
    send "qsDashOnce" to me in 1000 milliseconds
 end qsDashOnce
 
@@ -800,6 +1140,9 @@ command qsGetFile
          qsLog "Could not start the download:" && btLastError()
          exit qsGetFile
       end if
+      -- arm the one-shot metadata watchdog (cleared by metadataReceived)
+      put the milliseconds into sMetaWait[tH]
+      delete variable sMetaHinted[tH]
       put empty into field "qsRecvCode"
       qsLog "Downloading the locked file" && quote & tName & quote & " to" && qsSaveFolder() & " - it unlocks automatically when complete."
    else
@@ -819,6 +1162,9 @@ command qsGetFile
          qsLog "Could not start the download:" && btLastError()
          exit qsGetFile
       end if
+      -- arm the one-shot metadata watchdog (cleared by metadataReceived)
+      put the milliseconds into sMetaWait[tH]
+      delete variable sMetaHinted[tH]
       put empty into field "qsRecvCode"
       qsLog "Downloading to" && qsSaveFolder() & ". Watch the Transfers list - your friend must be online."
    end if
@@ -826,7 +1172,7 @@ end qsGetFile
 
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
-   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat
+   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tStat, tKind
    local tIH, tDisp, tDir, tK, tE
    if sSession is 0 or sSession is empty then
       exit qsRefreshXfers
@@ -898,20 +1244,28 @@ command qsRefreshXfers
    unlock screen
    put btDhtState(sSession) into tD
    put tD["nodes"] into tNodes
+   -- the one status line is the kit's (green once the DHT actually has nodes)
    if tNodes is a number and tNodes > 0 then
       put ("Connected - DHT: " & tNodes & " nodes") into tStat
+      put "ok" into tKind
    else
       put "Connecting to the network..." into tStat
+      put "" into tKind
    end if
-   put tStat & "        sending " & (qsBytes(tUp) & "/s") & "    receiving " & (qsBytes(tDown) & "/s") into field "qsStatus"
+   uiStatus (tStat & "        sending " & (qsBytes(tUp) & "/s") & "    receiving " & (qsBytes(tDown) & "/s")), tKind
 end qsRefreshXfers
 
 command qsHandleEvent pEvent
+   local tHandle
    switch pEvent["name"]
       case "torrentAdded"
          qsRefreshXfers
          break
       case "metadataReceived"
+         -- the metadata watchdog is satisfied; forget its pending entry
+         put pEvent["torrent"] into tHandle
+         delete variable sMetaWait[tHandle]
+         delete variable sMetaHinted[tHandle]
          qsLog "Got the details for" && pEvent["torrentName"] & " - downloading the file now..."
          break
       case "torrentFinished"
@@ -1204,7 +1558,11 @@ command qsOnionStart
 end qsOnionStart
 
 -- Retry the control connection on the Tor Browser port pair, exactly once.
+-- The retry's result is checked (fleet-audit fix): this is the LAST attempt,
+-- so a silent failure here left only the pill to notice - one log line names
+-- the outcome and what to do about it.
 command qsOnionTryTB
+   local tR
    if sOnionTriedTB is "true" then
       exit qsOnionTryTB
    end if
@@ -1212,6 +1570,10 @@ command qsOnionTryTB
    oxSetControlPort kTorControlPortTB
    oxSetSocksPort kTorSocksPortTB
    oxConnectControl
+   put the result into tR
+   if tR is not empty then
+      qsLog "No Tor control port answered on 127.0.0.1:9051 or 9151 (" & tR & ") - start Tor (or Tor Browser) and reopen this stack to use the private-send features."
+   end if
 end qsOnionTryTB
 
 -- OnionXT status callback (dispatched with pKind, pInfo). Coalesced bootstrap and
@@ -1279,9 +1641,15 @@ end qsOnionServicePublished
 
 -- Repaint the live pill AND drive the toggle's disabled/hilite state. A mode the
 -- environment cannot honor never stays silently armed (sTorSend forced off).
+-- The pill is the kit's uiPill (chip + centered label), painted ONLY here so
+-- its states can never disagree; the kinds map the states semantically:
+-- ready = "ok" (green), connecting = "wait" (amber), and every cannot-run
+-- state (no extension / needs cryptoXT / no daemon) = "bad" (red). The long
+-- start-Tor guidance moved to the log (qsOnionTryTB) - a chip cannot carry a
+-- sentence, and the tooltip still explains the pill.
 command qsOnionPill
-   local tState
-   if there is no field "qsTorPill" then
+   local tState, tKind
+   if there is no button "qsTorToggle" then
       exit qsOnionPill
    end if
    if not sHasOnion then
@@ -1290,22 +1658,26 @@ command qsOnionPill
       else
          put "Tor: needs cryptoXT" into tState
       end if
+      put "bad" into tKind
       set the disabled of button "qsTorToggle" to true
    else if not oxIsControlAuthenticated() then
-      put "Tor: no daemon (start Tor on 127.0.0.1:9051 or 9151)" into tState
+      put "Tor: no daemon" into tState
+      put "bad" into tKind
       set the disabled of button "qsTorToggle" to true
    else if not oxIsReady() then
       put ("Tor: connecting " & oxBootstrapProgress() & "%") into tState
+      put "wait" into tKind
       set the disabled of button "qsTorToggle" to false
    else
       put "Tor: ready" into tState
+      put "ok" into tKind
       set the disabled of button "qsTorToggle" to false
    end if
    if (the disabled of button "qsTorToggle") and (sTorSend is "true") then
       put "false" into sTorSend
       set the hilite of button "qsTorToggle" to false
    end if
-   set the text of field "qsTorPill" to tState
+   uiPill "qsTorPill", tState, "430,8,612,32", tKind
 end qsOnionPill
 
 -- Flip the send-over-Tor toggle (managed two-state; autoHilite is off).

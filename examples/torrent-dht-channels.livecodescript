@@ -73,6 +73,16 @@ script "dhtChannelsApp"
 -- loop repaints the transfers table, and a 60 s loop re-publishes your feed and
 -- re-fetches your subscriptions so it stays live. The DHT routing table is saved
 -- on close and reloaded on open for a faster bootstrap.
+--
+-- HONESTY (the suite convention): the torrent + BEP44 surface this demo drives
+-- is engine-proven (the member selftest and the demo passes recorded in
+-- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
+-- 2026-08-14 - the rebuilt chrome and layout are verified statically; needs an
+-- OXT re-pass.
+--
+-- THE LOOK is the suite UI kit, carried verbatim between the marker lines
+-- (master: tools/ui-kit.livecodescript; the drift gate holds every copy
+-- byte-identical). Change the look in the master, never here.
 
 -- ---- stack-local state -------------------------------------------------------
 local sSession          -- the live session handle (0/empty = none)
@@ -108,6 +118,12 @@ local sPendingKey       -- array: info-hash -> 32-byte file key, for a download 
 local sPendingName      -- array: info-hash -> original filename, for a download to decrypt
 local sXferName         -- array: info-hash -> real name to SHOW locally for an
                         --   encrypted transfer (the swarm only ever sees the .enc)
+-- Fleet-audit fixes: DHT get/put refusals are logged ONCE per call site (a
+-- refused request on the 60 s tick must not become a log flood), and a Follow
+-- whose feed never arrives gets one spoken diagnosis after its window.
+local sDhtErrHinted     -- array: call-site tag -> "true" once its refusal was logged
+local sFeedWait         -- array: followed pubkey -> ms clock when Follow asked for it
+local sFeedHinted       -- array: followed pubkey -> "true" once the no-feed hint ran
 
 -- The user-facing release version: shown in the OS title bar and the startup
 -- log line, so a bug report always says which build it came from.
@@ -116,28 +132,363 @@ constant kChAppVersion = "1.0.0"
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-ui-720p-1"
-
--- ---- UI design tokens ----------------------------------------------------------
--- The same palette newquickshare settled on after its OXT passes, so the two
--- demos read as one family. Neutral grays carry the chrome; one accent blue
--- carries brand + interaction. All literal RGB strings - OXT constants must be
--- literal and declared before first use.
-constant kClrPage = "240,242,246"       -- window background
-constant kClrCard = "255,255,255"       -- card fill (and input fill)
-constant kClrCardLine = "225,229,236"   -- hairline card border / dividers
-constant kClrBand = "44,90,160"         -- header band (brand blue)
-constant kClrBandText = "255,255,255"   -- title on the band
-constant kClrInk = "28,34,46"           -- primary text
-constant kClrInkSoft = "95,104,118"     -- secondary text / status lines
-constant kClrInkMute = "138,146,158"    -- captions, hints, empty states
-constant kClrFieldLine = "203,210,222"  -- entry-field border
-constant kClrCodeBg = "244,246,250"     -- code/key output fill
-constant kClrCodeLine = "210,217,229"   -- code/key output border
+constant kUiVersion = "channels-kit2-1"
 -- prefs file header: an 8-byte magic, then a 1-byte mode ("P" plain / "E" sealed).
 -- A SEALED file is [magic]["E"][salt 16][sxSecretBox], the same 16-byte-salt +
 -- Argon2id convention cryptoXT's own file-encrypt demo uses.
 constant kPrefMagic = "BTXPREF1"
+-- seconds of followed-but-feedless silence before the one-time diagnosis line
+-- (the fetch itself keeps retrying on the 60 s tick; nothing is aborted)
+constant kChFeedHintSecs = 60
+
+-- ---- adopter-owned colors ------------------------------------------------------
+-- The chrome palette comes from the suite UI kit block below; only the
+-- transfers-table ROW colors stay here, because the kit does not own row
+-- colors. Aligned with the family set: err/posted/paused carry the kit's
+-- bad/ok/muted values, downloaded is the accent blue the other demos use for
+-- active rows. Literal RGB strings only (OXT constants must be literal and
+-- declared before first use).
+constant kChRowErr = "176,58,46"        -- errored transfer (kUiBad's value)
+constant kChRowPaused = "138,146,158"   -- paused transfer (kUiMuted's value)
+constant kChRowPosted = "23,128,63"     -- a file YOU posted (kUiOk's value)
+constant kChRowDown = "43,108,196"      -- a file you downloaded (family accent)
+
+-- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
+-- The family look as one carried block: the kit owns colors, chrome, and
+-- control construction; the adopting demo owns layout (explicit rects) and
+-- logic. Builders are idempotent (create-if-missing), so a rebuild on
+-- reopen is safe. Do not edit this block in place: change the master and
+-- re-carry it.
+constant kUiBg = "240,242,246"
+constant kUiCard = "255,255,255"
+constant kUiCardLine = "225,229,236"
+constant kUiAccent = "44,90,160"
+constant kUiAccentText = "255,255,255"
+constant kUiAccentSub = "199,216,241"
+constant kUiInk = "28,34,46"
+constant kUiInkSoft = "95,104,118"
+constant kUiMuted = "138,146,158"
+constant kUiOk = "23,128,63"
+constant kUiWarn = "150,110,40"
+constant kUiBad = "176,58,46"
+constant kUiFieldLine = "203,210,222"
+constant kUiCodeBg = "244,246,250"
+constant kUiCodeLine = "210,217,229"
+
+-- The platform's own terminal face for codes, keys, tables and logs, so
+-- the monospace surfaces look native instead of typewriter-Courier. A
+-- missing face substitutes the engine default - a soft, safe failure.
+function uiMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end uiMonoFont
+
+-- The window chrome every adopter shares: stack size, page ground, the
+-- title band, and the one status line under it (write it with uiStatus).
+-- pBandH is optional (default 30); a taller band leaves room for an
+-- adopter's tagline or status pill, placed by the adopter.
+command uiChrome pTitle, pWidth, pHeight, pBandH
+   local tFH
+   if pBandH is empty then
+      put 30 into pBandH
+   end if
+   set the width of this stack to pWidth
+   set the height of this stack to pHeight
+   set the backgroundColor of this card to kUiBg
+   set the title of this stack to pTitle
+   uiGfx "uiBand", "0,0," & pWidth & "," & pBandH
+   set the style of graphic "uiBand" to "rectangle"
+   set the filled of graphic "uiBand" to true
+   set the backgroundColor of graphic "uiBand" to kUiAccent
+   set the lineSize of graphic "uiBand" to 0
+   uiLabel "uiTitle", "  " & pTitle, "0,0," & pWidth & "," & pBandH, 15
+   set the foregroundColor of field "uiTitle" to kUiAccentText
+   set the textStyle of field "uiTitle" to "bold"
+   -- center the title on the band midline by MEASURED height (never guess
+   -- font metrics - the family's OXT passes clipped hand-sized labels)
+   put the formattedHeight of field "uiTitle" into tFH
+   if tFH > 0 and tFH < pBandH then
+      set the height of field "uiTitle" to tFH
+      set the top of field "uiTitle" to ((pBandH - tFH) div 2)
+   end if
+   uiLabel "uiStatus", empty, "16," & (pBandH + 4) & "," & (pWidth - 16) & "," & (pBandH + 22), 11
+end uiChrome
+
+-- The status line, colored by what it reports: "ok", "warn", "bad", or
+-- anything else for neutral/muted. Demos route probe results through this
+-- so a stack that cannot run says so in red, at the top, immediately.
+command uiStatus pText, pKind
+   put pText into field "uiStatus"
+   if pKind is "ok" then
+      set the foregroundColor of field "uiStatus" to kUiOk
+   else if pKind is "warn" then
+      set the foregroundColor of field "uiStatus" to kUiWarn
+   else if pKind is "bad" then
+      set the foregroundColor of field "uiStatus" to kUiBad
+   else
+      set the foregroundColor of field "uiStatus" to kUiInkSoft
+   end if
+end uiStatus
+
+-- A static caption at a FIXED rect (idempotent, borderless, transparent).
+-- Use uiWrap instead when the text may wrap or the exact height matters.
+command uiLabel pName, pText, pRect, pSize
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the borderWidth of field pName to 0
+   set the opaque of field pName to false
+   set the threeD of field pName to false
+   set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kUiInk
+   put pText into field pName
+end uiLabel
+
+-- A caption FIT to its measured text height (top pinned). The fit does
+-- double duty: it prevents clipping (hand-sized rects clipped text on a
+-- real Windows pass), and it makes `the height of field` equal the TEXT
+-- height, which midline centering relies on. GUARD: only resize on a sane
+-- measurement - a 0/blank formattedHeight (possible before the window is
+-- fully realized) would collapse the label. Empty labels are skipped
+-- (they receive their text later).
+command uiWrap pName, pText, pRect, pSize
+   local tOldDelim, tTop, tFH
+   uiLabel pName, pText, pRect, pSize
+   if pText is not empty then
+      put the itemDelimiter into tOldDelim
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the itemDelimiter to tOldDelim
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
+         set the top of field pName to tTop
+      end if
+   end if
+end uiWrap
+
+-- A small, muted caption (hints, toggle descriptions, empty states).
+command uiCap pName, pText, pRect
+   uiWrap pName, pText, pRect, 10
+   set the foregroundColor of field pName to kUiMuted
+end uiCap
+
+-- A numbered bold section header with a hairline divider placed below the
+-- label's ACTUAL (fit-to-text) bottom, so it tracks the real header
+-- height on any platform's line metrics.
+command uiSection pName, pText, pRect
+   local tOldDelim, tL, tR, tB
+   uiWrap pName, pText, pRect, 13
+   set the textStyle of field pName to "bold"
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 3 of pRect into tR
+   set the itemDelimiter to tOldDelim
+   put the bottom of field pName into tB
+   uiGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
+   set the style of graphic (pName & "Line") to "rectangle"
+   set the filled of graphic (pName & "Line") to true
+   set the backgroundColor of graphic (pName & "Line") to kUiCardLine
+   set the lineSize of graphic (pName & "Line") to 0
+end uiSection
+
+-- A one-line entry field, mono and flat ("modern input" chrome instead of
+-- the engine's sunken-3D default), because hex, addresses and paths are
+-- what this suite's demos edit.
+command uiInput pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to false
+   set the traversalOn of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   -- 4-item margins form ONLY: OXT ignored the single-number form on a
+   -- real engine pass
+   set the margins of field pName to "6,6,6,6"
+   set the textSize of field pName to 11
+   set the textFont of field pName to uiMonoFont()
+end uiInput
+
+-- A read-only output/log area: mono, flat, scrolling, hairline-bordered.
+command uiArea pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the traversalOn of field pName to false
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiCardLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   set the margins of field pName to "6,6,6,6"
+   set the vScrollbar of field pName to true
+   set the textSize of field pName to 10
+   set the textFont of field pName to uiMonoFont()
+end uiArea
+
+-- A row-selectable table: uiArea plus list behavior and tab stops
+-- ("230,340"-style comma lists). Pair it with a uiLabel header carrying
+-- the same tabStops, set by the adopter.
+command uiTable pName, pRect, pTabStops
+   uiArea pName, pRect
+   set the listBehavior of field pName to true
+   if pTabStops is not empty then
+      set the tabStops of field pName to pTabStops
+   end if
+end uiTable
+
+command uiButton pName, pLabel, pRect
+   if there is no button pName then
+      create button
+      set the name of the last button to pName
+   end if
+   set the rect of button pName to pRect
+   set the label of button pName to pLabel
+end uiButton
+
+-- A script-managed checkbox: autoHilite OFF because the family drives
+-- toggle state from script locals (a mode the environment cannot honour
+-- must never stay silently armed - the quickshare pill lesson), so the
+-- hilite is set explicitly by the adopter's state machine.
+command uiCheckbox pName, pLabel, pRect
+   uiButton pName, pLabel, pRect
+   set the style of button pName to "checkbox"
+   set the autoHilite of button pName to false
+end uiCheckbox
+
+-- Create-or-reuse a named graphic: the chrome layer (cards, pills,
+-- dividers, drop targets). Created BEFORE the controls that sit on it, so
+-- it stays behind them in z-order. roundRect + antialiased by default;
+-- callers restyle.
+command uiGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end uiGfx
+
+-- A dashboard card: a rounded, hairline-bordered, softly shadowed panel
+-- placed BEHIND a group of controls. It only groups visually; clicks on
+-- it fall through to the adopter's `default: pass mouseUp`.
+command uiPanel pName, pRect
+   local tShadow, tErr
+   uiGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kUiCard
+   set the lineSize of graphic pName to 1
+   -- a graphic strokes its outline in the foregroundColor; borderColor is
+   -- set too so whichever the engine honours, the hairline lands
+   set the foregroundColor of graphic pName to kUiCardLine
+   set the borderColor of graphic pName to kUiCardLine
+   -- soft drop shadow is an LC-9-era feature, so it is a PURE
+   -- enhancement: an engine without it just skips it (the try) and the
+   -- hairline still separates the card from the page
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end uiPanel
+
+-- A status pill: rounded chip + centered label, colored by state kind -
+-- "ok" green, "wait" amber, "bad" red, anything else the muted on-band
+-- blue. The adopter repaints it from ONE place so its handlers cannot
+-- disagree about the colors (the nocloud Tor-pill discipline).
+command uiPill pName, pText, pRect, pKind
+   local tOldDelim, tTop, tBot, tFH
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 2 of pRect into tTop
+   put item 4 of pRect into tBot
+   set the itemDelimiter to tOldDelim
+   uiGfx (pName & "Bg"), pRect
+   set the roundRadius of graphic (pName & "Bg") to (tBot - tTop)
+   set the filled of graphic (pName & "Bg") to true
+   set the lineSize of graphic (pName & "Bg") to 0
+   if pKind is "ok" then
+      set the backgroundColor of graphic (pName & "Bg") to "205,240,214"
+   else if pKind is "wait" then
+      set the backgroundColor of graphic (pName & "Bg") to "250,240,199"
+   else if pKind is "bad" then
+      set the backgroundColor of graphic (pName & "Bg") to "243,215,213"
+   else
+      set the backgroundColor of graphic (pName & "Bg") to "31,64,116"
+   end if
+   uiLabel pName, pText, pRect, 10
+   set the textAlign of field pName to "center"
+   if pKind is "ok" then
+      set the foregroundColor of field pName to "22,101,52"
+   else if pKind is "wait" then
+      set the foregroundColor of field pName to "133,98,14"
+   else if pKind is "bad" then
+      set the foregroundColor of field pName to "135,44,38"
+   else
+      set the foregroundColor of field pName to kUiAccentSub
+   end if
+   -- center the label on the chip midline by measured height
+   put the formattedHeight of field pName into tFH
+   if tFH > 0 and tFH < (tBot - tTop) then
+      set the height of field pName to tFH
+      set the top of field pName to (tTop + ((tBot - tTop - tFH) div 2))
+   end if
+end uiPill
+
+-- Click-to-copy feedback: flash the button's label to "Copied!" for
+-- 1200 ms, then restore the real label (stashed in uRealLabel).
+command uiCopyFlash pBtn
+   if there is no button pBtn then
+      exit uiCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("uiCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end uiCopyFlash
+
+command uiCopyFlashReset pBtn
+   if there is no button pBtn then
+      exit uiCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end uiCopyFlashReset
+
+-- The honesty/custody footer every demo carries: what the stack is, what
+-- it is not, and its engine-evidence state.
+command uiFooter pText, pRect
+   uiWrap "uiFooter", pText, pRect, 11
+   set the textStyle of field "uiFooter" to "italic"
+   set the foregroundColor of field "uiFooter" to kUiMuted
+end uiFooter
+-- ==== SUITE UI KIT v2 END ====
 
 -- ---- lifecycle ---------------------------------------------------------------
 -- Build in preOpenStack, BEFORE the window is shown, so a first open (or a
@@ -324,140 +675,129 @@ command chBuild
    -- Rebuild when the UI version changes (not just "is it built?"). Otherwise a
    -- stack saved by an OLDER version keeps its old controls - including buttons
    -- this script no longer handles (e.g. the old chNewId/chSetName) - and never
-   -- gets the new ones. Wipe our generated controls and rebuild on any mismatch.
-   if the uUiVersion of this stack is kUiVersion then
+   -- gets the new ones. The second condition catches a stack whose property
+   -- says current but whose controls were deleted (the guard the sibling demos
+   -- already carried; version-only was this stack's audit finding).
+   if the uUiVersion of this stack is kUiVersion and there is a field "chLog" then
       exit chBuild
    end if
    chClearGeneratedUI
    lock screen
-   -- two columns so the whole app fits a 720p (1280x720) screen; the chrome
-   -- (band, rounded cards, hairline dividers) is the newquickshare design
-   -- system, OXT-pass-proven there, so the two demos read as one family
-   set the width of this stack to 1180
-   set the height of this stack to 640
+   -- two columns so the whole app fits a 720p (1280x720) screen; the chrome is
+   -- the suite UI kit (band + cards + hairline dividers)
+   uiChrome "Decentralized Channels - share files with no server", 1180, 640
+   -- the OS title bar carries the release version (bug reports name the build)
+   set the title of this stack to ("TorrentXT - Decentralized Channels " & kChAppVersion)
    -- fixed-size dashboard: the layout is hand-placed, a free resize would tear it
    set the resizable of this stack to false
-   set the backgroundColor of this card to kClrPage
-   set the title of this stack to ("TorrentXT - Decentralized Channels " & kChAppVersion)
-   -- title band: a plain filled graphic + an auto-sized label centered on its
-   -- midline by MEASURED height (never guess font metrics - the OXT lesson)
-   chGfx "chTitleBg", "0,0,1180,32"
-   set the style of graphic "chTitleBg" to "rectangle"
-   set the filled of graphic "chTitleBg" to true
-   set the backgroundColor of graphic "chTitleBg" to kClrBand
-   set the lineSize of graphic "chTitleBg" to 0
-   chMakeLabel "chTitle", "Decentralized Channels - share files with no server", "12,2,720,30", 13
-   set the foregroundColor of field "chTitle" to kClrBandText
-   set the textStyle of field "chTitle" to "bold"
-   set the top of field "chTitle" to (16 - ((the height of field "chTitle") div 2))
-   chMakeButton "chHelp", "?  What is this?", "1000,4,1164,28"
+   -- the kit's status line: this packed two-column layout has no free strip
+   -- under the band (the cards start at y 34), so the one status line lives
+   -- where the transfers totals line always did, inside the transfers card -
+   -- geometry is the caller's (kit rule 1); the semantics (uiStatus, semantic
+   -- colors) stay the kit's
+   set the rect of field "uiStatus" to "596,300,1164,318"
+   uiButton "chHelp", "?  What is this?", "1000,4,1164,28"
    -- lock/unlock the saved identity with a passphrase (label tracks state)
-   chMakeButton "chLock", "Lock Identity...", "820,4,994,28"
+   uiButton "chLock", "Lock Identity...", "820,4,994,28"
    -- the three cards, created BEFORE the controls that sit on them (z-order):
    -- left = your channels + follows; right = transfers; bottom = drop + log
-   chPanel "chCardLeft", "8,34,586,486"
-   chPanel "chCardRight", "588,34,1172,486"
-   chPanel "chCardBottom", "8,490,1172,638"
+   uiPanel "chCardLeft", "8,34,586,486"
+   uiPanel "chCardRight", "588,34,1172,486"
+   uiPanel "chCardBottom", "8,490,1172,638"
    -- ===== LEFT COLUMN (x 16..580): your channel + channels you follow =====
-   chSection "chSecMine", "1.  Your channels - publish files under a channel of your own", "16,38,580,58"
+   uiSection "chSecMine", "1.  Your channels - publish files under a channel of your own", "16,38,580,58"
    -- channel picker: switch the active channel, or make / delete one
-   chMakeLabel "chPickCap", "Active channel:", "16,63,116,81", 10
-   set the foregroundColor of field "chPickCap" to kClrInkSoft
-   chMakeButton "chChannelMenu", "", "118,62,346,84"
+   uiWrap "chPickCap", "Active channel:", "16,63,116,81", 10
+   set the foregroundColor of field "chPickCap" to kUiInkSoft
+   uiButton "chChannelMenu", "", "118,62,346,84"
    set the style of button "chChannelMenu" to "menu"
    set the menuMode of button "chChannelMenu" to "option"
-   chMakeButton "chNewChan", "New Channel", "352,62,452,84"
-   chMakeButton "chDelChan", "Delete", "458,62,552,84"
-   chMakeLabel "chMyKeyLabel", "This channel's address - Copy it so people can follow THIS channel and get its files:", "16,88,580,104", 10
-   set the foregroundColor of field "chMyKeyLabel" to kClrInkSoft
-   chMakeField "chMyKey", "16,106,360,130", true
-   chMakeButton "chCopyKey", "Copy", "368,106,452,130"
-   chMakeButton "chRename", "Rename", "458,106,552,130"
-   chMakeButton "chPublish", "Publish a File...", "16,136,250,158"
-   chMakeButton "chPrivacy", "Privacy...", "256,136,372,158"
-   chMakeLabel "chNowPub", "Not publishing yet.", "378,140,580,158", 9
-   set the foregroundColor of field "chNowPub" to kClrInkSoft
-   chSection "chSecSubs", "2.  Channels you follow - download what they share", "16,168,580,188"
-   chMakeField "chFollowKey", "16,192,400,216", false
-   chMakeButton "chFollow", "Follow", "408,192,492,216"
-   chMakeButton "chRefresh", "Refresh", "498,192,580,216"
-   chMakeLabel "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,220,580,244", 9
-   set the foregroundColor of field "chFeedCaption" to kClrInkMute
-   chMakeLabel "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by", "16,248,580,266", 10
-   chMakeList "chSubs", "16,268,580,452", false
-   chMakeButton "chDownload", "Download", "16,458,180,482"
-   chMakeButton "chCopyMag", "Copy Magnet", "188,458,300,482"
-   chMakeButton "chUnfollow", "Unfollow", "308,458,448,482"
+   uiButton "chNewChan", "New Channel", "352,62,452,84"
+   uiButton "chDelChan", "Delete", "458,62,552,84"
+   uiWrap "chMyKeyLabel", "This channel's address - Copy it so people can follow THIS channel and get its files:", "16,88,580,104", 10
+   set the foregroundColor of field "chMyKeyLabel" to kUiInkSoft
+   uiInput "chMyKey", "16,106,360,130"
+   set the lockText of field "chMyKey" to true
+   set the traversalOn of field "chMyKey" to false
+   uiButton "chCopyKey", "Copy", "368,106,452,130"
+   uiButton "chRename", "Rename", "458,106,552,130"
+   uiButton "chPublish", "Publish a File...", "16,136,250,158"
+   uiButton "chPrivacy", "Privacy...", "256,136,372,158"
+   uiWrap "chNowPub", "Not publishing yet.", "378,140,580,158", 9
+   set the foregroundColor of field "chNowPub" to kUiInkSoft
+   uiSection "chSecSubs", "2.  Channels you follow - download what they share", "16,168,580,188"
+   uiInput "chFollowKey", "16,192,400,216"
+   uiButton "chFollow", "Follow", "408,192,492,216"
+   uiButton "chRefresh", "Refresh", "498,192,580,216"
+   uiWrap "chFeedCaption", "Files shared by channels you follow. Each row is signed by its channel, so it cannot be faked. Pick one and Download:", "16,220,580,244", 9
+   set the foregroundColor of field "chFeedCaption" to kUiMuted
+   uiWrap "chSubsHeader", "Channel" & tab & "Release" & tab & "Signed by", "16,248,580,266", 10
+   uiTable "chSubs", "16,268,580,452", "150,430"
+   uiButton "chDownload", "Download", "16,458,180,482"
+   uiButton "chCopyMag", "Copy Magnet", "188,458,300,482"
+   uiButton "chUnfollow", "Unfollow", "308,458,448,482"
    set the tabStops of field "chSubsHeader" to "150,430"
-   set the tabStops of field "chSubs" to "150,430"
-   set the textFont of field "chSubsHeader" to chMonoFont()
-   set the textFont of field "chSubs" to chMonoFont()
-   set the foregroundColor of field "chSubsHeader" to kClrInkMute
+   set the textFont of field "chSubsHeader" to uiMonoFont()
+   set the foregroundColor of field "chSubsHeader" to kUiMuted
    -- a light selection colour so the dark/coloured row text stays readable
    set the hiliteColor of field "chSubs" to "208,226,245"
    -- ===== RIGHT COLUMN (x 596..1164): transfers + selected-transfer detail =====
-   chSection "chSecXfer", "3.  Transfers - green = files you POSTED, blue = files you DOWNLOADED", "596,38,1164,58"
-   chMakeLabel "chXferHeader", "Source" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "596,62,1164,80", 10
-   chMakeList "chXfers", "596,82,1164,238", false
+   uiSection "chSecXfer", "3.  Transfers - green = files you POSTED, blue = files you DOWNLOADED", "596,38,1164,58"
+   uiWrap "chXferHeader", "Source" & tab & "Name" & tab & "State" & tab & "Progress" & tab & "Peers", "596,62,1164,80", 10
    -- Source | Name | State | Progress | Peers (Peers kept clear of the scrollbar)
+   uiTable "chXfers", "596,82,1164,238", "84,236,338,460"
    set the tabStops of field "chXferHeader" to "84,236,338,460"
-   set the tabStops of field "chXfers" to "84,236,338,460"
    -- a light selection colour so the colour-coded row text stays readable
    set the hiliteColor of field "chXfers" to "208,226,245"
-   set the textFont of field "chXferHeader" to chMonoFont()
-   set the textFont of field "chXfers" to chMonoFont()
-   set the textSize of field "chXferHeader" to 10
-   set the textSize of field "chXfers" to 10
-   set the foregroundColor of field "chXferHeader" to kClrInkMute
+   set the textFont of field "chXferHeader" to uiMonoFont()
+   set the foregroundColor of field "chXferHeader" to kUiMuted
    -- add any magnet link or info-hash directly, not only channel releases
-   chMakeField "chMagnetField", "596,244,948,266", false
-   chMakeButton "chAddMagnet", "Add Magnet", "954,244,1080,266"
+   uiInput "chMagnetField", "596,244,948,266"
+   uiButton "chAddMagnet", "Add Magnet", "954,244,1080,266"
    -- act on the selected transfer (click a row first)
-   chMakeButton "chPauseXfer", "Pause", "596,272,690,294"
-   chMakeButton "chResumeXfer", "Resume", "696,272,790,294"
-   chMakeButton "chRemoveXfer", "Remove", "796,272,902,294"
-   chMakeButton "chOpenFolder", "Open Folder", "908,272,1054,294"
-   chMakeLabel "chTotals", "", "596,300,1164,318", 10
-   set the foregroundColor of field "chTotals" to kClrInkSoft
+   uiButton "chPauseXfer", "Pause", "596,272,690,294"
+   uiButton "chResumeXfer", "Resume", "696,272,790,294"
+   uiButton "chRemoveXfer", "Remove", "796,272,902,294"
+   uiButton "chOpenFolder", "Open Folder", "908,272,1054,294"
+   -- (the totals line that sat at 596,300 is now the kit's uiStatus, above)
    -- 3b. Contents of the selected transfer (live per-file progress via btFileList)
-   chMakeLabel "chFilesCaption", "Click a transfer above to see the files inside it (double-click opens its folder).", "596,324,1164,340", 9
-   set the foregroundColor of field "chFilesCaption" to kClrInkMute
-   chMakeLabel "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,344,1164,362", 10
-   chMakeList "chFiles", "596,364,1164,470", true
+   uiWrap "chFilesCaption", "Click a transfer above to see the files inside it (double-click opens its folder).", "596,324,1164,340", 9
+   set the foregroundColor of field "chFilesCaption" to kUiMuted
+   uiWrap "chFilesHeader", "File" & tab & "Size" & tab & "Progress", "596,344,1164,362", 10
+   uiArea "chFiles", "596,364,1164,470"
    set the tabStops of field "chFilesHeader" to "340,440"
    set the tabStops of field "chFiles" to "340,440"
-   set the textFont of field "chFilesHeader" to chMonoFont()
-   set the textFont of field "chFiles" to chMonoFont()
-   set the textSize of field "chFilesHeader" to 10
-   set the textSize of field "chFiles" to 10
-   set the foregroundColor of field "chFilesHeader" to kClrInkMute
+   set the textFont of field "chFilesHeader" to uiMonoFont()
+   set the foregroundColor of field "chFilesHeader" to kUiMuted
    set the text of field "chFiles" to "Click a transfer above to see its files and per-file progress."
    -- ===== FULL-WIDTH BOTTOM: quick drop + log =====
-   chSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,488,1164,508"
-   chMakeField "chPinText", "16,512,440,534", false
-   chMakeButton "chPin", "Pin", "448,512,530,534"
-   chMakeField "chPinCode", "538,512,810,534", true
-   chMakeButton "chPinCopy", "Copy", "818,512,910,534"
-   chMakeField "chFetchCode", "16,538,440,560", false
-   chMakeButton "chFetchBtn", "Fetch", "448,538,530,560"
-   chMakeField "chDropResult", "538,538,910,560", true
-   chMakeList "chLog", "16,564,1164,632", true
-   set the textFont of field "chLog" to chMonoFont()
-   set the textSize of field "chLog" to 9
-   set the foregroundColor of field "chLog" to kClrInkSoft
-   set the textFont of field "chMyKey" to chMonoFont()
-   set the textFont of field "chFollowKey" to chMonoFont()
-   set the textFont of field "chPinCode" to chMonoFont()
-   set the textFont of field "chFetchCode" to chMonoFont()
-   set the textFont of field "chMagnetField" to chMonoFont()
+   uiSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,488,1164,508"
+   uiInput "chPinText", "16,512,440,534"
+   uiButton "chPin", "Pin", "448,512,530,534"
+   uiInput "chPinCode", "538,512,810,534"
+   set the lockText of field "chPinCode" to true
+   set the traversalOn of field "chPinCode" to false
+   uiButton "chPinCopy", "Copy", "818,512,910,534"
+   uiInput "chFetchCode", "16,538,440,560"
+   uiButton "chFetchBtn", "Fetch", "448,538,530,560"
+   uiInput "chDropResult", "538,538,910,560"
+   set the lockText of field "chDropResult" to true
+   set the traversalOn of field "chDropResult" to false
+   -- the honesty footer, in the bottom card's free right corner (the only
+   -- clear space this packed layout has)
+   uiFooter \
+         "Decentralized-channels demo over TorrentXT. Torrent + BEP44 surface" \
+         & " engine-proven; this kit-unified UI needs an OXT re-pass.", \
+         "920,512,1164,560"
+   uiArea "chLog", "16,564,1164,632"
    -- the read-only output boxes (address, drop-code, drop-result) get the quiet
    -- code-box fill so they read as "copyable output", not editable input
-   set the backgroundColor of field "chMyKey" to kClrCodeBg
-   set the borderColor of field "chMyKey" to kClrCodeLine
-   set the backgroundColor of field "chPinCode" to kClrCodeBg
-   set the borderColor of field "chPinCode" to kClrCodeLine
-   set the backgroundColor of field "chDropResult" to kClrCodeBg
-   set the borderColor of field "chDropResult" to kClrCodeLine
+   set the backgroundColor of field "chMyKey" to kUiCodeBg
+   set the borderColor of field "chMyKey" to kUiCodeLine
+   set the backgroundColor of field "chPinCode" to kUiCodeBg
+   set the borderColor of field "chPinCode" to kUiCodeLine
+   set the backgroundColor of field "chDropResult" to kUiCodeBg
+   set the borderColor of field "chDropResult" to kUiCodeLine
    set the dontWrap of field "chMyKey" to true
    set the dontWrap of field "chPinCode" to true
    set the textSize of field "chMyKey" to 9
@@ -483,172 +823,10 @@ command chClearGeneratedUI
    unlock screen
 end chClearGeneratedUI
 
-command chMakeLabel pName, pText, pRect, pSize
-   local tTop, tFH
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the borderWidth of field pName to 0
-   set the opaque of field pName to false
-   set the threeD of field pName to false
-   set the textSize of field pName to pSize
-   set the foregroundColor of field pName to kClrInk
-   put pText into field pName
-   -- never GUESS font metrics (the newquickshare OXT lesson): FIT the field to
-   -- its measured text height (top pinned). This prevents clipping AND makes
-   -- `the height of field` equal the TEXT height, which the band-title centering
-   -- and chSection's divider placement rely on. GUARD: only resize when the
-   -- engine returns a sane measurement - a 0/blank formattedHeight (possible
-   -- before the window is realized) would collapse the label, so keep the rect
-   -- in that case. (An earlier grow-only version broke the centering by leaving
-   -- the field at its taller rect height.) Empty labels get their text later.
-   if pText is not empty then
-      set the itemDelimiter to comma
-      put item 2 of pRect into tTop
-      put the formattedHeight of field pName into tFH
-      if tFH > 0 then
-         set the height of field pName to tFH
-         set the top of field pName to tTop
-      end if
-   end if
-end chMakeLabel
-
--- A flat, bold section header with a hairline divider under it (replaces the
--- old opaque gray band). Sits ON a card. pRect is the header's text row.
-command chSection pName, pText, pRect
-   local tL, tR, tB
-   chMakeLabel pName, pText, pRect, 11
-   set the textStyle of field pName to "bold"
-   set the foregroundColor of field pName to kClrInk
-   set the itemDelimiter to comma
-   put item 1 of pRect into tL
-   put item 3 of pRect into tR
-   -- place the divider below the label's ACTUAL (fit-to-text) bottom, so it
-   -- tracks the real header height on any platform's line metrics
-   put the bottom of field pName into tB
-   chGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
-   set the style of graphic (pName & "Line") to "rectangle"
-   set the filled of graphic (pName & "Line") to true
-   set the backgroundColor of graphic (pName & "Line") to kClrCardLine
-   set the lineSize of graphic (pName & "Line") to 0
-end chSection
-
-command chMakeField pName, pRect, pLocked
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to pLocked
-   set the traversalOn of field pName to (not pLocked)
-   -- flat "modern input" chrome instead of the engine's sunken-3D default
-   set the threeD of field pName to false
-   set the borderWidth of field pName to 1
-   set the borderColor of field pName to kClrFieldLine
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to kClrCard
-   set the margins of field pName to "6,6,6,6"
-end chMakeField
-
-command chMakeButton pName, pLabel, pRect
-   if there is no button pName then
-      create button
-      set the name of the last button to pName
-   end if
-   set the rect of button pName to pRect
-   set the label of button pName to pLabel
-end chMakeButton
-
-command chMakeList pName, pRect, pIsLog
-   if there is no field pName then
-      create field
-      set the name of the last field to pName
-   end if
-   set the rect of field pName to pRect
-   set the lockText of field pName to true
-   set the vScrollbar of field pName to true
-   set the threeD of field pName to false
-   set the borderWidth of field pName to 1
-   set the borderColor of field pName to kClrCardLine
-   set the opaque of field pName to true
-   set the backgroundColor of field pName to kClrCard
-   if pIsLog then
-      set the listBehavior of field pName to false
-   else
-      set the listBehavior of field pName to true
-   end if
-end chMakeList
-
--- Create-or-reuse a named graphic (the chrome layer: cards, dividers, the band).
--- Created BEFORE the controls that sit on it, so it stays behind them in z-order.
-command chGfx pName, pRect
-   if there is no graphic pName then
-      create graphic
-      set the name of the last graphic to pName
-   end if
-   set the rect of graphic pName to pRect
-   set the style of graphic pName to "roundRect"
-   set the antialiased of graphic pName to true
-end chGfx
-
--- A dashboard card: rounded, hairline-bordered, softly shadowed, behind a group.
-command chPanel pName, pRect
-   chGfx pName, pRect
-   set the roundRadius of graphic pName to 14
-   set the filled of graphic pName to true
-   set the backgroundColor of graphic pName to kClrCard
-   set the lineSize of graphic pName to 1
-   set the foregroundColor of graphic pName to kClrCardLine
-   set the borderColor of graphic pName to kClrCardLine
-   -- soft drop shadow is a pure enhancement; an engine without it just skips it
-   local tShadow, tErr
-   try
-      put "90,98,114" into tShadow["color"]
-      put 30 into tShadow["opacity"]
-      put 10 into tShadow["size"]
-      put 0 into tShadow["spread"]
-      put 2 into tShadow["distance"]
-      put 90 into tShadow["angle"]
-      set the dropShadow of graphic pName to tShadow
-   catch tErr
-   end try
-end chPanel
-
--- The platform's own terminal face for keys / codes / the tables. A missing
--- face substitutes the engine default - a soft, safe failure.
-function chMonoFont
-   if the platform is "MacOS" then
-      return "Menlo"
-   else if the platform is "Win32" then
-      return "Consolas"
-   end if
-   return "DejaVu Sans Mono"
-end chMonoFont
-
--- Flash a Copy button's label to "Copied!" for a beat, then restore it, so the
--- feedback lands AT the pointer, not only in the far-away log.
-command chCopyFlash pBtn
-   if there is no button pBtn then
-      exit chCopyFlash
-   end if
-   if the uRealLabel of button pBtn is empty then
-      set the uRealLabel of button pBtn to the label of button pBtn
-   end if
-   set the label of button pBtn to "Copied!"
-   send ("chCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
-end chCopyFlash
-
-command chCopyFlashReset pBtn
-   if there is no button pBtn then
-      exit chCopyFlashReset
-   end if
-   if the uRealLabel of button pBtn is not empty then
-      set the label of button pBtn to the uRealLabel of button pBtn
-   end if
-end chCopyFlashReset
+-- The label/section/field/button/list/graphic/panel builders (and the mono-font
+-- + copy-flash helpers) that used to live here collapsed onto the suite UI kit
+-- above (uiWrap/uiSection/uiInput/uiButton/uiTable/uiArea/uiGfx/uiPanel/
+-- uiMonoFont/uiCopyFlash); only genuinely channels-local helpers survive.
 
 -- a hover hint on every control, so the app explains itself
 command chAddTips
@@ -715,6 +893,7 @@ command chStart
    put the result into sSession
    if sSession is 0 or sSession is empty then
       chLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      uiStatus "No session (another TorrentXT stack open?) - see the log.", "bad"
       put 0 into sSession
       exit chStart
    end if
@@ -1020,19 +1199,47 @@ command chLoadFollows
    chRefreshSubs
    repeat for each line tKey in sFollows
       if tKey is not empty then
-         btDhtGetMutable sSession, tKey, ""
+         chDhtGetChecked tKey, "load"
       end if
    end repeat
 end chLoadFollows
 
-command chStop
-   put "false" into sPolling
-   if sSession is not empty and sSession is not 0 then
-      -- persist the DHT routing table so next launch bootstraps faster
-      set the uDhtState of this stack to btDhtSaveState(sSession)
-      btStopSession sSession
+-- One guarded feed fetch, shared by every btDhtGetMutable site (fleet-audit
+-- fix: all four were fire-and-forget, so a refused request - session gone,
+-- malformed key - looked exactly like a slow DHT). A refusal is logged ONCE
+-- per call site (pSite tags it): the load/tick sites re-run forever and a
+-- flood would bury the log, while the once-line still names the first
+-- failure with btLastError(). A queued request returns 0 and stays silent.
+command chDhtGetChecked pKey, pSite
+   local tR
+   btDhtGetMutable sSession, pKey, ""
+   put the result into tR
+   if tR is not empty and tR < 0 and sDhtErrHinted[pSite] is not "true" then
+      put "true" into sDhtErrHinted[pSite]
+      chLog "* DHT feed fetch refused (site" && pSite & "," && tR & "):" && btLastError() && "- further refusals at this site stay quiet."
    end if
-   chPrefSave      -- final flush to the external prefs file on close
+end chDhtGetChecked
+
+command chStop
+   local tErr
+   put "false" into sPolling
+   -- try-guarded (fleet-audit fix): shutdownRequest can run this while the
+   -- engine is already tearing extensions down, and a throw here would abort
+   -- the quit path - losing the prefs flush below. The teardown and the
+   -- prefs save are guarded separately so a failed save-state still lets the
+   -- prefs (pure script + file IO) be written.
+   try
+      if sSession is not empty and sSession is not 0 then
+         -- persist the DHT routing table so next launch bootstraps faster
+         set the uDhtState of this stack to btDhtSaveState(sSession)
+         btStopSession sSession
+      end if
+   catch tErr
+   end try
+   try
+      chPrefSave      -- final flush to the external prefs file on close
+   catch tErr
+   end try
    put empty into sSession
 end chStop
 
@@ -1225,17 +1432,28 @@ command chPollOnce
 end chPollOnce
 
 command chDashOnce
+   local tNow, tKey
    if sPolling is not "true" then
       exit chDashOnce
    end if
    chRefreshTransfers
+   -- the Follow watchdog (fleet-audit fix): "Fetching their feed..." used to
+   -- wait in silence forever. One spoken diagnosis per followed key once its
+   -- window passes; the fetch itself keeps retrying on the 60 s tick.
+   put the milliseconds into tNow
+   repeat for each key tKey in sFeedWait
+      if sFeedHinted[tKey] is not "true" and (tNow - sFeedWait[tKey]) > (kChFeedHintSecs * 1000) then
+         put "true" into sFeedHinted[tKey]
+         chLog "* still nothing from" && chShortKey(tKey) && "after" && kChFeedHintSecs && "s - wrong code? publisher offline? DHT still warming up (watch the node count)? Still watching for it."
+      end if
+   end repeat
    send "chDashOnce" to me in 1000 milliseconds
 end chDashOnce
 
 -- every 60 s: keep EVERY one of your channels alive in the DHT (not just the
 -- active one, so they all stay reachable) and re-pull your subscriptions
 command chChannelTick
-   local tKey, tI, tKp, tFeed, tVal
+   local tKey, tI, tKp, tFeed, tVal, tR
    if sPolling is not "true" then
       exit chChannelTick
    end if
@@ -1248,11 +1466,19 @@ command chChannelTick
          put chFeedValue(tFeed, sChannels[tI]["pass"], tKp["publicKey"]) into tVal
          if tVal is not empty then
             btDhtPutMutable sSession, tKp["publicKey"], tKp["secretKey"], "", tVal
+            -- a refused re-announce means the channel silently expires from
+            -- the DHT in ~2 h; say so ONCE (this tick re-runs forever, and a
+            -- once-per-site flag keeps the log readable) - fleet-audit fix
+            put the result into tR
+            if tR is not empty and tR < 0 and sDhtErrHinted["tick-put"] is not "true" then
+               put "true" into sDhtErrHinted["tick-put"]
+               chLog "* channel re-announce refused (" & tR & "):" && btLastError() && "- your channels stop being reachable if this keeps failing."
+            end if
          end if
       end repeat
       repeat for each line tKey in sFollows
          if tKey is not empty then
-            btDhtGetMutable sSession, tKey, ""
+            chDhtGetChecked tKey, "tick"
          end if
       end repeat
    end if
@@ -1411,7 +1637,7 @@ command chCopyKey
       put tName & " | " & sPub into tCard
    end if
    set the clipboardData["text"] to tCard
-   chCopyFlash "chCopyKey"
+   uiCopyFlash "chCopyKey"
    chLog "Copied your channel card (name + address) - paste it into someone's Follow box."
 end chCopyKey
 
@@ -1458,7 +1684,11 @@ command chFollow
    chPrefSave
    put empty into field "chFollowKey"
    chRefreshSubs
-   btDhtGetMutable sSession, tKey, ""
+   chDhtGetChecked tKey, "follow"
+   -- arm the no-feed watchdog for THIS key: cleared when its dhtMutableItem
+   -- arrives (or on Unfollow), hinted once by chDashOnce if it never does
+   put the milliseconds into sFeedWait[tKey]
+   delete variable sFeedHinted[tKey]
    if tDup then
       chLog "Updated the passphrase for" && chShortKey(tKey) & ". Re-fetching its feed..."
    else
@@ -1473,7 +1703,7 @@ command chRefreshAll
    end if
    repeat for each line tKey in sFollows
       if tKey is not empty then
-         btDhtGetMutable sSession, tKey, ""
+         chDhtGetChecked tKey, "refresh"
       end if
    end repeat
    chLog "Refreshing all followed channels..."
@@ -1505,6 +1735,10 @@ command chUnfollow
    set the uFollows of this stack to sFollows
    put empty into sFollowFeeds[tKey]
    put empty into sFollowPass[tKey]
+   -- a pending no-feed watchdog for this key would otherwise hint later
+   -- about a channel we no longer follow
+   delete variable sFeedWait[tKey]
+   delete variable sFeedHinted[tKey]
    set the uFollowPass of this stack to arrayEncode(sFollowPass)
    chPrefSave
    chRefreshSubs
@@ -1563,7 +1797,7 @@ command chCopySelectedMagnet
       exit chCopySelectedMagnet
    end if
    set the clipboardData["text"] to tMag
-   chCopyFlash "chCopyMag"
+   uiCopyFlash "chCopyMag"
    chLog "Copied the magnet to the clipboard."
 end chCopySelectedMagnet
 
@@ -1652,7 +1886,7 @@ end chRefreshSubs
 
 -- ---- transfers dashboard -----------------------------------------------------
 command chRefreshTransfers
-   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht
+   local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht, tKind
    local tColors, tErr, tSelH, tSelLine, tSource, tDispName, tIH
    if sSession is 0 or sSession is empty then
       exit chRefreshTransfers
@@ -1685,15 +1919,16 @@ command chRefreshTransfers
       put (the round of (tS["progress"] * 1000) / 10) into tPct
       put chSource(tS) into tSource
       -- Colour the row by SOURCE so posted vs downloaded is obvious at a glance:
-      -- red = error, grey = paused, green = YOU posted it, blue = you downloaded it.
+      -- red = error, grey = paused, green = YOU posted it, blue = you downloaded
+      -- it (named adopter constants, aligned with the family's row-color set).
       if tS["error"] is not empty then
-         put "200,40,40" into tColors[tLineNum]
+         put kChRowErr into tColors[tLineNum]
       else if tS["isPaused"] is true or tS["isPaused"] is 1 then
-         put "120,120,120" into tColors[tLineNum]
+         put kChRowPaused into tColors[tLineNum]
       else if tSource is "Posted" then
-         put "0,140,70" into tColors[tLineNum]
+         put kChRowPosted into tColors[tLineNum]
       else
-         put "30,90,200" into tColors[tLineNum]
+         put kChRowDown into tColors[tLineNum]
       end if
       -- Show the real name for our own/known encrypted transfers; the swarm only
       -- ever sees the neutral .enc name, but we should not hide it from ourselves.
@@ -1715,8 +1950,10 @@ command chRefreshTransfers
    put tD["nodes"] into tNodes
    if tNodes is a number and tNodes > 0 then
       put ("DHT:" && tNodes && "nodes") into tDht
+      put "ok" into tKind
    else
       put "DHT: connecting..." into tDht
+      put "" into tKind
    end if
    lock screen
    set the text of field "chXfers" to tRows
@@ -1742,8 +1979,9 @@ command chRefreshTransfers
    if tSelLine > 0 then
       set the hilitedLines of field "chXfers" to tSelLine
    end if
-   put tLineNum && "transfers     down" && (chFmtBytes(tDown) & "/s") && "    up" \
-      && (chFmtBytes(tUp) & "/s") && "     " & tDht into field "chTotals"
+   -- the one status line is the kit's (green once the DHT actually has nodes)
+   uiStatus (tLineNum && "transfers     down" && (chFmtBytes(tDown) & "/s") && "    up" \
+      && (chFmtBytes(tUp) & "/s") && "     " & tDht), tKind
    unlock screen
    -- refresh the file detail for whatever transfer is selected (live per-file %)
    chShowFiles tSelH
@@ -2005,7 +2243,7 @@ command chPinCopy
       exit chPinCopy
    end if
    set the clipboardData["text"] to field "chPinCode"
-   chCopyFlash "chPinCopy"
+   uiCopyFlash "chPinCopy"
    chLog "Copied the drop code to the clipboard."
 end chPinCopy
 
@@ -2033,6 +2271,9 @@ command chHandleEvent pEvent
    switch pEvent["name"]
       case "dhtMutableItem"
          put pEvent["publicKey"] into tKey
+         -- the feed arrived: the Follow watchdog for this key is satisfied
+         delete variable sFeedWait[tKey]
+         delete variable sFeedHinted[tKey]
          -- decrypt if this is a private channel we hold the passphrase for;
          -- libtorrent only surfaces a mutable item after verifying its ed25519
          -- signature, so arrival == cryptographically authentic (encryption rides
