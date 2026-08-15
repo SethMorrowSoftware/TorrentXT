@@ -480,7 +480,9 @@ before its predecessor's gate is green.
 > deliberately does not prove stays open, and the stronger phase gates below
 > are exactly it: the real-swarm interop gate (§8.5, a legal torrent verified
 > against its published hash), resume across a real session restart, the
-> two-machine seed/leech and rp1/DHT runs, and the packaged install on every
+> two-machine seed/leech and rp1/DHT runs of THIS member's demos (the
+> transport itself has carried two-machine rp1/DHT traffic via riptide,
+> 2026-08-13 and -15), and the packaged install on every
 > platform. Phase 4 is largely done: four of five platform binaries are built
 > and committed under `src/code/`, leaving only the macOS universal dylib +
 > notarization. Phase 5 (the visual widget) is the remaining optional work. The

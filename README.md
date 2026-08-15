@@ -272,7 +272,9 @@ and on **2026-08-10** the whole member selftest
 twice in one day, folded into the suite harness — the v9-v11 surface
 (`btDhtGetPeers`, `btAddInfohash`, `btMapPort`/`btUnmapPort`, the `btRp1*`
 quartet) included. Remaining: the signed macOS universal dylib and the two-machine
-rp1/DHT demos. The optional visual dashboard widget (plan phase 5) was
+runs of this member's OWN rp1/DHT demos (the rp1/DHT transport itself has since
+carried two-machine traffic - riptide's feed propagation 2026-08-13 and its
+DMs-over-rp1 2026-08-15 ride exactly this surface). The optional visual dashboard widget (plan phase 5) was
 **decided out of v1 scope on 2026-08-13**: it stays in the plan as a possible
 later phase, and its absence is a recorded decision, not a maturity gap.
 
