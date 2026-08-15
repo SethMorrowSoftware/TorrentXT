@@ -9,9 +9,11 @@ for the lifecycle you must follow; this file is the call-by-call contract.
 
 > **Honesty note (carried throughout the repo).** OXT has no headless way to
 > compile or run `.lcb`, so the runtime behaviour of these handlers is "verified
-> statically; needs an OXT pass." Where a value is plumbed through the schema but
-> not yet populated by the shim (a few status fields, noted inline), that is
-> flagged in place rather than promised.
+> statically; needs an OXT pass." This note once flagged schema fields the shim
+> did not yet populate; that gap has closed (audited 2026-08-15: every field id
+> registered in `src/btx_record.h` is written by `src/torrent_shim.cpp`). The
+> one surviving inline caveat is the DHT-state note below - a counter a given
+> libtorrent build omits stays `0`.
 
 ---
 
