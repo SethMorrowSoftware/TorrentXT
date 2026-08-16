@@ -298,6 +298,7 @@ end stListHas
 
 -- ---- the run -----------------------------------------------------------------
 command stRun
+   local tRunErr -- a REFERENCED catch variable must be declared: undeclared, strict OXT throws a second error that masks the real one (checker check 15)
    stResetCounters
    put 0 into sTorrent
    put 0 into sTorrent2

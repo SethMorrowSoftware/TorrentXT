@@ -13,12 +13,15 @@ sodiumxt/onionxt/coinxt/riptide, another in torrentxt/enetxt/datachannelxt),
 each with real checks the other lacked - sodiumxt's copy famously did not know
 `switch`, so it reported phantom imbalances in dispatchers the other lineage
 parsed fine, and would have hidden a real one. This file is the union of both
-lineages. Do not edit one copy: edit every member's copy identically (they are
-the same bytes), and the suite gate tools/check-checker-drift.py FAILS the
-build if any copy differs from the others, so a fix applied to one member can
-no longer silently miss the suite. tools/test-checker.py at the suite root
-holds the fixture tests for every rule here; extend it in the same change as
-any new rule.
+lineages - and, since 2026-08-15, of a THIRD: the hold-em lineage checker
+(born in Box2Dxt, carried into holde-em as tools/check-holdem-idioms.py),
+whose member-only checks all had shipped-defect provenance and are now checks
+13-21 below; that file is retired. Do not edit one copy: edit every member's
+copy identically (they are the same bytes), and the suite gate
+tools/check-checker-drift.py FAILS the build if any copy differs from the
+others, so a fix applied to one member can no longer silently miss the suite.
+tools/test-checker.py at the suite root holds the fixture tests for every
+rule here; extend it in the same change as any new rule.
 
 The checks, and the engine lesson each encodes:
 
@@ -68,6 +71,99 @@ The checks, and the engine lesson each encodes:
       subscripting a function result (`f(x)["k"]` does not parse).
   12. `put X into Y after Z` - a `put` takes `into` OR `after`/`before`,
       never both. Both dialects.
+  13. A bitwise operator invoked with FUNCTION-CALL syntax and two arguments -
+      `bitXor(a, b)` - .livecodescript only. bitAnd/bitOr/bitXor/bitNot are
+      OPERATORS in this dialect, not functions; the call form is exactly the
+      shape of holde-em's shipped defect (`bitXor(acc, baseConvert(...))`,
+      gotcha H7, which threw double/binary at runtime on its first OXT pass).
+      Only the two-argument call form is refused: the OPERATOR form
+      (`a bitXor b`, `tM bitAnd (bitNot 255)`) stands in ENGINE-PASSED code
+      across box2dxt (the Kit's collision layer bits), nocloud and torrentxt
+      (the onion frame flags), and sodiumxt's examples (tamper flips), so a
+      blanket bitwise refusal - which the hold-em lineage carried as member
+      law - would manufacture violations in the family's most-proven files.
+      holde-em's stricter no-bitwise-at-all convention stays that member's
+      prose law (its playable path uses pure-integer heByteXor).
+  14. A declared local or handler parameter whose FULL name case-insensitively
+      IS an engine token (`local tAb`: `tAb` is the `tab` constant; a param
+      named `id`) - .livecodescript only. Complementary to check 6, which
+      only sees t/p/s/k-prefixed mixed-case spellings at USE sites: this one
+      checks DECLARATION sites, any name, against the hold-em lineage's
+      CURATED token set (which adds cr/lf/crlf/quote/nan/eof and friends).
+      Deliberately NOT the whole RESERVED set: RESERVED's use-site entries
+      are harmless-by-construction over-broad there (check 6 only tests
+      prefixed mixed-case names), but at declaration sites they are live -
+      and the fleet proves some are legal declared names (box2dxt's
+      engine-proven Kit declares `local tV, i, a, lx, ly` in b2kCapsuleVerts,
+      so `a` must not be refused). Found on holde-em's engine (gotcha 2,
+      `tAb` in heByteXor).
+  15. A `catch tErr` whose variable is undeclared (no handler `local`, no
+      parameter, no script-level `local`/`global`) AND whose catch BODY
+      references it - .livecodescript only. On strict OXT the reference
+      throws a SECONDARY error at the moment the catch fires, masking the
+      real failure as an opaque "error in function handler" - invisible on a
+      read, because the catch only misbehaves when it actually fires
+      (holde-em gotcha H8: heProbeSodium/heProbeTorrent/heDeckFromStreamKey
+      all shipped it and blew up only once the sibling extensions were
+      installed). The body-reference condition is the honest scope: the
+      hold-em lineage flagged EVERY undeclared catch variable, but onionxt's
+      capability probes (`catch tError` / `return false`, no reference) have
+      FIRED on real engines - pre-ABI-7 SodiumXT made oxSodiumHasSha3's
+      catch the taken path - and ran green, so binding alone is proven safe
+      and only the reference is the trap.
+  16. A locally-declared COMMAND (`command X` / `on X`) invoked with
+      function-call syntax `X(...)` in EXPRESSION position - .livecodescript
+      only. A command called as a function throws at the call site; the body
+      never runs (holde-em gotcha 7: `put ... heProbeSodium() ...` died with
+      "error in function handler" pointing at the call line). A command
+      STATEMENT with a parenthesised first argument (`heFoo (x), y`) is legal
+      and not flagged; complementary to check 8, which handles the zero-arg
+      statement spelling.
+  17. A parenthesised DYNAMIC property name - `the (expr) of obj` -
+      .livecodescript only. Property names are compile-time tokens; the
+      computed-name form is engine-shaky on OXT (holde-em gotcha H9: v0.14.0
+      stored avatar paths in per-seat props named `"uHeAvatarPath" & N`).
+      Hold the data in ONE property indexed by line/item instead.
+  18. `the message box` used in CODE as a container - .livecodescript only.
+      The container token is `msg`; the dictionary's prose name does not
+      compile (holde-em gotcha 13's family: v0.17.1's report delivery threw
+      at first run on `put gRpt into the message box`).
+  19. A `k`-prefixed constant name used but NEVER declared in the file -
+      .livecodescript only, and the other half of check 4: that one catches a
+      use ABOVE its declaration, this one a use with NO `constant k... = ...`
+      anywhere. LiveCodeScript evaluates the undeclared name as the literal
+      text of its own name, which then flows into a hash or hex decode and
+      throws far downstream (holde-em: nine kKat... names silently broke
+      heTestDealRun when the deal constants were dropped from a paste).
+  20. The dangling else: a single-line `if ... then <stmt>` directly followed
+      by a BARE `else` line - .livecodescript only. The engine binds that
+      else to the single-line if, so its `end if` closes the WRONG frame and
+      the outer block-if surfaces as a baffling "missing end if" at the
+      handler's end, far from the cause (the Box2Dxt lesson the hold-em
+      lineage carried; block balance alone cannot see it).
+  21. A backslash OUTSIDE every string literal that is not a line
+      continuation - .livecodescript only. xTalk has NO string escapes, so a
+      C-style `\"` ends the string at the quote and strands the rest of the
+      intended text as bare tokens (a compile error); the stranded backslash
+      is the reliable static tell, and it is what this flags - so the LEGAL
+      `"\"` (a one-backslash string, common in path normalisation) never
+      false-fires. Shipped once in holde-em's heProbeKit.
+
+One hold-em lineage check is deliberately NOT here, and the reason is
+recorded so it is not "rediscovered": the chunk-of-an-array-element refusal
+(`byte i of tA[j]`, holde-em gotcha H6). The trap is real WHERE IT WAS
+OBSERVED - holde-em's seed-XOR path, chunking FFI-bridged SodiumXT Data,
+where the double/binary throw persisted even after copying the element to a
+local - but as a universal rule it is falsified by engine-passed code in
+four members: riptide chunks `char ... of tRec["signature"]` (harness green
+89/89), onionxt's httpd chunks `item ... of tOut["__resource"]` (served real
+pages in Tor Browser), box2dxt chunks `byte ... of sSheetData[pSheet]` (the
+Kit's sheet slicer, under every game), and nocloud's shipped receive path
+chunks `byte ... of sRxBuf[pStream]`. No static scoping can see the actual
+variable - whether the element holds FFI-bridged binary - and the per-file
+allowlist honesty would require (15+ files) is larger than the rule is
+worth. holde-em's H6 discipline (hex at the edge; chunk plain text) stays
+that member's prose law.
 
 It is a lexer-level checker, NOT a compiler: it neutralizes comments and
 string contents, merges backslash continuations into logical lines, and
@@ -124,6 +220,26 @@ RESERVED = {
     "sin", "size", "space", "sqrt", "stack", "start", "stop", "style", "sum",
     "keys",
 }
+
+# The token set for the DECLARATION-site full-name check (check 14), carried
+# verbatim from the hold-em lineage, which curated it to "tokens a prefixed
+# variable could plausibly spell by accident". Deliberately a SEPARATE set
+# from RESERVED, in both directions: widening RESERVED would change check
+# 6's long-measured use-site behaviour, and reusing RESERVED here would
+# refuse names the engine demonstrably accepts as declarations - RESERVED
+# carries harmless-by-construction over-broad entries (`a`, `an`, `add`...)
+# that check 6 can never reach (it only tests prefixed mixed-case names),
+# but a declaration site reaches all of them, and box2dxt's engine-proven
+# Kit declares `local tV, i, a, lx, ly` (b2kCapsuleVerts, under every game).
+DECLARED_NAME_TOKENS = set("""
+tab cr lf crlf return linefeed formfeed space comma colon quote backslash
+slash null empty nan pi true false zero one two three four five six seven
+eight nine ten up down eof it me id the end then else repeat while until for
+of in is or and not to into after before put get set send exit next pass
+global local constant char byte word line item token element each number
+length offset result target message type name owner rect loc text top bottom
+width height key value sound cursor paint sort merge param params
+""".split())
 
 # Foreign types live in com.livecode.foreign; a .lcb that names one without
 # `use com.livecode.foreign` gets a "not declared" compile error.
@@ -754,6 +870,353 @@ def check_engine_hostile_constructs(path, text):
     return out
 
 
+# --- the hold-em lineage checks (13-21), absorbed 2026-08-15 -----------------
+# All of them run on the CLEANED logical lines (comments stripped, string
+# interiors blanked, continuations merged), and all are .livecodescript only:
+# the traps are xTalk evaluation/parse rules, and LCB is a different language
+# (it even has real string escapes, which would falsify check 21 there).
+
+LCS_HANDLER_KW = ("on", "command", "function", "getprop", "setprop",
+                  "before", "after")
+
+BITWISE_FN_CALL = re.compile(r"\b(bitXor|bitAnd|bitOr|bitNot)\s*\(",
+                             re.IGNORECASE)
+CATCH_VAR = re.compile(r"\bcatch\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+CALL_PAREN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+DYNAMIC_PROP = re.compile(r"\bthe\s*\(", re.IGNORECASE)
+MSGBOX_PROSE = re.compile(r"\bthe\s+message\s+box\b", re.IGNORECASE)
+K_CONST_DECL_LCS = re.compile(r"^\s*constant\s+(k[A-Za-z0-9_]+)\s*=")
+K_CONST_USE = re.compile(r"\b(k[A-Z][A-Za-z0-9_]*)\b")
+SINGLE_LINE_IF = re.compile(r"^if\b.+\bthen\s+\S", re.IGNORECASE)
+
+
+def lcs_handler_decl(s):
+    """Parse a LiveCodeScript handler-opener line: return (kind, name,
+    params_text) or None. `private command foo pA` is a decl; `end foo` is
+    not (callers filter `end` before asking)."""
+    toks = s.split()
+    if not toks:
+        return None
+    i = 0
+    if toks[0].lower() == "private" and len(toks) >= 2 and \
+            toks[1].lower() in ("command", "function"):
+        i = 1
+    if i >= len(toks) or toks[i].lower() not in LCS_HANDLER_KW:
+        return None
+    if i + 1 >= len(toks):
+        return None
+    kind = toks[i].lower()
+    name = toks[i + 1]
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        return None
+    parts = s.split(None, i + 2)
+    params = parts[i + 2] if len(parts) > i + 2 else ""
+    return kind, name, params
+
+
+def decl_names(text):
+    """The names declared by a comma-separated `local`/param list. Splits off
+    reference markers (@), initializers (=) and array subscripts."""
+    out = []
+    for part in text.split(","):
+        name = part.strip().lstrip("@").split("=")[0].split("[")[0].strip()
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            out.append(name)
+    return out
+
+
+def check_bitwise_function_calls(path, cleaned):
+    """`bitXor(a, b)` - the operator written as a two-argument function call.
+    Refused only when the paren group carries a TOP-LEVEL comma: an operator's
+    parenthesised right operand (`tBits bitOr (tL)`, `tM bitAnd (bitNot n)`)
+    can never contain one, so the engine-passed operator forms across the
+    fleet stay legal and the exact shape of holde-em's shipped defect fires."""
+    problems = []
+    for lineno, line in cleaned:
+        for m in BITWISE_FN_CALL.finditer(line):
+            depth = 0
+            arg_comma = False
+            for ch in line[m.end() - 1:]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif ch == "," and depth == 1:
+                    arg_comma = True
+                    break
+            if arg_comma:
+                problems.append(Problem(path, lineno,
+                                "`%s(a, b)` calls the bitwise OPERATOR as a "
+                                "function - not xTalk; write the operator "
+                                "form `a %s b` (holde-em's seed-XOR path "
+                                "shipped this and threw double/binary at "
+                                "runtime)" % (m.group(1), m.group(1))))
+    return problems
+
+
+def check_declared_name_tokens(path, cleaned):
+    """A declared local or handler parameter whose FULL name IS an engine
+    token, any case (`tAb` == the `tab` constant). Declaration sites only:
+    a use site cannot distinguish the variable from the token, which is
+    exactly why the engine silently reads the token."""
+    problems = []
+    vocab = DECLARED_NAME_TOKENS
+    for lineno, line in cleaned:
+        s = line.strip()
+        toks = s.split()
+        if not toks:
+            continue
+        first = toks[0].lower()
+        if first == "local":
+            decl = s[len(toks[0]):]
+        else:
+            hd = lcs_handler_decl(s)
+            if hd is None:
+                continue
+            decl = hd[2]
+        for name in decl_names(decl):
+            if name.lower() in vocab:
+                problems.append(Problem(path, lineno,
+                                "declared name `%s` IS the engine token "
+                                "`%s` - xTalk evaluates it as that token, "
+                                "not a variable; rename it with a "
+                                "distinctive stem (holde-em's tAb -> tWorkA)"
+                                % (name, name.lower())))
+    return problems
+
+
+def check_catch_declared(path, cleaned):
+    """`catch tErr` where tErr is undeclared AND the catch body references
+    it. On strict OXT the reference throws a SECONDARY error the moment the
+    catch fires, masking the real failure - invisible until the try body
+    actually throws, which is why three holde-em probes shipped it. Binding
+    alone (an undeclared catch variable the body never reads) is
+    engine-proven safe - onionxt's capability probes took exactly that path
+    on real engines - so only the reference is flagged.
+
+    Two passes: declarations first (a handler's `local` is a compile-time
+    declaration wherever it sits, and mid-handler `local` is legal LCS, so
+    a single pass would miss a declaration below the try), then the
+    try/catch walk with a frame per open catch so nested tries resolve."""
+    # pass 1: script-level names, and each handler's declared names by span
+    script_names = set()
+    spans = []  # (start_index, end_index_exclusive, declared_set)
+    handler_start = None
+    declared = set()
+    for idx, (lineno, line) in enumerate(cleaned):
+        s = line.strip()
+        toks = s.split()
+        if not toks:
+            continue
+        t0 = toks[0].lower()
+        if handler_start is None:
+            hd = lcs_handler_decl(s)
+            if hd is not None:
+                handler_start = idx
+                declared = set(n.lower() for n in decl_names(hd[2]))
+                continue
+            if t0 in ("local", "global"):
+                for n in decl_names(s[len(toks[0]):]):
+                    script_names.add(n.lower())
+            continue
+        if t0 == "end" and len(toks) >= 2 and \
+                toks[1].lower() not in ("if", "repeat", "switch", "try"):
+            spans.append((handler_start, idx + 1, declared))
+            handler_start = None
+            declared = set()
+            continue
+        if t0 in ("local", "global"):
+            for n in decl_names(s[len(toks[0]):]):
+                declared.add(n.lower())
+    if handler_start is not None:
+        spans.append((handler_start, len(cleaned), declared))
+
+    # pass 2: walk each handler's try/catch structure
+    problems = []
+    for start, end, declared in spans:
+        hd = lcs_handler_decl(cleaned[start][1].strip())
+        hname = hd[1] if hd else "?"
+        depth = 0
+        frames = []  # open catches: (var, catch_lineno, try_depth)
+        for lineno, line in cleaned[start + 1:end]:
+            s = line.strip()
+            toks = s.split()
+            if not toks:
+                continue
+            t0 = toks[0].lower()
+            if t0 == "try":
+                depth += 1
+                continue
+            if t0 == "end" and len(toks) >= 2 and toks[1].lower() == "try":
+                frames = [f for f in frames if f[2] < depth]
+                depth = max(depth - 1, 0)
+                continue
+            if t0 == "catch":
+                frames = [f for f in frames if f[2] != depth]
+                m = CATCH_VAR.match(s)
+                if m and depth > 0:
+                    var = m.group(1)
+                    if var.lower() not in declared and \
+                            var.lower() not in script_names:
+                        frames.append((var, lineno, depth))
+                continue
+            for var, cline, _ in frames:
+                if re.search(r"\b%s\b" % re.escape(var), s, re.IGNORECASE):
+                    problems.append(Problem(path, lineno,
+                                    "catch variable `%s` (caught at line %d "
+                                    "in handler `%s`) is referenced here but "
+                                    "never declared - on strict OXT the "
+                                    "reference throws a second error when "
+                                    "the catch fires, masking the real "
+                                    "failure; declare it (`local %s`)"
+                                    % (var, cline, hname, var)))
+                    frames = [f for f in frames if f[0] != var]
+                    break
+    return problems
+
+
+def check_command_paren_calls(path, cleaned):
+    """A locally-declared COMMAND invoked with function-call syntax in
+    EXPRESSION position (`put ... heProbeSodium() ...`). The engine throws at
+    the call site and the body never runs. The leading-token position is
+    skipped because a command STATEMENT with a parenthesised first argument
+    (`heFoo (x), y`) is legal; only a command name with real text before it
+    is unmistakably inside an expression."""
+    commands = set()
+    functions = set()
+    for _, line in cleaned:
+        hd = lcs_handler_decl(line.strip())
+        if hd is None:
+            continue
+        if hd[0] == "function":
+            functions.add(hd[1].lower())
+        elif hd[0] in ("command", "on"):
+            commands.add(hd[1].lower())
+    suspect = commands - functions
+    problems = []
+    if not suspect:
+        return problems
+    for lineno, line in cleaned:
+        s = line.strip()
+        if lcs_handler_decl(s) is not None:
+            continue
+        for m in CALL_PAREN.finditer(s):
+            if m.group(1).lower() not in suspect:
+                continue
+            before = s[:m.start()].strip()
+            if before == "" or before.split()[-1].lower() in ("then", "else"):
+                continue
+            problems.append(Problem(path, lineno,
+                            "command `%s` is called with function-call "
+                            "syntax `%s(...)` inside an expression - a "
+                            "command called as a function throws at the "
+                            "call site (call it as a statement, or make it "
+                            "a function)" % (m.group(1), m.group(1))))
+    return problems
+
+
+def check_dynamic_property_names(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        if DYNAMIC_PROP.search(line):
+            problems.append(Problem(path, lineno,
+                            "parenthesised dynamic property name (`the "
+                            "(expr) of ...`) - property names are "
+                            "compile-time tokens and the computed form is "
+                            "engine-shaky on OXT; hold the data in ONE "
+                            "property indexed by line/item instead"))
+    return problems
+
+
+def check_message_box_prose(path, cleaned):
+    problems = []
+    for lineno, line in cleaned:
+        if MSGBOX_PROSE.search(line):
+            problems.append(Problem(path, lineno,
+                            "`the message box` is dictionary prose, not a "
+                            "container - the container token is `msg` "
+                            "(`put x into msg`); the prose form throws at "
+                            "runtime on OXT"))
+    return problems
+
+
+def check_undeclared_k_constants(path, cleaned):
+    """A k-prefixed constant name with NO `constant k... = ...` declaration
+    anywhere in the file. LiveCodeScript evaluates the undeclared name as the
+    literal text of its own name and the failure surfaces far downstream.
+    Only names whose second character is UPPERCASE are treated as intended
+    constants (`kFoo` yes, `keyDown` no), matching the family convention.
+    A `constant` line may declare several comma-separated constants
+    (`constant kA = 1, kB = 2` - box2dxt's builder does this throughout),
+    so every `k... =` pair on a declaration line declares its name."""
+    declared = set()
+    for _, line in cleaned:
+        if K_CONST_DECL_LCS.match(line):
+            for name in re.findall(r"\b(k[A-Za-z0-9_]+)\s*=", line):
+                declared.add(name)
+    problems = []
+    seen = set()
+    for lineno, line in cleaned:
+        for name in K_CONST_USE.findall(line):
+            if name not in declared and name not in seen:
+                seen.add(name)
+                problems.append(Problem(path, lineno,
+                                "constant `%s` is used but never declared - "
+                                "LiveCodeScript evaluates it as the literal "
+                                "text %r and the failure surfaces far "
+                                "downstream; add `constant %s = ...` (or "
+                                "complete the paste that carried it)"
+                                % (name, name, name)))
+    return problems
+
+
+def check_dangling_else(path, cleaned):
+    """A single-line `if ... then <stmt>` directly followed by a BARE `else`:
+    the else binds to the single-line if, its `end if` closes the wrong
+    frame, and the outer block-if surfaces as a baffling "missing end if" at
+    the handler's end. Blank (and comment-only) lines between the two do not
+    change the binding, so they are skipped."""
+    problems = []
+    prev = None  # (lineno, stripped) of the last non-blank line
+    for lineno, line in cleaned:
+        s = line.strip()
+        if not s:
+            continue
+        if prev is not None and s.lower() == "else":
+            plow = prev[1]
+            if SINGLE_LINE_IF.match(plow) and not plow.lower().endswith("then"):
+                problems.append(Problem(path, lineno,
+                                "bare `else` after the single-line `if ... "
+                                "then <stmt>` at line %d - the engine binds "
+                                "this else to the single-line if, so its "
+                                "`end if` closes the wrong block; make that "
+                                "if block-form (or put a statement on the "
+                                "else line)" % prev[0]))
+        prev = (lineno, s)
+    return problems
+
+
+def check_stray_backslash(path, cleaned):
+    """A backslash outside every string literal. Cleaned lines have string
+    interiors blanked and continuations merged, so any surviving backslash
+    is stranded code - almost always a C-style `\\"` escape attempt (xTalk
+    has no string escapes: the quote ENDS the string and the rest becomes
+    bare tokens), occasionally a continuation with trailing whitespace. The
+    legal one-backslash string `"\\"` never reaches this check."""
+    problems = []
+    for lineno, line in cleaned:
+        if "\\" in line:
+            problems.append(Problem(path, lineno,
+                            "backslash outside a string literal - xTalk has "
+                            "no string escapes, so a `\\\"` ends the string "
+                            "at the quote and strands the rest as bare "
+                            "tokens; build a literal quote with the `quote` "
+                            "constant, concatenated"))
+    return problems
+
+
 def check_file(path):
     with open(path, "rb") as f:
         raw = f.read()
@@ -778,6 +1241,16 @@ def check_file(path):
     if is_script:
         problems += check_livecodescript_blocks(path, cleaned)
         problems += check_lcs_antipatterns(path, cleaned)
+        # the hold-em lineage checks (13-21) - .livecodescript only
+        problems += check_bitwise_function_calls(path, cleaned)
+        problems += check_declared_name_tokens(path, cleaned)
+        problems += check_catch_declared(path, cleaned)
+        problems += check_command_paren_calls(path, cleaned)
+        problems += check_dynamic_property_names(path, cleaned)
+        problems += check_message_box_prose(path, cleaned)
+        problems += check_undeclared_k_constants(path, cleaned)
+        problems += check_dangling_else(path, cleaned)
+        problems += check_stray_backslash(path, cleaned)
     else:
         problems += check_lcb_module(path, cleaned)
         problems += check_lcb_blocks(path, cleaned)

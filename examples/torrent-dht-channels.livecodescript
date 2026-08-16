@@ -74,11 +74,24 @@ script "dhtChannelsApp"
 -- re-fetches your subscriptions so it stays live. The DHT routing table is saved
 -- on close and reloaded on open for a faster bootstrap.
 --
+-- ANONYMOUS CHANNELS (optional, Tor): click "Anonymous..." on a channel and its
+-- WHOLE feed + every file travel over the channel's own Tor onion service (both
+-- IPs hidden, nothing on the DHT or a magnet), reachable from the channel card
+-- alone - the onion address is derived from the channel's existing ed25519 key.
+-- It composes with Privacy (Tor hides WHERE, cryptoXT hides WHAT + authenticates
+-- WHO). Needs the OnionXT extension (org.openxtalk.library.onion) + cryptoXT + a
+-- local Tor daemon (127.0.0.1:9050/9051 or Tor Browser 9150/9151). Fails closed:
+-- with any piece missing, anon is inert and every public feature works normally.
+-- Plaintext anon hides the route but does NOT authenticate the sender; anon is
+-- only anonymous between the two onion endpoints. See docs/ONIONXT-INTEGRATION-PLAN.md.
+--
 -- HONESTY (the suite convention): the torrent + BEP44 surface this demo drives
 -- is engine-proven (the member selftest and the demo passes recorded in
 -- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
 -- 2026-08-14 - the rebuilt chrome and layout are verified statically; needs an
--- OXT re-pass.
+-- OXT re-pass. The OnionXT anon-channels layer (Model C, built 2026-08-15) is
+-- verified STATICALLY (tools/check-livecodescript.py); every ox* call still needs
+-- an on-engine OXT pass with a running Tor daemon before any runtime claim.
 --
 -- THE LOOK is the suite UI kit, carried verbatim between the marker lines
 -- (master: tools/ui-kit.livecodescript; the drift gate holds every copy
@@ -125,6 +138,58 @@ local sDhtErrHinted     -- array: call-site tag -> "true" once its refusal was l
 local sFeedWait         -- array: followed pubkey -> ms clock when Follow asked for it
 local sFeedHinted       -- array: followed pubkey -> "true" once the no-feed hint ran
 
+-- OnionXT (optional per-channel Tor anonymity, Model C - section 6 of
+-- docs/ONIONXT-INTEGRATION-PLAN.md). When a channel's "anon" flag is set, its
+-- signed feed AND every release travel over the channel's OWN Tor onion service,
+-- never over DHT/BitTorrent (the mutual-exclusion invariant). The onion address
+-- is derived from the channel's existing ed25519 pubkey (section 6.1), so a
+-- follower reaches it from the channel card alone. All of this is inert unless
+-- sHasOnion, and every anon action fails closed. The onion identity is the
+-- channel's OWN key - no new key is minted.
+local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once at start)
+local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
+local sOnionIdentityOk  -- "true" once the offline seed<->pubkey byte-compare passed (section 6.1)
+local sOnionTriedTB     -- "true" once we retried the Tor Browser control port pair
+local sFollowAnon       -- array: followed pubkey -> "true" if we follow it ANONYMOUSLY (over Tor)
+local sFollowSvc        -- array: followed pubkey -> the svc= onion from its feed (fallback address)
+-- publisher: one deterministic onion service per anon channel, keyed by pubkey hex
+local sChanService      -- array: pubkey -> OnionXT service handle
+local sChanServiceAddr  -- array: pubkey -> the channel's .onion address
+local sChanServicePort  -- array: pubkey -> the ephemeral loopback port the service maps to
+local sFeedStreams      -- array: pubkey -> return-delimited list of subscribed follower stream handles
+-- publisher: the in-memory serve map (relId -> file), keyed "pub:relId". NOT
+-- persisted (the demo prunes stranded onion releases on load; section 6.5).
+local sOnionServe       -- array: "pub:relId" -> absolute path of the file to stream
+local sOnionServeEnc    -- array: "pub:relId" -> kFlagEnc if that release is a cryptoXT .enc
+local sOnionServeName   -- array: "pub:relId" -> the original filename (for the header)
+local sOnionServeTotal  -- array: "pub:relId" -> total bytes to stream
+-- follower: the live dial per anon channel we follow
+local sFollowStream     -- array: followed pubkey -> the open feed-fetch stream (empty = reconnect)
+-- per-stream state, keyed by the OnionXT stream handle (both serve + fetch sides)
+local sOnRole           -- array: stream -> "serve-req"/"serve-feed"/"serve-file"/"follow-feed"/"download"
+local sOnPub            -- array: stream -> the channel pubkey this stream serves or fetches
+local sOnReq            -- array: stream -> accumulated inbound BTXC request bytes (serve side)
+local sOnBuf            -- array: stream -> accumulated inbound BTXF/BTXO bytes (fetch side)
+-- per send-stream state (re-open-per-read for fan-out; section 3.3 step 6b)
+local sTxPath           -- array: stream -> path of the file we are streaming out
+local sTxPos            -- array: stream -> next byte offset to read (0-based)
+local sTxRemaining      -- array: stream -> bytes still to send
+local sTxName           -- array: stream -> the release's display name (for the log)
+local sTxDeadline       -- array: stream -> the milliseconds of the last send (idle watchdog)
+-- per receive-stream state (section 3.3 receiver)
+local sRxBuf            -- array: stream -> reassembly buffer (drained + compacted each call)
+local sRxState          -- array: stream -> "header" / "body" / "done"
+local sRxTmp            -- array: stream -> temp output path we are writing into
+local sRxName           -- array: stream -> real (sanitized) filename to save as
+local sRxEnc            -- array: stream -> nonzero if the payload is a cryptoXT .enc
+local sRxTotal          -- array: stream -> total payload bytes expected
+local sRxGot            -- array: stream -> payload bytes written so far
+local sRxKey            -- array: stream -> 32-byte file key (encrypted receive), else empty
+local sRxSave           -- array: stream -> save folder for this receive
+local sRxDeadline       -- array: stream -> the milliseconds of the last data (idle watchdog)
+-- the parallel in-script transfers model for onion rows (no torrent handle exists)
+local sOnionXfer        -- array: stream -> {name, dir("up"/"down"), got, total, state}
+
 -- The user-facing release version: shown in the OS title bar and the startup
 -- log line, so a bug report always says which build it came from.
 constant kChAppVersion = "1.0.0"
@@ -132,7 +197,7 @@ constant kChAppVersion = "1.0.0"
 -- Bump this whenever the generated UI changes. chBuild rebuilds the controls when
 -- the stack's stored version differs, so updating the script in a saved stack
 -- picks up the new layout instead of keeping the old one.
-constant kUiVersion = "channels-kit2-1"
+constant kUiVersion = "channels-kit2-2"
 -- prefs file header: an 8-byte magic, then a 1-byte mode ("P" plain / "E" sealed).
 -- A SEALED file is [magic]["E"][salt 16][sxSecretBox], the same 16-byte-salt +
 -- Argon2id convention cryptoXT's own file-encrypt demo uses.
@@ -152,6 +217,42 @@ constant kChRowErr = "176,58,46"        -- errored transfer (kUiBad's value)
 constant kChRowPaused = "138,146,158"   -- paused transfer (kUiMuted's value)
 constant kChRowPosted = "23,128,63"     -- a file YOU posted (kUiOk's value)
 constant kChRowDown = "43,108,196"      -- a file you downloaded (family accent)
+constant kChRowOnion = "0,150,150"      -- an onion (Tor) transfer row (teal; section 6.8)
+
+-- ---- OnionXT (optional Tor anonymity) constants ------------------------------
+-- Model C: an anon channel's feed AND files ride an OnionXT onion stream (both
+-- IPs hidden) and NO torrent / DHT put is ever made for them. Requires OnionXT +
+-- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
+-- ABI (onionxt/docs/05-api-reference.md); verified statically here, needs an
+-- on-engine OXT pass with a running Tor daemon before any runtime claim. OXT
+-- resolves constants by lexical position, so they are all declared here, once,
+-- before first use. See docs/ONIONXT-INTEGRATION-PLAN.md sections 3 and 6.
+constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync
+constant kOnionVer = 1                 -- file-stream protocol version
+constant kOnionVPort = 80              -- the onion service's advertised virtual port
+constant kOnionChunk = 65536           -- 64 KiB: max payload bytes in one data frame
+constant kFlagEnc = 1                  -- header flags bit0: payload is a cryptoXT .enc
+constant kOnionPumpTick = 15           -- ms between send-pump frames (never a tight loop)
+constant kOnionSendTimeout = 30000     -- ms idle watchdog, sender
+constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slow)
+constant kOnionPublishTimeout = 90000  -- ms to wait for the onion descriptor to upload
+constant kOnionMaxName = 1024          -- reject a header nameLen beyond this (anti-DoS)
+constant kOnionMaxTotal = 8589934592   -- 8 GiB payload ceiling; reject a larger header
+constant kOnionFeedCap = 65536         -- reject a BTXF feed-value length beyond this (anti-DoS)
+constant kAnonSizeWarn = 268435456     -- 256 MiB: warn (never block) above this on an anon publish
+constant kTorSocksPort = "9050"        -- system/standalone tor
+constant kTorControlPort = "9051"
+constant kTorSocksPortTB = "9150"      -- Tor Browser
+constant kTorControlPortTB = "9151"
+-- The channels request layer (section 6.4), one level above the section-3.3
+-- file framing. A follower sends a BTXC request; the publisher answers with a
+-- BTXF feed frame (repeatable, for live push) and/or a BTXO file stream.
+constant kChanReqMagic = "BTXC"        -- 4 ASCII bytes: channels request magic
+constant kChanReqVer = 1
+constant kFeedFrameMagic = "BTXF"      -- 4 ASCII bytes: feed-frame magic
+constant kFeedFrameVer = 1
+constant kVerbFeed = 1                 -- BTXC verb: fetch the signed feed
+constant kVerbFile = 2                 -- BTXC verb: fetch a release's bytes
 
 -- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
 -- The family look as one carried block: the kit owns colors, chrome, and
@@ -561,6 +662,9 @@ on mouseUp
       case "chPrivacy"
          chSetPrivacy
          break
+      case "chAnon"
+         chSetAnon
+         break
       case "chFollow"
          chFollow
          break
@@ -721,9 +825,12 @@ command chBuild
    set the traversalOn of field "chMyKey" to false
    uiButton "chCopyKey", "Copy", "368,106,452,130"
    uiButton "chRename", "Rename", "458,106,552,130"
-   uiButton "chPublish", "Publish a File...", "16,136,250,158"
-   uiButton "chPrivacy", "Privacy...", "256,136,372,158"
-   uiWrap "chNowPub", "Not publishing yet.", "378,140,580,158", 9
+   uiButton "chPublish", "Publish a File...", "16,136,178,158"
+   uiButton "chPrivacy", "Privacy...", "184,136,286,158"
+   -- the per-channel anonymity control, beside Privacy (they compose - section 6.6).
+   -- Built in the adopter's own builder section, NOT the ui-kit block.
+   uiButton "chAnon", "Anonymous...", "292,136,396,158"
+   uiWrap "chNowPub", "Not publishing yet.", "402,140,580,158", 9
    set the foregroundColor of field "chNowPub" to kUiInkSoft
    uiSection "chSecSubs", "2.  Channels you follow - download what they share", "16,168,580,188"
    uiInput "chFollowKey", "16,192,400,216"
@@ -803,6 +910,10 @@ command chBuild
    set the textSize of field "chMyKey" to 9
    set the textSize of field "chFollowKey" to 9
    set the textSize of field "chMagnetField" to 9
+   -- the live Tor status pill sits in the title band (left of the Lock button)
+   -- and is created + repainted ONLY by chOnionPill (via the kit's uiPill), so
+   -- its states can never disagree. Built here so chAddTips can set its tooltip.
+   chOnionPill
    chAddTips
    set the uUiVersion of this stack to kUiVersion
    unlock screen
@@ -839,6 +950,8 @@ command chAddTips
    set the tooltip of button "chRename" to "Give the active channel a friendly display name its followers will see."
    set the tooltip of button "chPublish" to "Pick a folder. It is packaged, seeded, and added to the active channel's feed."
    set the tooltip of button "chPrivacy" to "Set a passphrase to encrypt this channel's feed AND the files you publish to it."
+   set the tooltip of button "chAnon" to "Make this whole channel anonymous: its feed AND files travel over Tor (both IPs hidden, no DHT/magnet), reachable from the channel card alone. Needs OnionXT + cryptoXT + a local Tor daemon. Compose it with Privacy for encrypted contents too."
+   set the tooltip of field "chTor" to "Status of your local Tor connection. 'ready' means anonymous channels can publish and be reached."
    set the tooltip of field "chFollowKey" to "Paste someone's channel card or 64-character address, then click Follow."
    set the tooltip of button "chFollow" to "Subscribe to that channel and fetch its signed list of files."
    set the tooltip of button "chRefresh" to "Re-fetch the latest files from every channel you follow."
@@ -875,6 +988,14 @@ command chHelp
    put tMsg & "   channel encrypts BOTH its feed AND the files you publish (the file is encrypted before" & return into tMsg
    put tMsg & "   it is shared; downloads decrypt automatically). Share the passphrase out-of-band, never" & return into tMsg
    put tMsg & "   on the DHT. It still does not hide your IP, and private publishing is one file at a time." & return & return into tMsg
+   put tMsg & "   ANONYMOUS (Tor): click Anonymous to make a whole channel travel over Tor - its file" & return into tMsg
+   put tMsg & "   list AND every file ride the channel's own onion service, both IPs hidden, nothing on" & return into tMsg
+   put tMsg & "   the DHT or a magnet, reachable from the channel card alone. Needs OnionXT + cryptoXT +" & return into tMsg
+   put tMsg & "   a local Tor daemon. The onion is bound to the channel key, so the address and the" & return into tMsg
+   put tMsg & "   channel identity are linkable by design (use a separate channel for an unlinkable one)." & return into tMsg
+   put tMsg & "   Tor is slow for large media, and PLAINTEXT anon hides the route but does NOT" & return into tMsg
+   put tMsg & "   authenticate the sender - add Privacy (a passphrase) for encrypted, authenticated" & return into tMsg
+   put tMsg & "   contents. The publisher must stay online for followers to reach it." & return & return into tMsg
    put tMsg & "2) CHANNELS YOU FOLLOW - paste someone's channel card to see their latest files. Pick" & return into tMsg
    put tMsg & "   one and Download; it transfers from them while they are online. Every entry is signed," & return into tMsg
    put tMsg & "   so it is tamper-proof. For a PRIVATE channel, Follow asks for its passphrase." & return & return into tMsg
@@ -908,12 +1029,34 @@ command chStart
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    -- can this build encrypt? gates the optional private-channel feature
    put chCanEncrypt() into sCanEncrypt
+   -- probe OnionXT (needs cryptoXT) and run the OFFLINE seed<->pubkey byte-compare
+   -- (section 6.1) BEFORE reading channels: a mismatch disables anon entirely, so
+   -- a channel's derived .onion can never be wrong. Both are one-shot at start.
+   put chHasOnion() into sHasOnion
+   if sHasOnion then
+      put chVerifyOnionIdentity() into sOnionIdentityOk
+      if not sOnionIdentityOk then
+         chLog "Anonymous channels are DISABLED: the libtorrent/libsodium ed25519 identities did not byte-match offline (or this SodiumXT is older than ABI 7). Public channels are unaffected."
+      end if
+   else
+      put false into sOnionIdentityOk
+   end if
+   put empty into sFollowAnon
+   put empty into sFollowSvc
    chEnsureIdentity
    chLoadFollows
+   chPruneStrandedAnon     -- an in-memory serve map is empty after a restart (section 6.5)
    chUpdateNowPub
    chUpdateLockButton      -- reflect whether the saved identity is passphrase-locked
    if not sCanEncrypt then
       chLog "Note: cryptoXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
+   end if
+   -- bring up the Tor control link (non-blocking). The anon path is completely
+   -- inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
+   if sHasOnion then
+      chOnionStart
+   else
+      chOnionPill
    end if
    chLog "Decentralized Channels " & kChAppVersion & " ready. DHT bootstrapping - give it a few seconds of peers before publishing or following."
    put "true" into sPolling
@@ -933,7 +1076,9 @@ function chLooksLikeCard pText
    if pText contains "|" then
       put the itemDelimiter into tSavedID
       set the itemDelimiter to "|"
-      put chTrim(the last item of pText) into tKey
+      -- the key is ALWAYS item 2 ("Name | key" or "Name | key | anon"); names
+      -- never contain "|" (chRenameChannel strips it), so item 2 is unambiguous
+      put chTrim(item 2 of pText) into tKey
       set the itemDelimiter to tSavedID
    end if
    if the number of chars of tKey is not 64 then
@@ -1006,11 +1151,13 @@ command chEnsureIdentity
          put the uDhtSeed of this stack into sChannels[1]["seed"]
          put the uChannelName of this stack into sChannels[1]["name"]
          put "" into sChannels[1]["releases"]
+         put "" into sChannels[1]["anon"]
       else
          put btDhtKeypair("") into tKey
          put tKey["seed"] into sChannels[1]["seed"]
          put "" into sChannels[1]["name"]
          put "" into sChannels[1]["releases"]
+         put "" into sChannels[1]["anon"]
       end if
    end if
    put (the uActiveChannel of this stack) into sActive
@@ -1044,6 +1191,11 @@ command chActivate pIndex
    set the text of field "chMyKey" to sPub
    chUpdateChannelMenu
    chUpdateNowPub
+   -- if the active channel is anonymous, bring its onion service up (a no-op when
+   -- Tor is not ready yet - chOnionBringUpServices retries after bootstrap)
+   if chIsAnonChannel(sActive) then
+      chOnionServiceFor sActive
+   end if
 end chActivate
 
 -- repopulate the option menu with the channel names, active one selected
@@ -1060,6 +1212,9 @@ command chUpdateChannelMenu
       end if
       if sChannels[tI]["pass"] is not empty then
          put tName && "(private)" into tName
+      end if
+      if sChannels[tI]["anon"] is "true" then
+         put tName && "(anon)" into tName
       end if
       put tName & return after tItems
    end repeat
@@ -1086,6 +1241,7 @@ command chNewChannel
    put tKey["seed"] into sChannels[tN]["seed"]
    put ("Channel " & tN) into sChannels[tN]["name"]
    put "" into sChannels[tN]["releases"]
+   put "" into sChannels[tN]["anon"]
    chSaveChannels
    chActivate tN
    chLog "Created a new channel. Rename it, then Publish a file to it - your other channels stay live."
@@ -1163,6 +1319,11 @@ command chDeleteChannel
    if it is not "Delete" then
       exit chDeleteChannel
    end if
+   -- if the deleted channel is anonymous, tear its onion service down first
+   -- (section 6.3): stop serving it and drop its subscribers
+   if chIsAnonChannel(sActive) then
+      chOnionWithdrawService sPub
+   end if
    -- rebuild the array without the active channel, keeping 1..N contiguous
    put empty into tNew
    put 0 into tIdx
@@ -1173,6 +1334,9 @@ command chDeleteChannel
          put sChannels[tI]["name"] into tNew[tIdx]["name"]
          put sChannels[tI]["releases"] into tNew[tIdx]["releases"]
          put sChannels[tI]["pass"] into tNew[tIdx]["pass"]
+         -- REQUIRED (section 6.2): copy anon too, else deleting any channel
+         -- silently clears the anon flag of every survivor
+         put sChannels[tI]["anon"] into tNew[tIdx]["anon"]
       end if
    end repeat
    put tNew into sChannels
@@ -1196,10 +1360,27 @@ command chLoadFollows
          put empty into sFollowPass
       end try
    end if
+   -- restore which follows are ANONYMOUS (over Tor). Backward-compat (section
+   -- 6.2 #17): an old saved stack has no uFollowAnon, so this defaults empty.
+   put empty into sFollowAnon
+   put the uFollowAnon of this stack into tEnc
+   if tEnc is not empty then
+      try
+         put arrayDecode(tEnc) into sFollowAnon
+      catch tErr
+         put empty into sFollowAnon
+      end try
+   end if
    chRefreshSubs
    repeat for each line tKey in sFollows
       if tKey is not empty then
-         chDhtGetChecked tKey, "load"
+         -- an anon follow is fetched over the onion, NEVER via btDhtGetMutable
+         -- (which would leak our follow interest + real IP; section 6.7 guard 4)
+         if sFollowAnon[tKey] is "true" then
+            chOnionFollowFetch tKey
+         else
+            chDhtGetChecked tKey, "load"
+         end if
       end if
    end repeat
 end chLoadFollows
@@ -1223,6 +1404,9 @@ end chDhtGetChecked
 command chStop
    local tErr
    put "false" into sPolling
+   -- tear the onion subsystem down BEFORE btStopSession (all idempotent): close
+   -- every stream, remove every service, disconnect control, sweep receive temps.
+   chOnionStop
    -- try-guarded (fleet-audit fix): shutdownRequest can run this while the
    -- engine is already tearing extensions down, and a throw here would abort
    -- the quit path - losing the prefs flush below. The teardown and the
@@ -1340,6 +1524,7 @@ command chPrefLoad
    set the uActiveChannel of this stack to tA["uActiveChannel"]
    set the uFollows of this stack to tA["uFollows"]
    set the uFollowPass of this stack to tA["uFollowPass"]
+   set the uFollowAnon of this stack to tA["uFollowAnon"]
    set the uDhtState of this stack to tA["uDhtState"]
 end chPrefLoad
 
@@ -1354,6 +1539,7 @@ command chPrefSave
    put the uActiveChannel of this stack into tA["uActiveChannel"]
    put the uFollows of this stack into tA["uFollows"]
    put the uFollowPass of this stack into tA["uFollowPass"]
+   put the uFollowAnon of this stack into tA["uFollowAnon"]
    put the uDhtState of this stack into tA["uDhtState"]
    put arrayEncode(tA) into tBody
    if sVaultPass is not empty and sCanEncrypt then
@@ -1437,6 +1623,7 @@ command chDashOnce
       exit chDashOnce
    end if
    chRefreshTransfers
+   chOnionPill      -- keep the live Tor pill (bootstrap %) current, 1 Hz
    -- the Follow watchdog (fleet-audit fix): "Fetching their feed..." used to
    -- wait in silence forever. One spoken diagnosis per followed key once its
    -- window passes; the fetch itself keeps retrying on the 60 s tick.
@@ -1445,6 +1632,14 @@ command chDashOnce
       if sFeedHinted[tKey] is not "true" and (tNow - sFeedWait[tKey]) > (kChFeedHintSecs * 1000) then
          put "true" into sFeedHinted[tKey]
          chLog "* still nothing from" && chShortKey(tKey) && "after" && kChFeedHintSecs && "s - wrong code? publisher offline? DHT still warming up (watch the node count)? Still watching for it."
+         -- section 6.8 stripped-tag mitigation: a public follow that never answers
+         -- over the DHT might be an onion-only channel followed from an OLD 2-field
+         -- card. Probe its onion once (fail-closed, no misleading placeholder); a
+         -- feed over Tor promotes it to anon (chApplyAnonFeed), else nothing changes.
+         if sHasOnion and sOnionIdentityOk and sFollowAnon[tKey] is not "true" and sFollowStream[tKey] is empty then
+            chLog "  if" && chShortKey(tKey) && "is an anonymous channel, re-copy its current card (it now carries an anon tag). Trying its onion once..."
+            chOnionFollowFetch tKey
+         end if
       end if
    end repeat
    send "chDashOnce" to me in 1000 milliseconds
@@ -1459,8 +1654,14 @@ command chChannelTick
    end if
    if sSession is not 0 and sSession is not empty then
       repeat with tI = 1 to chChannelCount()
-         put chBuildFeed(sChannels[tI]["name"], sChannels[tI]["releases"]) into tFeed
          put btDhtKeypair(sChannels[tI]["seed"]) into tKp
+         -- ANON channel (section 6.7 guard 3): NEVER btDhtPutMutable - its feed
+         -- lives on the onion. Refresh live subscribers over Tor instead.
+         if chIsAnonChannel(tI) then
+            chOnionPushFeed tKp["publicKey"]
+            next repeat
+         end if
+         put chBuildFeed(sChannels[tI]["name"], sChannels[tI]["releases"]) into tFeed
          -- encrypted for private channels; skip a private one we cannot encrypt
          -- rather than ever re-announcing it in the clear (fail-closed)
          put chFeedValue(tFeed, sChannels[tI]["pass"], tKp["publicKey"]) into tVal
@@ -1478,9 +1679,19 @@ command chChannelTick
       end repeat
       repeat for each line tKey in sFollows
          if tKey is not empty then
-            chDhtGetChecked tKey, "tick"
+            -- an anon follow re-pulls over the onion (only when its feed stream
+            -- has dropped); a public follow re-pulls over the DHT as before
+            if sFollowAnon[tKey] is "true" then
+               if sFollowStream[tKey] is empty then
+                  chOnionFollowFetch tKey
+               end if
+            else
+               chDhtGetChecked tKey, "tick"
+            end if
          end if
       end repeat
+      -- bring anon services online after a Tor restart / bootstrap (no-op when up)
+      chOnionBringUpServices
    end if
    send "chChannelTick" to me in 60000 milliseconds
 end chChannelTick
@@ -1493,6 +1704,13 @@ command chPublishFile
    local tPath, tParent, tTitle, tData, tH, tHash, tMagnet, tRel, tOrig, tEnc, tErr
    if sSession is 0 then
       chLog "No session."
+      exit chPublishFile
+   end if
+   -- ANON channel (section 6.7 guard 1): the whole clearnet body below is
+   -- UNREACHABLE. An anon release is streamed over the onion on demand, never
+   -- packaged as a torrent - no btCreateTorrent / btAddTorrentFile / magnet.
+   if chIsAnonChannel(sActive) then
+      chOnionPublishFile
       exit chPublishFile
    end if
    if sChannels[sActive]["pass"] is not empty then
@@ -1617,6 +1835,13 @@ command chUpdateNowPub
    if sChannels[sActive]["pass"] is not empty then
       put tMsg && "[PRIVATE: file list hidden]" into tMsg
    end if
+   if chIsAnonChannel(sActive) then
+      if sChanService[sPub] is not empty and chOnionReadyNow() then
+         put tMsg && "[ANON: served over Tor]" into tMsg
+      else
+         put tMsg && "[ANON: served over Tor - service offline]" into tMsg
+      end if
+   end if
    if tTotal > 1 then
       put tMsg && "(" & tTotal & " total)" into tMsg
    end if
@@ -1629,9 +1854,14 @@ command chCopyKey
       exit chCopyKey
    end if
    -- copy a "Name | key" channel card; the Follow box accepts either that or a
-   -- bare key, so the recipient sees who they are following, not just a hex blob
+   -- bare key, so the recipient sees who they are following, not just a hex blob.
+   -- An ANON channel appends "| anon" (section 6.8) so the follower fetches it
+   -- over Tor, not the DHT - the card always keeps its Name field first, so the
+   -- key stays item 2 even when the name is blank.
    put sMyName into tName
-   if tName is empty then
+   if chIsAnonChannel(sActive) then
+      put tName & " | " & sPub & " | anon" into tCard
+   else if tName is empty then
       put sPub into tCard
    else
       put tName & " | " & sPub into tCard
@@ -1643,16 +1873,22 @@ end chCopyKey
 
 -- ---- subscriptions / unified feed --------------------------------------------
 command chFollow
-   local tKey, tRaw, tPass, tDup
+   local tKey, tRaw, tPass, tDup, tCardAnon
    if sSession is 0 then
       chLog "No session."
       exit chFollow
    end if
-   -- accept a bare 64-hex key OR a shared "Name | key" channel card
+   -- accept a bare 64-hex key OR a shared "Name | key" / "Name | key | anon" card.
+   -- The key is ALWAYS item 2 when a "|" is present; item 3 "anon" marks it as an
+   -- anonymous channel to follow over Tor (section 6.8).
    put chTrim(field "chFollowKey") into tRaw
+   put "" into tCardAnon
    if tRaw contains "|" then
       set the itemDelimiter to "|"
-      put chTrim(the last item of tRaw) into tRaw
+      if the number of items of tRaw >= 3 and chTrim(item 3 of tRaw) is "anon" then
+         put "true" into tCardAnon
+      end if
+      put chTrim(item 2 of tRaw) into tRaw
    end if
    put toLower(tRaw) into tKey
    if the number of chars of tKey is not 64 then
@@ -1661,6 +1897,12 @@ command chFollow
    end if
    if tKey is sPub then
       chLog "That is your own channel."
+      exit chFollow
+   end if
+   -- an anon card is un-followable without OnionXT: refuse with a clear reason
+   -- rather than silently doing a DHT get for an onion-only channel
+   if tCardAnon is "true" and not sHasOnion then
+      chLog "That is an anonymous (Tor) channel, but OnionXT + cryptoXT are not installed here - it cannot be followed on this machine. Public channels are unaffected."
       exit chFollow
    end if
    put (tKey is among the lines of sFollows) into tDup
@@ -1673,6 +1915,11 @@ command chFollow
    put it into tPass
    put tPass into sFollowPass[tKey]
    set the uFollowPass of this stack to arrayEncode(sFollowPass)
+   -- record + persist whether this follow is anonymous, in parallel to the
+   -- passphrases (section 6.2). A stripped card (no "| anon") defaults public;
+   -- the chDashOnce watchdog probes the onion for a silent public follow.
+   put tCardAnon into sFollowAnon[tKey]
+   set the uFollowAnon of this stack to arrayEncode(sFollowAnon)
    if not tDup then
       if sFollows is empty then
          put tKey into sFollows
@@ -1684,9 +1931,15 @@ command chFollow
    chPrefSave
    put empty into field "chFollowKey"
    chRefreshSubs
-   chDhtGetChecked tKey, "follow"
-   -- arm the no-feed watchdog for THIS key: cleared when its dhtMutableItem
-   -- arrives (or on Unfollow), hinted once by chDashOnce if it never does
+   -- fetch the feed the right way: an anon follow DIALS the onion (never the DHT,
+   -- which would publish our follow interest + real IP - section 6.7 guard 4)
+   if tCardAnon is "true" then
+      chOnionFollowFetch tKey
+   else
+      chDhtGetChecked tKey, "follow"
+   end if
+   -- arm the no-feed watchdog for THIS key: cleared when its feed arrives (over
+   -- the DHT or the onion) or on Unfollow, hinted once by chDashOnce if it never does
    put the milliseconds into sFeedWait[tKey]
    delete variable sFeedHinted[tKey]
    if tDup then
@@ -1703,7 +1956,15 @@ command chRefreshAll
    end if
    repeat for each line tKey in sFollows
       if tKey is not empty then
-         chDhtGetChecked tKey, "refresh"
+         -- anon follows re-pull over the onion (reconnecting if the feed stream
+         -- dropped); public follows re-pull over the DHT
+         if sFollowAnon[tKey] is "true" then
+            if sFollowStream[tKey] is empty then
+               chOnionFollowFetch tKey
+            end if
+         else
+            chDhtGetChecked tKey, "refresh"
+         end if
       end if
    end repeat
    chLog "Refreshing all followed channels..."
@@ -1735,6 +1996,15 @@ command chUnfollow
    set the uFollows of this stack to sFollows
    put empty into sFollowFeeds[tKey]
    put empty into sFollowPass[tKey]
+   -- an anonymous follow also has a live onion stream and stored fallback address
+   -- to drop, and its anon flag to clear + persist
+   if sFollowStream[tKey] is not empty then
+      chOnionCloseStream sFollowStream[tKey]
+   end if
+   delete variable sFollowStream[tKey]
+   delete variable sFollowAnon[tKey]
+   delete variable sFollowSvc[tKey]
+   set the uFollowAnon of this stack to arrayEncode(sFollowAnon)
    -- a pending no-feed watchdog for this key would otherwise hint later
    -- about a channel we no longer follow
    delete variable sFeedWait[tKey]
@@ -1757,6 +2027,13 @@ command chDownloadSelected
    end if
    put sFeedMag[tL] into tMag
    put sFeedTitle[tL] into tTitle
+   -- an ANON release carries an "onion:<relId>" locator: stream it over Tor,
+   -- NEVER btAddMagnet (section 6.5 / 6.7 guard 3). The .onion is derived from
+   -- the channel pubkey (sFeedKey[tL]); the locator only names the release.
+   if tMag begins with "onion:" then
+      chOnionDownload sFeedKey[tL], (char 7 to -1 of tMag), tTitle, sFeedEnc[tL], sFeedOrigName[tL]
+      exit chDownloadSelected
+   end if
    if tMag is empty or not (tMag begins with "magnet:") then
       chLog "That channel's feed has not arrived yet - try Refresh, and give the DHT a few seconds."
       exit chDownloadSelected
@@ -1796,6 +2073,10 @@ command chCopySelectedMagnet
       chLog "Nothing to copy yet for that row."
       exit chCopySelectedMagnet
    end if
+   if tMag begins with "onion:" then
+      chLog "This is an anonymous release; it has no magnet link (it streams over Tor). Copy the channel card to share the channel."
+      exit chCopySelectedMagnet
+   end if
    set the clipboardData["text"] to tMag
    uiCopyFlash "chCopyMag"
    chLog "Copied the magnet to the clipboard."
@@ -1803,7 +2084,7 @@ end chCopySelectedMagnet
 
 -- Rebuild the unified, signed release feed across every channel we follow.
 command chRefreshSubs
-   local tKey, tFeed, tL, tName, tRel, tTitle, tMag, tRows, tLineNum, tSelMag, tEmpty, tErr
+   local tKey, tFeed, tL, tName, tRel, tTitle, tMag, tRows, tLineNum, tSelMag, tEmpty, tErr, tRelCount
    put chSelectedMagnet() into tSelMag
    put "" into tRows
    put 0 into tLineNum
@@ -1833,7 +2114,21 @@ command chRefreshSubs
             exit repeat
          end if
       end repeat
+      -- stash the feed's svc= onion (section 6.1 fallback address); harmless for
+      -- a public feed, which never carries one
+      repeat for each line tL in tFeed
+         if tL begins with "svc=" then
+            put char 5 to -1 of tL into sFollowSvc[tKey]
+            exit repeat
+         end if
+      end repeat
+      -- tag an anonymous follow's rows (section 6.8); a connecting/offline
+      -- placeholder name already says "anonymous", so do not double-tag it
+      if sFollowAnon[tKey] is "true" and not (tName contains "anon") then
+         put tName && "(anon)" into tName
+      end if
       -- one row per "r=title TAB magnet" release line
+      put 0 into tRelCount
       repeat for each line tL in tFeed
          if tL begins with "r=" then
             set the itemDelimiter to tab
@@ -1841,6 +2136,7 @@ command chRefreshSubs
             put item 1 of tRel into tTitle
             put item 2 of tRel into tMag
             add 1 to tLineNum
+            add 1 to tRelCount
             put tKey into sFeedKey[tLineNum]
             put tMag into sFeedMag[tLineNum]
             put tTitle into sFeedTitle[tLineNum]
@@ -1854,6 +2150,15 @@ command chRefreshSubs
             end if
          end if
       end repeat
+      -- an ANON follow with no release rows (its name= is a connecting/offline
+      -- placeholder, or the channel has published nothing) still needs to be
+      -- VISIBLE - a name=-only feed would otherwise render no row. Public follows
+      -- keep their exact prior rendering (this branch is anon-only).
+      if sFollowAnon[tKey] is "true" and tRelCount is 0 then
+         add 1 to tLineNum
+         put tKey into sFeedKey[tLineNum]
+         put tName & tab & "(no releases yet)" & tab & chShortKey(tKey) & return after tRows
+      end if
    end repeat
    if the last char of tRows is return then
       delete the last char of tRows
@@ -1887,7 +2192,7 @@ end chRefreshSubs
 -- ---- transfers dashboard -----------------------------------------------------
 command chRefreshTransfers
    local tCount, tI, tH, tS, tRows, tPct, tDown, tUp, tLineNum, tD, tNodes, tDht, tKind
-   local tColors, tErr, tSelH, tSelLine, tSource, tDispName, tIH
+   local tColors, tErr, tSelH, tSelLine, tSource, tDispName, tIH, tK, tOx, tOxState
    if sSession is 0 or sSession is empty then
       exit chRefreshTransfers
    end if
@@ -1942,6 +2247,23 @@ command chRefreshTransfers
           chProgressBar(tPct) & tab & tS["numPeers"] & return after tRows
       add tS["downloadRate"] to tDown
       add tS["uploadRate"] to tUp
+   end repeat
+   -- append the onion (Tor) transfer rows AFTER the swarm rows, before the empty
+   -- check (section 6.8). These have no torrent handle - their whole progress is
+   -- the in-script sOnionXfer model - so the source column reads "Onion" (teal)
+   -- and the mode is never visually confused with a swarm transfer.
+   repeat for each key tK in sOnionXfer
+      put sOnionXfer[tK] into tOx
+      add 1 to tLineNum
+      put kChRowOnion into tColors[tLineNum]
+      put chOnionXferState(tOx) into tOxState
+      if tOx["total"] is empty or tOx["total"] is 0 or tOx["state"] is "connecting" then
+         put 0 into tPct
+      else
+         put (the round of (tOx["got"] / tOx["total"] * 1000) / 10) into tPct
+      end if
+      put "Onion" & tab & chTrunc(tOx["name"], 21) & tab & tOxState & tab & \
+          chProgressBar(tPct) & tab & "-" & return after tRows
    end repeat
    if the last char of tRows is return then
       delete the last char of tRows
@@ -2059,6 +2381,9 @@ end chShowFilesForSelection
 
 -- Add any magnet link or 40/64-char info-hash directly, not only the releases
 -- shared by channels you follow. The download lands in the same default folder.
+-- Intentionally UNAFFECTED by anon mode (section 6.7 guard 7): this is a manual,
+-- user-chosen clearnet download into the user's own folder, never a channel
+-- publish - do not "fix" it to route through Tor.
 command chAddMagnetManual
    local tMag, tH
    if sSession is 0 then
@@ -2271,6 +2596,12 @@ command chHandleEvent pEvent
    switch pEvent["name"]
       case "dhtMutableItem"
          put pEvent["publicKey"] into tKey
+         -- ignore any DHT value for a channel we follow ANONYMOUSLY: a stale
+         -- artifact of its public past must not overwrite the onion feed
+         -- (section 6.7 guard 5)
+         if sFollowAnon[tKey] is "true" then
+            break
+         end if
          -- the feed arrived: the Follow watchdog for this key is satisfied
          delete variable sFeedWait[tKey]
          delete variable sFeedHinted[tKey]
@@ -2442,6 +2773,12 @@ function chPublishActiveFeed
    if sSession is 0 or sSession is empty then
       return 0
    end if
+   -- ANON channel (section 6.7 guard 2): NEVER btDhtPutMutable - the feed lives on
+   -- the onion. Push it to live subscribers instead. Public channels fall through.
+   if chIsAnonChannel(sActive) then
+      chOnionPushFeed sPub
+      return 0
+   end if
    put chBuildFeed(sMyName, sMyReleases) into sMyPost
    put chFeedValue(sMyPost, sChannels[sActive]["pass"], sPub) into tVal
    if tVal is empty then
@@ -2539,7 +2876,11 @@ command chAddReleaseAndPublish pRel, pTitle, pKind
       exit chAddReleaseAndPublish
    end if
    chUpdateNowPub
-   if pKind is "ENCRYPTED" then
+   if pKind is "ANON" then
+      chLog "Published '" & pTitle & "' ANONYMOUSLY to channel '" & chActiveName() & "' - it streams over Tor on demand and was pushed to onion followers. Keep this window open."
+   else if pKind is "ANONENC" then
+      chLog "Published '" & pTitle & "' ANONYMOUSLY + ENCRYPTED to channel '" & chActiveName() & "' - it streams (sealed) over Tor and was pushed to onion followers. Keep this window open."
+   else if pKind is "ENCRYPTED" then
       chLog "Published '" & pTitle & "' ENCRYPTED to channel '" & chActiveName() & "' and seeding it."
    else
       chLog "Published '" & pTitle & "' to channel '" & chActiveName() & "' and seeding it."
@@ -2576,6 +2917,1521 @@ command chMaybeDecryptFinished pTorrent
    put empty into sPendingKey[tHash]
    put empty into sPendingName[tHash]
 end chMaybeDecryptFinished
+
+-- ==== OnionXT: optional per-channel Tor anonymity (Model C) ===================
+-- The whole block below is inert unless sHasOnion. It NEVER touches libtorrent
+-- for an anon channel: no btCreateTorrent / btAddTorrentFile / btAddMagnet /
+-- btDhtPutMutable / btDhtGetMutable (the mutual-exclusion invariant, section 6.7).
+-- Every ox* handler is OnionXT's published ABI (onionxt/docs/05-api-reference.md);
+-- verified statically (tools/check-livecodescript.py) and NEEDS an on-engine OXT
+-- pass with a running Tor daemon before any runtime claim. See the suite's
+-- docs/ONIONXT-INTEGRATION-PLAN.md section 6 and its VERIFY register (12.3).
+
+-- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both
+-- must be present for any anonymous transfer (even a plaintext one). A guarded
+-- oxVersion() probe, mirroring chCanEncrypt.
+function chHasOnion
+   local tV, tErr
+   if not sCanEncrypt then
+      return false
+   end if
+   try
+      put oxVersion() into tV
+   catch tErr
+      return false
+   end try
+   return (tV is not empty)
+end chHasOnion
+
+-- Live, authoritative Tor readiness, re-read at the moment of use (never trust
+-- the cached sTorReady for a go/no-go). oxIsReady() is true only at 100% bootstrap.
+function chOnionReadyNow
+   if not sHasOnion then
+      return false
+   end if
+   return oxIsReady()
+end chOnionReadyNow
+
+function chIsAnonChannel pIndex
+   return (sChannels[pIndex]["anon"] is "true")
+end chIsAnonChannel
+
+-- The channel's onion address is DERIVED from its ed25519 pubkey alone (section
+-- 6.1): the follower computes the identical .onion locally from the channel card.
+-- Empty when the address codec is unavailable (SodiumXT older than ABI 7) - which
+-- makes chVerifyOnionIdentity fail and anon disable, fail-closed.
+function chChannelOnionAddr pPubHex
+   local tAddr, tErr
+   try
+      put oxAddressFromPublicKey(sxHex2Bin(textEncode(pPubHex, "ASCII"))) into tAddr
+   catch tErr
+      return ""
+   end try
+   if tAddr is empty or not (tAddr ends with ".onion") then
+      return ""   -- a capability error string is not a valid address
+   end if
+   return tAddr
+end chChannelOnionAddr
+
+-- The HARD Phase-2 gate (section 6.1), run once at startup, OFFLINE (no daemon):
+-- prove libtorrent's and libsodium's ed25519 seed->pubkey agree byte for byte, so
+-- a follower can never derive and dial the WRONG onion. Any failure disables anon.
+function chVerifyOnionIdentity
+   local tSeed, tKp, tBtPub, tSxPub, tSxSec, tAddr, tRecovered, tErr
+   try
+      put "0000000000000000000000000000000000000000000000000000000000000000" into tSeed
+      put btDhtKeypair(tSeed) into tKp
+      put tKp["publicKey"] into tBtPub
+      -- the real cross-impl check: btDhtKeypair vs sxSignKeypairFromSeed, byte-equal
+      sxSignKeypairFromSeed sxHex2Bin(textEncode(tSeed, "ASCII")), tSxPub, tSxSec
+      if sxHex2Bin(textEncode(tBtPub, "ASCII")) is not tSxPub then
+         return false
+      end if
+      -- and the address codec is self-consistent for that key
+      put chChannelOnionAddr(tBtPub) into tAddr
+      if tAddr is empty then
+         return false
+      end if
+      put oxPublicKeyFromAddress(tAddr) into tRecovered
+      if tRecovered is not sxHex2Bin(textEncode(tBtPub, "ASCII")) then
+         return false
+      end if
+   catch tErr
+      return false
+   end try
+   return true
+end chVerifyOnionIdentity
+
+-- A 16-hex release id (section 6.5): names the release inside the feed; the .onion
+-- is derived from the channel pubkey, so the locator never carries an address.
+function chAllocRelId
+   return toLower(textDecode(sxBin2Hex(sxRandomBytes(8)), "ASCII"))
+end chAllocRelId
+
+-- Reduce an attacker-chosen name (feed origName OR stream header) to a safe
+-- filename LEAF (section 3.3): basename only, no drive/colon, no leading dots, no
+-- separators or controls. Empty becomes "shared-file". Applied before opening any
+-- temp and before the final move - closes path traversal / arbitrary write.
+function chSafeLeaf pName
+   local tN, tCh, tOut
+   put pName into tN
+   replace "\" with "/" in tN
+   set the itemDelimiter to "/"
+   put the last item of tN into tN
+   if tN contains ":" then
+      set the itemDelimiter to ":"
+      put the last item of tN into tN
+   end if
+   repeat while tN begins with "."
+      delete char 1 of tN
+   end repeat
+   put "" into tOut
+   repeat for each char tCh in tN
+      if charToNum(tCh) >= 32 and tCh is not "/" and tCh is not "\" then
+         put tCh after tOut
+      end if
+   end repeat
+   put tOut into tN
+   if tN is empty or tN is ".." or tN is "." then
+      return "shared-file"
+   end if
+   return tN
+end chSafeLeaf
+
+-- Byte size of a file WITHOUT loading it whole (bounded 4 MiB chunks): O(size) I/O,
+-- O(1) memory. Used for the header totalLen and the large-file warning.
+function chFileSize pPath
+   local tSize
+   put 0 into tSize
+   open file pPath for binary read
+   if the result is not empty then
+      return empty
+   end if
+   repeat
+      read from file pPath for 4194304
+      if it is empty then
+         exit repeat
+      end if
+      add the number of bytes in it to tSize
+   end repeat
+   close file pPath
+   return tSize
+end chFileSize
+
+-- A pseudo-random high loopback port for OnionXT's internal listener. A collision
+-- surfaces as an oxCreateService error string, and the caller reports it.
+function chPickPort
+   return (20000 + random(40000))
+end chPickPort
+
+-- Move a finished plaintext temp to its real name (rename avoids a full read).
+function chMoveFile pSrc, pDst
+   local tErr
+   try
+      if there is a file pDst then
+         delete file pDst
+      end if
+      rename file pSrc to pDst
+   catch tErr
+      return tErr
+   end try
+   return ""
+end chMoveFile
+
+-- Decode a big-endian unsigned u16 / u32 from raw bytes (matches onion_frame_golden).
+function chBEu16 pBytes
+   return (byteToNum(byte 1 of pBytes) * 256 + byteToNum(byte 2 of pBytes))
+end chBEu16
+
+function chBEu32 pBytes
+   local tA, tB, tC, tD
+   put byteToNum(byte 1 of pBytes) into tA
+   put byteToNum(byte 2 of pBytes) into tB
+   put byteToNum(byte 3 of pBytes) into tC
+   put byteToNum(byte 4 of pBytes) into tD
+   return (((tA * 256 + tB) * 256 + tC) * 256 + tD)
+end chBEu32
+
+-- The section-3.3 file header: magic(4) ver(1) flags(1) nameLen(u16 BE) name(UTF-8)
+-- totalLen(u64 BE as hi:u32 then lo:u32). Binary discipline throughout.
+function chOnionHeader pName, pEnc, pTotal
+   local tNameB, tFlags, tHi, tLo, tOut
+   put textEncode(chSafeLeaf(pName), "UTF-8") into tNameB
+   put 0 into tFlags
+   if pEnc is kFlagEnc then
+      put kFlagEnc into tFlags
+   end if
+   put (pTotal div 4294967296) into tHi
+   put (pTotal mod 4294967296) into tLo
+   put kOnionMagic into tOut
+   put numToByte(kOnionVer) after tOut
+   put numToByte(tFlags) after tOut
+   put binaryEncode("n", the number of bytes in tNameB) after tOut
+   put tNameB after tOut
+   put binaryEncode("NN", tHi, tLo) after tOut
+   return tOut
+end chOnionHeader
+
+-- The section-6.4 BTXC request frame (follower -> publisher).
+function chChanRequest pVerb, pKeyHex, pRelId
+   local tKeyB, tIdB, tOut
+   put textEncode(pKeyHex, "ASCII") into tKeyB
+   put textEncode(pRelId, "ASCII") into tIdB
+   put kChanReqMagic into tOut
+   put numToByte(kChanReqVer) after tOut
+   put numToByte(pVerb) after tOut
+   put binaryEncode("n", the number of bytes in tKeyB) after tOut
+   put tKeyB after tOut
+   put binaryEncode("n", the number of bytes in tIdB) after tOut
+   put tIdB after tOut
+   return tOut
+end chChanRequest
+
+-- The section-6.4 BTXF feed frame (publisher -> follower; repeatable for push).
+function chFeedFrame pValue
+   local tOut
+   put kFeedFrameMagic into tOut
+   put numToByte(kFeedFrameVer) after tOut
+   put binaryEncode("N", the number of bytes in pValue) after tOut
+   put pValue after tOut
+   return tOut
+end chFeedFrame
+
+-- The feed TEXT served over the onion: the normal name=/r= feed PLUS the svc=<onion>
+-- corroboration/fallback line (section 6.1). Never put on the DHT.
+function chAnonFeedText pIndex
+   local tKp, tPub, tFeed, tAddr
+   put btDhtKeypair(sChannels[pIndex]["seed"]) into tKp
+   put tKp["publicKey"] into tPub
+   put chBuildFeed(sChannels[pIndex]["name"], sChannels[pIndex]["releases"]) into tFeed
+   put sChanServiceAddr[tPub] into tAddr
+   if tAddr is empty then
+      put chChannelOnionAddr(tPub) into tAddr
+   end if
+   if tAddr is not empty then
+      put tFeed & return & "svc=" & tAddr into tFeed
+   end if
+   return tFeed
+end chAnonFeedText
+
+-- The channel index whose ed25519 pubkey matches pPubHex, or 0 (used to validate a
+-- BTXC request names a channel WE own).
+function chChannelIndexForPub pPubHex
+   local tI, tKp
+   repeat with tI = 1 to chChannelCount()
+      put btDhtKeypair(sChannels[tI]["seed"]) into tKp
+      if toLower(tKp["publicKey"]) is toLower(pPubHex) then
+         return tI
+      end if
+   end repeat
+   return 0
+end chChannelIndexForPub
+
+-- The live torrent handle whose info-hash matches pHash (lowercased), or 0.
+function chFindTorrentByHash pHash
+   local tCount, tI, tH, tS
+   put btTorrentCount(sSession) into tCount
+   repeat with tI = 0 to (tCount - 1)
+      put btTorrentHandleAt(sSession, tI) into tH
+      if tH is not 0 then
+         put btTorrentStatus(tH) into tS
+         if toLower(tS["infoHashV1"]) is pHash or toLower(tS["infoHashV2"]) is pHash then
+            return tH
+         end if
+      end if
+   end repeat
+   return 0
+end chFindTorrentByHash
+
+-- ---- Tor lifecycle -----------------------------------------------------------
+-- Bring up the OnionXT control connection at startup (only when sHasOnion).
+-- Non-blocking: bootstrap takes tens of seconds and is surfaced by the status
+-- callback + the 1 s dash pill. Connects on the stock tor control port (9051);
+-- the status callback retries the Tor Browser port pair (9151) once on failure.
+command chOnionStart
+   if not sHasOnion then
+      exit chOnionStart
+   end if
+   put "false" into sOnionTriedTB
+   oxSetCallbackOwner the long id of me
+   oxSetStatusCallback "chOnionStatus"
+   oxSetPeerCallback "chOnionPeer"
+   oxSetControlPort kTorControlPort
+   oxSetSocksPort kTorSocksPort
+   oxConnectControl
+   if the result is not empty then
+      chOnionTryTB
+   end if
+   chOnionPill
+end chOnionStart
+
+-- Retry the control connection on the Tor Browser port pair, exactly once.
+command chOnionTryTB
+   local tR
+   if sOnionTriedTB is "true" then
+      exit chOnionTryTB
+   end if
+   put "true" into sOnionTriedTB
+   oxSetControlPort kTorControlPortTB
+   oxSetSocksPort kTorSocksPortTB
+   oxConnectControl
+   put the result into tR
+   if tR is not empty then
+      chLog "No Tor control port answered on 127.0.0.1:9051 or 9151 (" & tR & ") - start Tor (or Tor Browser) and reopen this stack to use anonymous channels."
+   end if
+end chOnionTryTB
+
+-- OnionXT status callback (pKind, pInfo). Coalesced bootstrap + event updates on
+-- the main thread. On the FIRST transition to ready, bring anon services online.
+command chOnionStatus pKind, pInfo
+   local tWasReady
+   put sTorReady into tWasReady
+   if pKind is "control" then
+      if pInfo is "authenticated" then
+         chLog "Tor control connected - bootstrapping (this can take a minute)..."
+      else if (pInfo is "authfailed" or pInfo is "error") then
+         chOnionTryTB
+      end if
+   else if pKind is "serviceReady" then
+      chLog "An anonymous channel is now reachable over Tor (" & pInfo & ")."
+      chUpdateNowPub
+   end if
+   put chOnionReadyNow() into sTorReady
+   if sTorReady and not tWasReady then
+      chOnionBringUpServices
+   end if
+   chOnionPill
+end chOnionStatus
+
+-- Repaint the live Tor pill (created + repainted ONLY here so its states cannot
+-- disagree). The kinds map the states semantically: ready=ok, connecting=wait,
+-- and every cannot-run state=bad. The chAnon button stays enabled so a click
+-- gives chSetAnon's informative answer even when Tor is absent.
+command chOnionPill
+   local tState, tKind
+   if there is no button "chAnon" then
+      exit chOnionPill
+   end if
+   if not sHasOnion then
+      if sCanEncrypt then
+         put "Tor: no extension" into tState
+      else
+         put "Tor: needs cryptoXT" into tState
+      end if
+      put "bad" into tKind
+   else if not oxIsControlAuthenticated() then
+      put "Tor: no daemon" into tState
+      put "bad" into tKind
+   else if not oxIsReady() then
+      put ("Tor: connecting " & oxBootstrapProgress() & "%") into tState
+      put "wait" into tKind
+   else
+      put "Tor: ready" into tState
+      put "ok" into tKind
+   end if
+   uiPill "chTor", tState, "648,4,812,26", tKind
+end chOnionPill
+
+-- Tear the onion subsystem down on close, BEFORE btStopSession. All idempotent.
+command chOnionStop
+   local tK, tErr
+   if not sHasOnion then
+      exit chOnionStop
+   end if
+   repeat for each key tK in sOnRole
+      try
+         oxCloseStream tK
+      catch tErr
+      end try
+   end repeat
+   repeat for each key tK in sChanService
+      try
+         oxRemoveService sChanService[tK]
+      catch tErr
+      end try
+   end repeat
+   try
+      oxDisconnectControl
+   catch tErr
+   end try
+   -- sweep receive temps and the .enc temps we created for anon-encrypted serves
+   -- (never the user's plaintext originals - only Enc entries are our temps)
+   repeat for each key tK in sRxTmp
+      try
+         if sRxTmp[tK] is not empty and there is a file sRxTmp[tK] then
+            delete file sRxTmp[tK]
+         end if
+      catch tErr
+      end try
+   end repeat
+   repeat for each key tK in sOnionServe
+      try
+         if sOnionServeEnc[tK] is kFlagEnc and there is a file sOnionServe[tK] then
+            delete file sOnionServe[tK]
+         end if
+      catch tErr
+      end try
+   end repeat
+   put empty into sChanService
+   put empty into sChanServiceAddr
+   put empty into sChanServicePort
+   put empty into sFeedStreams
+   put empty into sFollowStream
+   put empty into sOnRole
+   put empty into sOnPub
+   put empty into sOnReq
+   put empty into sOnBuf
+   put empty into sOnionServe
+   put empty into sOnionServeEnc
+   put empty into sOnionServeName
+   put empty into sOnionServeTotal
+   put empty into sOnionXfer
+end chOnionStop
+
+-- ---- publisher: per-channel onion service lifecycle (section 6.3) ------------
+-- Create (idempotently) the deterministic onion service for one anon channel, on
+-- its OWN ephemeral loopback port. The address is derived from the channel key, so
+-- we VERIFY-on-service that the .onion the daemon produced equals the derived one
+-- (section 6.1 step 4) - a mismatch is a hard safety stop.
+command chOnionServiceFor pIndex
+   local tKp, tPub, tPort, tSvc, tAddr, tDerived, tErr
+   if not sHasOnion or not sOnionIdentityOk then
+      exit chOnionServiceFor
+   end if
+   if not chIsAnonChannel(pIndex) then
+      exit chOnionServiceFor
+   end if
+   if not chOnionReadyNow() then
+      exit chOnionServiceFor   -- retried by chOnionBringUpServices after bootstrap
+   end if
+   put btDhtKeypair(sChannels[pIndex]["seed"]) into tKp
+   put tKp["publicKey"] into tPub
+   if sChanService[tPub] is not empty then
+      exit chOnionServiceFor   -- idempotent: already up
+   end if
+   put chPickPort() into tPort
+   oxCreateServiceFromSeed sChannels[pIndex]["seed"], kOnionVPort, tPort
+   put the result into tSvc
+   if tSvc is not an integer then
+      chLog "Could not publish the Tor service for this anonymous channel:" && tSvc
+      exit chOnionServiceFor
+   end if
+   put oxServiceAddress(tSvc) into tAddr
+   put chChannelOnionAddr(tPub) into tDerived
+   if tAddr is not empty and tDerived is not empty and tAddr is not tDerived then
+      try
+         oxRemoveService tSvc
+      catch tErr
+      end try
+      put false into sOnionIdentityOk
+      chLog "Anonymous channels DISABLED: the Tor service address did not match the address the channel key predicts (seed<->onion mismatch). This is a hard safety stop; public channels are unaffected."
+      exit chOnionServiceFor
+   end if
+   put tSvc into sChanService[tPub]
+   if tAddr is not empty then
+      put tAddr into sChanServiceAddr[tPub]
+   else
+      put tDerived into sChanServiceAddr[tPub]
+   end if
+   put tPort into sChanServicePort[tPub]
+   chLog "Publishing the Tor service for an anonymous channel - reachable in up to a minute."
+end chOnionServiceFor
+
+-- Bring every anon channel's service online (called on the first ready + each
+-- 60 s tick, so services recover after a Tor restart without blocking chStart).
+command chOnionBringUpServices
+   local tI
+   if not sHasOnion or not sOnionIdentityOk then
+      exit chOnionBringUpServices
+   end if
+   if not chOnionReadyNow() then
+      exit chOnionBringUpServices
+   end if
+   repeat with tI = 1 to chChannelCount()
+      if chIsAnonChannel(tI) then
+         chOnionServiceFor tI
+      end if
+   end repeat
+end chOnionBringUpServices
+
+-- Withdraw one channel's service and drop its subscribers (Off / delete / stop).
+command chOnionWithdrawService pPubHex
+   local tErr, tLine, tList
+   put sFeedStreams[pPubHex] into tList
+   repeat for each line tLine in tList
+      if tLine is not empty then
+         chOnionCloseStream tLine
+      end if
+   end repeat
+   delete variable sFeedStreams[pPubHex]
+   if sChanService[pPubHex] is not empty then
+      try
+         oxRemoveService sChanService[pPubHex]
+      catch tErr
+      end try
+   end if
+   delete variable sChanService[pPubHex]
+   delete variable sChanServiceAddr[pPubHex]
+   delete variable sChanServicePort[pPubHex]
+end chOnionWithdrawService
+
+-- ---- publisher: serve a follower's request (section 6.4) ---------------------
+-- A follower dialed one of our channel onions. Wait for its BTXC request (which
+-- names the target channel) before serving anything; refuse a non-BTXC opener.
+command chOnionPeer pStream, pService, pPeerAddr
+   put "serve-req" into sOnRole[pStream]
+   put "" into sOnReq[pStream]
+   put the milliseconds into sTxDeadline[pStream]
+   oxSetStreamCallback pStream, "chOnionServeStream"
+   send ("chOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end chOnionPeer
+
+-- Serve-side per-stream handler. Accumulate the request; once a full BTXC has
+-- arrived, dispatch it. A serve-feed subscriber and an in-flight file send send
+-- nothing more, so their data events are ignored.
+command chOnionServeStream pStream, pEvent, pData
+   if pEvent is "data" then
+      if sOnRole[pStream] is "serve-req" then
+         put pData after sOnReq[pStream]
+         put the milliseconds into sTxDeadline[pStream]
+         if the number of bytes in sOnReq[pStream] >= 4 then
+            if (byte 1 to 4 of sOnReq[pStream]) is not kChanReqMagic then
+               chOnionServeAbort pStream   -- junk from a local process
+               exit chOnionServeStream
+            end if
+         end if
+         chOnionServeRequest pStream
+      else if sOnRole[pStream] is "serve-file" then
+         put the milliseconds into sTxDeadline[pStream]
+      end if
+   else if pEvent is "closed" or pEvent is "error" then
+      chOnionServeAbort pStream
+   end if
+end chOnionServeStream
+
+-- Parse an accumulated BTXC request and dispatch FEED / FILE. Exits early (and
+-- is re-entered) until the whole self-delimiting frame has arrived.
+command chOnionServeRequest pStream
+   local tBuf, tVer, tVerb, tKeyLen, tKeyHex, tIdLen, tRelId, tNeed, tPub, tIdx
+   put sOnReq[pStream] into tBuf
+   if the number of bytes in tBuf < 8 then
+      exit chOnionServeRequest
+   end if
+   if (byte 1 to 4 of tBuf) is not kChanReqMagic then
+      chOnionServeAbort pStream
+      exit chOnionServeRequest
+   end if
+   put byteToNum(byte 5 of tBuf) into tVer
+   put byteToNum(byte 6 of tBuf) into tVerb
+   put chBEu16(byte 7 to 8 of tBuf) into tKeyLen
+   if tKeyLen > 128 then
+      chOnionServeAbort pStream
+      exit chOnionServeRequest
+   end if
+   put (8 + tKeyLen + 2) into tNeed
+   if the number of bytes in tBuf < tNeed then
+      exit chOnionServeRequest
+   end if
+   put textDecode(byte 9 to (8 + tKeyLen) of tBuf, "ASCII") into tKeyHex
+   put chBEu16(byte (9 + tKeyLen) to (10 + tKeyLen) of tBuf) into tIdLen
+   if tIdLen > 64 then
+      chOnionServeAbort pStream
+      exit chOnionServeRequest
+   end if
+   put (tNeed + tIdLen) into tNeed
+   if the number of bytes in tBuf < tNeed then
+      exit chOnionServeRequest
+   end if
+   if tIdLen > 0 then
+      put textDecode(byte (11 + tKeyLen) to (10 + tKeyLen + tIdLen) of tBuf, "ASCII") into tRelId
+   else
+      put "" into tRelId
+   end if
+   if tVer is not kChanReqVer then
+      chOnionServeAbort pStream
+      exit chOnionServeRequest
+   end if
+   put toLower(tKeyHex) into tPub
+   -- validate we OWN this pubkey AND it is an anon channel with a live service
+   put chChannelIndexForPub(tPub) into tIdx
+   if tIdx is 0 or not chIsAnonChannel(tIdx) or sChanService[tPub] is empty then
+      chOnionServeAbort pStream
+      exit chOnionServeRequest
+   end if
+   put tPub into sOnPub[pStream]
+   if tVerb is kVerbFeed then
+      chOnionServeFeed pStream, tIdx
+      put "serve-feed" into sOnRole[pStream]
+      chOnionSubscribe tPub, pStream
+   else if tVerb is kVerbFile then
+      chOnionServeFile pStream, tPub, tRelId
+   else
+      chOnionServeAbort pStream
+   end if
+end chOnionServeRequest
+
+-- Build + send one BTXF feed frame for a channel (never in the clear for a private
+-- channel we cannot encrypt).
+command chOnionServeFeed pStream, pIndex
+   local tKp, tPub, tText, tVal
+   put btDhtKeypair(sChannels[pIndex]["seed"]) into tKp
+   put tKp["publicKey"] into tPub
+   put chAnonFeedText(pIndex) into tText
+   put chFeedValue(tText, sChannels[pIndex]["pass"], tPub) into tVal
+   if tVal is empty then
+      exit chOnionServeFeed
+   end if
+   if the number of bytes in tVal > kOnionFeedCap then
+      exit chOnionServeFeed
+   end if
+   oxWrite pStream, chFeedFrame(tVal)
+end chOnionServeFeed
+
+-- Add a feed stream as a live subscriber: de-dup by handle, cap per channel
+-- (evict the oldest at the cap). Prunes happen here AND on close (section 6.4).
+command chOnionSubscribe pPubHex, pStream
+   local tList, tLine, tNew, tCount
+   put sFeedStreams[pPubHex] into tList
+   put "" into tNew
+   put 0 into tCount
+   repeat for each line tLine in tList
+      if tLine is not empty and tLine is not pStream then
+         if tNew is empty then
+            put tLine into tNew
+         else
+            put tNew & return & tLine into tNew
+         end if
+         add 1 to tCount
+      end if
+   end repeat
+   repeat while tCount >= 32
+      chOnionCloseStream (line 1 of tNew)
+      delete line 1 of tNew
+      subtract 1 from tCount
+   end repeat
+   if tNew is empty then
+      put pStream into tNew
+   else
+      put tNew & return & pStream into tNew
+   end if
+   put tNew into sFeedStreams[pPubHex]
+end chOnionSubscribe
+
+-- Push a fresh feed frame to every live subscriber of a channel (section 6.4).
+-- Re-seals with a FRESH nonce (chFeedValue) each push - no keystream reuse (M9).
+-- Dead handles are pruned here, not only lazily.
+command chOnionPushFeed pPubHex
+   local tIdx, tText, tVal, tFrame, tList, tLine, tNew, tErr
+   if not sHasOnion then
+      exit chOnionPushFeed
+   end if
+   put chChannelIndexForPub(pPubHex) into tIdx
+   if tIdx is 0 then
+      exit chOnionPushFeed
+   end if
+   put sFeedStreams[pPubHex] into tList
+   if tList is empty then
+      exit chOnionPushFeed
+   end if
+   put chAnonFeedText(tIdx) into tText
+   put chFeedValue(tText, sChannels[tIdx]["pass"], pPubHex) into tVal
+   if tVal is empty then
+      exit chOnionPushFeed
+   end if
+   if the number of bytes in tVal > kOnionFeedCap then
+      exit chOnionPushFeed
+   end if
+   put chFeedFrame(tVal) into tFrame
+   put "" into tNew
+   repeat for each line tLine in tList
+      if tLine is not empty then
+         oxWrite tLine, tFrame
+         if the result is empty then
+            if tNew is empty then
+               put tLine into tNew
+            else
+               put tNew & return & tLine into tNew
+            end if
+         else
+            try
+               oxCloseStream tLine
+            catch tErr
+            end try
+            chOnionServeCleanup tLine
+         end if
+      end if
+   end repeat
+   put tNew into sFeedStreams[pPubHex]
+end chOnionPushFeed
+
+-- Serve a release's bytes (section 6.4 FILE / section 3.3 sender). A missing serve
+-- entry (e.g. a restart lost the map) replies with an empty header + FINISH so the
+-- follower shows "release not available", never a hang.
+command chOnionServeFile pStream, pPubHex, pRelId
+   local tMapKey, tPath, tEnc, tName, tTotal
+   put pPubHex & ":" & pRelId into tMapKey
+   put sOnionServe[tMapKey] into tPath
+   if tPath is empty or there is no file tPath then
+      put sOnionServeName[tMapKey] into tName
+      if tName is empty then
+         put "unavailable" into tName
+      end if
+      oxWrite pStream, chOnionHeader(tName, 0, 0)
+      oxWrite pStream, binaryEncode("N", 0)
+      oxCloseStream pStream
+      chOnionServeCleanup pStream
+      exit chOnionServeFile
+   end if
+   put sOnionServeEnc[tMapKey] into tEnc
+   put sOnionServeName[tMapKey] into tName
+   put sOnionServeTotal[tMapKey] into tTotal
+   put "serve-file" into sOnRole[pStream]
+   put tPath into sTxPath[pStream]
+   put 0 into sTxPos[pStream]
+   put tTotal into sTxRemaining[pStream]
+   put tName into sTxName[pStream]
+   put the milliseconds into sTxDeadline[pStream]
+   put tName into sOnionXfer[pStream]["name"]
+   put "up" into sOnionXfer[pStream]["dir"]
+   put tTotal into sOnionXfer[pStream]["total"]
+   put 0 into sOnionXfer[pStream]["got"]
+   put "active" into sOnionXfer[pStream]["state"]
+   oxWrite pStream, chOnionHeader(tName, tEnc, tTotal)
+   if the result is not empty then
+      chOnionServeAbort pStream
+      exit chOnionServeFile
+   end if
+   send ("chOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+end chOnionServeFile
+
+-- One frame per tick (never a tight loop). The file is opened/seeked/read/closed
+-- WITHIN this tick (re-open-per-read; section 3.3 step 6b), so a popular release
+-- can fan out to concurrent receivers without sharing a cursor. No writability
+-- gate (the quickshare false-stall lesson): pace on the timer + oxWrite's error.
+command chOnionSendPump pStream
+   local tWant, tSlice, tErr
+   if sTxPath[pStream] is empty then
+      exit chOnionSendPump
+   end if
+   put kOnionChunk into tWant
+   if sTxRemaining[pStream] < tWant then
+      put sTxRemaining[pStream] into tWant
+   end if
+   if tWant <= 0 then
+      oxWrite pStream, binaryEncode("N", 0)   -- zero-length terminator
+      put "done" into sOnionXfer[pStream]["state"]
+      chLog "Served '" & sTxName[pStream] & "' over Tor."
+      oxCloseStream pStream
+      chOnionServeCleanup pStream
+      exit chOnionSendPump
+   end if
+   open file sTxPath[pStream] for binary read
+   if the result is not empty then
+      chOnionServeAbort pStream
+      exit chOnionSendPump
+   end if
+   seek to sTxPos[pStream] in file sTxPath[pStream]
+   read from file sTxPath[pStream] for tWant
+   put it into tSlice
+   try
+      close file sTxPath[pStream]
+   catch tErr
+   end try
+   if tSlice is empty then
+      oxWrite pStream, binaryEncode("N", 0)
+      put "done" into sOnionXfer[pStream]["state"]
+      oxCloseStream pStream
+      chOnionServeCleanup pStream
+      exit chOnionSendPump
+   end if
+   oxWrite pStream, (binaryEncode("N", the number of bytes in tSlice) & tSlice)
+   if the result is not empty then
+      chOnionServeAbort pStream
+      exit chOnionSendPump
+   end if
+   add (the number of bytes in tSlice) to sTxPos[pStream]
+   subtract (the number of bytes in tSlice) from sTxRemaining[pStream]
+   put sTxPos[pStream] into sOnionXfer[pStream]["got"]
+   put the milliseconds into sTxDeadline[pStream]
+   send ("chOnionSendPump " & pStream) to me in kOnionPumpTick milliseconds
+end chOnionSendPump
+
+-- Idle watchdog for a serve stream, armed at accept. A serve-feed SUBSCRIBER is
+-- allowed to idle between pushes (re-arm, never abort); a serve-req that never
+-- sends a request, or a stalled serve-file, is aborted.
+command chOnionSendWatchdog pStream
+   if sOnRole[pStream] is empty then
+      exit chOnionSendWatchdog
+   end if
+   if sOnRole[pStream] is "serve-feed" then
+      send ("chOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+      exit chOnionSendWatchdog
+   end if
+   if (the milliseconds - sTxDeadline[pStream]) > kOnionSendTimeout then
+      chLog "An anonymous transfer stalled - closing it."
+      chOnionServeAbort pStream
+      exit chOnionSendWatchdog
+   end if
+   send ("chOnionSendWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
+end chOnionSendWatchdog
+
+-- Clear serve per-stream state and drop the stream from its channel's subscriber
+-- list. Keeps its sOnionXfer row (pruned in chOnionStop) so a finished/failed
+-- transfer stays visible for the session.
+command chOnionServeCleanup pStream
+   local tErr, tPub, tLine, tNew
+   try
+      close file sTxPath[pStream]
+   catch tErr
+   end try
+   put sOnPub[pStream] into tPub
+   if tPub is not empty and sFeedStreams[tPub] is not empty then
+      put "" into tNew
+      repeat for each line tLine in sFeedStreams[tPub]
+         if tLine is not empty and tLine is not pStream then
+            if tNew is empty then
+               put tLine into tNew
+            else
+               put tNew & return & tLine into tNew
+            end if
+         end if
+      end repeat
+      put tNew into sFeedStreams[tPub]
+   end if
+   delete variable sTxPath[pStream]
+   delete variable sTxPos[pStream]
+   delete variable sTxRemaining[pStream]
+   delete variable sTxName[pStream]
+   delete variable sTxDeadline[pStream]
+   delete variable sOnReq[pStream]
+   delete variable sOnRole[pStream]
+   delete variable sOnPub[pStream]
+end chOnionServeCleanup
+
+command chOnionServeAbort pStream
+   if sOnionXfer[pStream] is not empty then
+      put "error" into sOnionXfer[pStream]["state"]
+   end if
+   oxCloseStream pStream
+   chOnionServeCleanup pStream
+end chOnionServeAbort
+
+-- Close + fully clear any stream (either side); idempotent.
+command chOnionCloseStream pStream
+   local tErr
+   try
+      oxCloseStream pStream
+   catch tErr
+   end try
+   chOnionServeCleanup pStream
+   chOnionRecvClear pStream
+end chOnionCloseStream
+
+-- ---- publisher: turn Anonymous on/off + publish anon releases ----------------
+-- Set (or clear) the whole-channel anon flag (section 6.2), modeled on chSetPrivacy.
+-- Turning ON hard-blocks on any live clearnet magnet release (section 6.7 guard 6):
+-- an anon badge over a still-seeding torrent is real-IP-on-the-DHT mixing.
+command chSetAnon
+   local tGo, tMagCount, tRel, tLoc, tSavedID, tHash, tH
+   if not sHasOnion then
+      answer "Anonymous channels need OnionXT + cryptoXT and a local Tor daemon (127.0.0.1:9050/9051 or 9150/9151). Public channels are unaffected."
+      exit chSetAnon
+   end if
+   if not sOnionIdentityOk then
+      answer "Anonymous channels are disabled on this machine: the libtorrent and libsodium ed25519 identities did not byte-match offline (or SodiumXT is older than ABI 7). A channel's derived .onion could be wrong, so anon is refused. Public channels work normally."
+      exit chSetAnon
+   end if
+   answer ("Make the channel '" & chActiveName() & "' ANONYMOUS?" & return & return & \
+      "An anonymous channel serves its file list AND every file over Tor: both IPs are hidden, nothing is put on the DHT or a magnet, and it is reachable from the channel card alone. The publisher must stay online for followers to reach it, large media is slow, and Tor only anonymizes BETWEEN the two onion endpoints. Compose it with Privacy (a passphrase) to also encrypt the contents and authenticate the sender - recommended.") \
+      with "Cancel" or "Off" or "On"
+   put it into tGo
+   if tGo is "Cancel" then
+      exit chSetAnon
+   end if
+   put the itemDelimiter into tSavedID
+   if tGo is "On" then
+      if chIsAnonChannel(sActive) then
+         chLog "This channel is already anonymous."
+         exit chSetAnon
+      end if
+      -- count live clearnet magnet releases; refuse until they are removed
+      put 0 into tMagCount
+      set the itemDelimiter to tab
+      repeat for each line tRel in sChannels[sActive]["releases"]
+         if tRel is not empty then
+            put item 2 of tRel into tLoc
+            if tLoc begins with "magnet:" then
+               add 1 to tMagCount
+            end if
+         end if
+      end repeat
+      set the itemDelimiter to tSavedID
+      if tMagCount > 0 then
+         answer ("This channel has " & tMagCount & " public release(s) on the swarm/DHT under your real IP. Turning it anonymous while they are still seeded would MIX modes and leak your IP." & return & return & \
+            "Remove those " & tMagCount & " public release(s) and stop seeding them, then make the channel anonymous?") \
+            with "Cancel" or "Remove and continue"
+         if it is not "Remove and continue" then
+            exit chSetAnon
+         end if
+         set the itemDelimiter to tab
+         repeat for each line tRel in sChannels[sActive]["releases"]
+            if tRel is not empty then
+               put item 2 of tRel into tLoc
+               if tLoc begins with "magnet:" then
+                  put chHashFromMagnet(tLoc) into tHash
+                  if tHash is not empty then
+                     put chFindTorrentByHash(tHash) into tH
+                     if tH is not 0 then
+                        btRemoveTorrent sSession, tH, false
+                     end if
+                     delete variable sMineHashes[tHash]
+                  end if
+               end if
+            end if
+         end repeat
+         set the itemDelimiter to tSavedID
+         -- every release was public: clear them; anon starts a fresh onion feed
+         put "" into sChannels[sActive]["releases"]
+         put "" into sMyReleases
+         put chBuildFeed(sMyName, sMyReleases) into sMyPost
+      end if
+      put "true" into sChannels[sActive]["anon"]
+      chSaveChannels
+      chOnionServiceFor sActive
+      chLog "Channel '" & chActiveName() & "' is now ANONYMOUS. Publish a file to stream it over Tor; share the channel card (it carries the anon tag). Add Privacy for encrypted, authenticated contents."
+   else
+      set the itemDelimiter to tSavedID
+      if not chIsAnonChannel(sActive) then
+         chLog "This channel is already public."
+         exit chSetAnon
+      end if
+      put "" into sChannels[sActive]["anon"]
+      chSaveChannels
+      chOnionWithdrawService sPub
+      get chPublishActiveFeed()   -- resume normal DHT announce for the public channel
+      chLog "Channel '" & chActiveName() & "' is public again. Its (onion-less) feed re-announces on the DHT."
+   end if
+   chUpdateChannelMenu
+   chUpdateNowPub
+end chSetAnon
+
+-- The anon replacement for chPublishFile's clearnet body (section 6.5): pick ONE
+-- file, encrypt it when the channel is private (recommended), record it in the
+-- in-memory serve map under a fresh relId, and publish an "onion:<relId>" locator.
+-- NO btCreateTorrent / btAddTorrentFile / sMineHashes / magnet.
+command chOnionPublishFile
+   local tPath, tTitle, tOrig, tTotal, tEnc, tEncFlag, tStreamFile, tRelId
+   local tMapKey, tRel, tKind, tErr, tSafe
+   if not chOnionReadyNow() then
+      chLog "Tor is still connecting - watch the pill, then Publish again."
+      exit chOnionPublishFile
+   end if
+   chOnionServiceFor sActive
+   if sChanService[sPub] is empty then
+      chLog "This channel's Tor service is not up yet - wait for 'Tor: ready', then Publish again."
+      exit chOnionPublishFile
+   end if
+   answer file "Choose a FILE to share anonymously over Tor (a folder is not supported - zip it first):"
+   put it into tPath
+   if tPath is empty then
+      exit chOnionPublishFile
+   end if
+   if there is a folder tPath then
+      chLog "Anonymous publishing handles one file at a time; zip the folder first."
+      exit chOnionPublishFile
+   end if
+   replace "\" with "/" in tPath
+   set the itemDelimiter to "/"
+   put the last item of tPath into tOrig
+   put tOrig into tTitle
+   ask "Title for this release:" with tTitle
+   if it is not empty then
+      put it into tTitle
+   end if
+   replace return with space in tTitle
+   replace tab with space in tTitle
+   put chFileSize(tPath) into tTotal
+   if tTotal is empty or tTotal < 0 then
+      chLog "Could not read that file's size."
+      exit chOnionPublishFile
+   end if
+   if tTotal > kAnonSizeWarn then
+      answer ("This file is large for an anonymous Tor transfer and will be slow." & return & \
+         "For big media, publish it on a PUBLIC channel instead (that reveals your IP).") with "Cancel" or "Publish over Tor anyway"
+      if it is not "Publish over Tor anyway" then
+         exit chOnionPublishFile
+      end if
+   end if
+   put chSafeLeaf(tOrig) into tSafe
+   put tPath into tStreamFile
+   put 0 into tEncFlag
+   -- compose with encryption when the channel is private (recommended): reuse the
+   -- existing chFileKey / chEncryptFile path, stream the .enc under a neutral name
+   if sChannels[sActive]["pass"] is not empty and sCanEncrypt then
+      put chTempEncPath() into tEnc
+      chLog "Encrypting '" & tTitle & "' before the anonymous transfer - the app may pause briefly on a large file..."
+      put chEncryptFile(tPath, tEnc, chFileKey(sChannels[sActive]["pass"], sPub)) into tErr
+      if tErr is not empty then
+         chLog "Could not encrypt '" & tTitle & "':" && tErr
+         try
+            if there is a file tEnc then
+               delete file tEnc
+            end if
+         catch tErr
+         end try
+         exit chOnionPublishFile
+      end if
+      put tEnc into tStreamFile
+      put kFlagEnc into tEncFlag
+      put chFileSize(tEnc) into tTotal
+   end if
+   put chAllocRelId() into tRelId
+   put sPub & ":" & tRelId into tMapKey
+   put tStreamFile into sOnionServe[tMapKey]
+   put tEncFlag into sOnionServeEnc[tMapKey]
+   put tSafe into sOnionServeName[tMapKey]
+   put tTotal into sOnionServeTotal[tMapKey]
+   if tEncFlag is kFlagEnc then
+      put chTrunc(tTitle, 60) & tab & ("onion:" & tRelId) & tab & "enc" & tab & tOrig into tRel
+      put "ANONENC" into tKind
+   else
+      put chTrunc(tTitle, 60) & tab & ("onion:" & tRelId) into tRel
+      put "ANON" into tKind
+   end if
+   chAddReleaseAndPublish tRel, tTitle, tKind
+end chOnionPublishFile
+
+-- ---- follower: fetch the feed + files over the onion (section 6.4 / 6.5) ------
+-- The onion address for a followed key: derived from the pubkey (primary), or the
+-- feed's svc= line (fallback if the derivation ever fell back; section 6.1).
+function chOnionAddrForKey pKey
+   local tAddr
+   put chChannelOnionAddr(pKey) into tAddr
+   if tAddr is empty or not oxIsValidAddress(tAddr) then
+      if sFollowSvc[pKey] is not empty then
+         return sFollowSvc[pKey]
+      end if
+      return ""
+   end if
+   return tAddr
+end chOnionAddrForKey
+
+-- Dial an anon channel's onion and subscribe to its feed. Fail-closed at every
+-- step: never a swarm fallback. Writes a name= placeholder for the offline cases
+-- (section 6.8) that chRefreshSubs renders, retried on the 60 s tick.
+command chOnionFollowFetch pKey
+   local tAddr, tStream, tConfirmed
+   if not sHasOnion then
+      exit chOnionFollowFetch
+   end if
+   -- a placeholder is only written for a CONFIRMED anon follow; a stripped-card
+   -- PROBE (section 6.8, pKey not yet marked anon) must not overwrite the feed of
+   -- what might be a genuinely public, just-slow channel - a success promotes it
+   -- via chApplyAnonFeed, a failure stays silent.
+   put (sFollowAnon[pKey] is "true") into tConfirmed
+   if not chOnionReadyNow() then
+      if tConfirmed then
+         put ("name=" & chShortKey(pKey) & " (anonymous - Tor still connecting)") into sFollowFeeds[pKey]
+         chRefreshSubs
+      end if
+      exit chOnionFollowFetch
+   end if
+   if sFollowStream[pKey] is not empty then
+      exit chOnionFollowFetch   -- a live subscription already keeps the feed fresh
+   end if
+   put chOnionAddrForKey(pKey) into tAddr
+   if tAddr is empty then
+      if tConfirmed then
+         put ("name=" & chShortKey(pKey) & " (anonymous - no valid address)") into sFollowFeeds[pKey]
+         chRefreshSubs
+      end if
+      exit chOnionFollowFetch
+   end if
+   oxDial tAddr, kOnionVPort
+   put the result into tStream
+   if tStream is not an integer then
+      if tConfirmed then
+         put ("name=" & chShortKey(pKey) & " (anonymous - offline)") into sFollowFeeds[pKey]
+         chRefreshSubs
+         chLog "Channel " & chShortKey(pKey) & " is anonymous and its publisher is not reachable over Tor right now (" & tStream & "). Its releases appear when it comes online."
+      end if
+      exit chOnionFollowFetch
+   end if
+   put tStream into sFollowStream[pKey]
+   put "follow-feed" into sOnRole[tStream]
+   put pKey into sOnPub[tStream]
+   put "" into sOnBuf[tStream]
+   put chChanRequest(kVerbFeed, pKey, "") into sOnReq[tStream]   -- sent on "open"
+   put the milliseconds into sRxDeadline[tStream]
+   oxSetStreamCallback tStream, "chOnionFetchStream"
+   send ("chOnionRecvWatchdog " & tStream) to me in kOnionRecvTimeout milliseconds
+end chOnionFollowFetch
+
+-- Dial an anon channel's onion and request ONE release's bytes (section 6.5).
+command chOnionDownload pKey, pRelId, pTitle, pEnc, pOrigName
+   local tAddr, tStream, tName
+   if not sHasOnion then
+      chLog "This is an anonymous release, but OnionXT + cryptoXT are not installed here."
+      exit chOnionDownload
+   end if
+   if not chOnionReadyNow() then
+      chLog "Tor still connecting - try Download again in a moment."
+      exit chOnionDownload
+   end if
+   put chOnionAddrForKey(pKey) into tAddr
+   if tAddr is empty then
+      chLog "Could not resolve that anonymous channel's Tor address."
+      exit chOnionDownload
+   end if
+   oxDial tAddr, kOnionVPort
+   put the result into tStream
+   if tStream is not an integer then
+      chLog "Could not open a Tor connection to that channel:" && tStream
+      exit chOnionDownload
+   end if
+   put chSafeLeaf(pOrigName) into tName
+   if tName is "shared-file" and pTitle is not empty then
+      put chSafeLeaf(pTitle) into tName
+   end if
+   put "download" into sOnRole[tStream]
+   put pKey into sOnPub[tStream]
+   put chChanRequest(kVerbFile, pKey, pRelId) into sOnReq[tStream]   -- sent on "open"
+   put "header" into sRxState[tStream]
+   put "" into sRxBuf[tStream]
+   put 0 into sRxGot[tStream]
+   put tName into sRxName[tStream]
+   put chDefaultSave() into sRxSave[tStream]
+   if pEnc is "enc" then
+      put chFileKey(sFollowPass[pKey], pKey) into sRxKey[tStream]
+   else
+      put "" into sRxKey[tStream]
+   end if
+   put the milliseconds into sRxDeadline[tStream]
+   put tName into sOnionXfer[tStream]["name"]
+   put "down" into sOnionXfer[tStream]["dir"]
+   put 0 into sOnionXfer[tStream]["total"]
+   put 0 into sOnionXfer[tStream]["got"]
+   put "connecting" into sOnionXfer[tStream]["state"]
+   oxSetStreamCallback tStream, "chOnionFetchStream"
+   send ("chOnionRecvWatchdog " & tStream) to me in kOnionRecvTimeout milliseconds
+   chLog "Downloading '" & pTitle & "' anonymously over Tor..."
+end chOnionDownload
+
+-- Fetch-side per-stream handler (dialed streams). On "open", send the pending BTXC
+-- request; on "data", route to the BTXF feed parser or the BTXO file receiver.
+command chOnionFetchStream pStream, pEvent, pData
+   if pEvent is "open" then
+      if sOnReq[pStream] is not empty then
+         oxWrite pStream, sOnReq[pStream]
+         put "" into sOnReq[pStream]
+      end if
+      put the milliseconds into sRxDeadline[pStream]
+   else if pEvent is "data" then
+      if sOnRole[pStream] is "follow-feed" then
+         chOnionFeedData pStream, pData
+      else if sOnRole[pStream] is "download" then
+         chOnionRecvData pStream, pData
+      end if
+   else if pEvent is "closed" or pEvent is "error" then
+      if sOnRole[pStream] is "download" then
+         if sRxState[pStream] is not "done" and sRxState[pStream] is not empty then
+            chOnionRecvAbort pStream, "The publisher went offline before the anonymous download finished. Try again."
+         end if
+      else if sOnRole[pStream] is "follow-feed" then
+         chOnionFetchClear pStream   -- the next tick re-dials
+      end if
+   end if
+end chOnionFetchStream
+
+-- Clear a fetch stream's state and, for a feed stream, drop its follow mapping so
+-- the next tick reconnects.
+command chOnionFetchClear pStream
+   local tKey
+   put sOnPub[pStream] into tKey
+   if tKey is not empty and sFollowStream[tKey] is pStream then
+      delete variable sFollowStream[tKey]
+   end if
+   delete variable sOnBuf[pStream]
+   delete variable sOnReq[pStream]
+   delete variable sOnRole[pStream]
+   delete variable sOnPub[pStream]
+end chOnionFetchClear
+
+command chOnionFetchAbort pStream, pMsg
+   local tErr
+   try
+      oxCloseStream pStream
+   catch tErr
+   end try
+   chOnionFetchClear pStream
+   if pMsg is not empty then
+      chLog pMsg
+   end if
+end chOnionFetchAbort
+
+-- BTXF feed-frame parser (section 6.4), draining every complete frame each call so
+-- a real-time push reassembles across reads. Each value goes through the EXISTING
+-- chReadFeed (plaintext / LOCKED / BADPASS) - only the byte source moved.
+command chOnionFeedData pStream, pData
+   local tBuf, tVer, tValLen, tNeed, tValue, tKey, tFeed
+   put pData after sOnBuf[pStream]
+   put the milliseconds into sRxDeadline[pStream]
+   put sOnPub[pStream] into tKey
+   repeat
+      put sOnBuf[pStream] into tBuf
+      if the number of bytes in tBuf < 9 then
+         exit repeat
+      end if
+      if (byte 1 to 4 of tBuf) is not kFeedFrameMagic then
+         chOnionFetchAbort pStream, "Unexpected data on the anonymous feed stream (bad magic)."
+         exit chOnionFeedData
+      end if
+      put byteToNum(byte 5 of tBuf) into tVer
+      if tVer is not kFeedFrameVer then
+         chOnionFetchAbort pStream, "Unsupported anonymous feed frame version."
+         exit chOnionFeedData
+      end if
+      put chBEu32(byte 6 to 9 of tBuf) into tValLen
+      if tValLen > kOnionFeedCap then
+         chOnionFetchAbort pStream, "Anonymous feed frame too large - aborting."
+         exit chOnionFeedData
+      end if
+      put (9 + tValLen) into tNeed
+      if the number of bytes in tBuf < tNeed then
+         exit repeat
+      end if
+      put byte 10 to (9 + tValLen) of tBuf into tValue
+      delete byte 1 to (9 + tValLen) of sOnBuf[pStream]
+      put chReadFeed(tValue, sFollowPass[tKey], tKey) into tFeed
+      chApplyAnonFeed tKey, tFeed
+   end repeat
+end chOnionFeedData
+
+-- Apply a feed that arrived over Tor (mirrors the dhtMutableItem handler). Also
+-- PROMOTES a stripped-card follow to anon now that it proved onion-only (section
+-- 6.8), so the tick stops doing DHT gets for it.
+command chApplyAnonFeed pKey, pFeed
+   local tN
+   delete variable sFeedWait[pKey]
+   delete variable sFeedHinted[pKey]
+   if sFollowAnon[pKey] is not "true" then
+      put "true" into sFollowAnon[pKey]
+      set the uFollowAnon of this stack to arrayEncode(sFollowAnon)
+      chPrefSave
+   end if
+   if pFeed is "LOCKED" then
+      put ("name=" & chShortKey(pKey) & " (private - needs passphrase)") into sFollowFeeds[pKey]
+      chRefreshSubs
+      chLog "Anonymous channel " & chShortKey(pKey) & " is private. Follow again with its passphrase to read it."
+   else if pFeed is "BADPASS" then
+      put ("name=" & chShortKey(pKey) & " (wrong passphrase)") into sFollowFeeds[pKey]
+      chRefreshSubs
+      chLog "Anonymous channel " & chShortKey(pKey) & ": that passphrase did not unlock the feed."
+   else
+      put pFeed into sFollowFeeds[pKey]
+      chRefreshSubs
+      put chCountReleases(pFeed) into tN
+      chLog "Anonymous feed " & chShortKey(pKey) & ": verified over Tor," && tN && "release(s)."
+   end if
+end chApplyAnonFeed
+
+-- ---- follower: the section-3.3 BTXO file receiver ----------------------------
+command chOnionRecvData pStream, pData
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
+   if sRxState[pStream] is empty or sRxState[pStream] is "done" then
+      exit chOnionRecvData
+   end if
+   put pData after sRxBuf[pStream]
+   put the milliseconds into sRxDeadline[pStream]
+   if sRxState[pStream] is "header" then
+      if the number of bytes in sRxBuf[pStream] < 8 then
+         exit chOnionRecvData
+      end if
+      if (byte 1 to 4 of sRxBuf[pStream]) is not kOnionMagic then
+         chOnionRecvAbort pStream, "Unexpected data on the Tor stream (bad magic)."
+         exit chOnionRecvData
+      end if
+      if byteToNum(byte 5 of sRxBuf[pStream]) is not kOnionVer then
+         chOnionRecvAbort pStream, "Unsupported Tor stream version."
+         exit chOnionRecvData
+      end if
+      put byteToNum(byte 6 of sRxBuf[pStream]) into tFlags
+      put chBEu16(byte 7 to 8 of sRxBuf[pStream]) into tNameLen
+      if tNameLen > kOnionMaxName then
+         chOnionRecvAbort pStream, "Tor stream header looks malformed (name too long)."
+         exit chOnionRecvData
+      end if
+      if the number of bytes in sRxBuf[pStream] < (8 + tNameLen + 8) then
+         exit chOnionRecvData
+      end if
+      put textDecode(byte 9 to (8 + tNameLen) of sRxBuf[pStream], "UTF-8") into tName
+      put chBEu32(byte (9 + tNameLen) to (12 + tNameLen) of sRxBuf[pStream]) into tHi
+      put chBEu32(byte (13 + tNameLen) to (16 + tNameLen) of sRxBuf[pStream]) into tLo
+      put (tHi * 4294967296 + tLo) into tTotal
+      if tTotal > kOnionMaxTotal then
+         chOnionRecvAbort pStream, "Refusing an oversized Tor transfer."
+         exit chOnionRecvData
+      end if
+      if sRxKey[pStream] is not empty and (tFlags bitAnd kFlagEnc) is 0 then
+         chOnionRecvAbort pStream, "This release was supposed to be encrypted but arrived unencrypted - do not trust it."
+         exit chOnionRecvData
+      end if
+      if (tFlags bitAnd kFlagEnc) is not 0 and sRxKey[pStream] is empty then
+         chOnionRecvAbort pStream, "This release is encrypted but no passphrase is set - Follow the channel again with its passphrase."
+         exit chOnionRecvData
+      end if
+      put (tFlags bitAnd kFlagEnc) into sRxEnc[pStream]
+      if tName is not empty then
+         put chSafeLeaf(tName) into sRxName[pStream]
+      end if
+      put tTotal into sRxTotal[pStream]
+      put tTotal into sOnionXfer[pStream]["total"]
+      put 0 into sRxGot[pStream]
+      put chTempEncPath() into sRxTmp[pStream]
+      open file sRxTmp[pStream] for binary write
+      if the result is not empty then
+         chOnionRecvAbort pStream, "Could not open a temp file to receive into."
+         exit chOnionRecvData
+      end if
+      delete byte 1 to (16 + tNameLen) of sRxBuf[pStream]
+      put "body" into sRxState[pStream]
+      put "active" into sOnionXfer[pStream]["state"]
+   end if
+   repeat while sRxState[pStream] is "body"
+      if the number of bytes in sRxBuf[pStream] < 4 then
+         exit repeat
+      end if
+      put chBEu32(byte 1 to 4 of sRxBuf[pStream]) into tLen
+      if tLen is 0 then
+         delete byte 1 to 4 of sRxBuf[pStream]
+         put "done" into sRxState[pStream]
+         exit repeat
+      end if
+      if tLen > kOnionChunk then
+         chOnionRecvAbort pStream, "Tor stream frame too large - aborting."
+         exit chOnionRecvData
+      end if
+      if the number of bytes in sRxBuf[pStream] < (4 + tLen) then
+         exit repeat
+      end if
+      put byte 5 to (4 + tLen) of sRxBuf[pStream] into tPayload
+      write tPayload to file sRxTmp[pStream]
+      if the result is not empty then
+         chOnionRecvAbort pStream, "Could not write the received data to disk:" && the result
+         exit chOnionRecvData
+      end if
+      add tLen to sRxGot[pStream]
+      put sRxGot[pStream] into sOnionXfer[pStream]["got"]
+      delete byte 1 to (4 + tLen) of sRxBuf[pStream]
+   end repeat
+   -- belt and suspenders: finish on the byte count even if the terminator is lost
+   if sRxState[pStream] is "body" and sRxGot[pStream] >= sRxTotal[pStream] then
+      put "done" into sRxState[pStream]
+   end if
+   if sRxState[pStream] is "done" then
+      chOnionRecvFinish pStream
+   end if
+end chOnionRecvData
+
+command chOnionRecvFinish pStream
+   local tSave, tOut, tErr, tErr2
+   close file sRxTmp[pStream]
+   if sRxGot[pStream] is not sRxTotal[pStream] then
+      chOnionRecvAbort pStream, "The anonymous download ended early (incomplete) - nothing was saved."
+      exit chOnionRecvFinish
+   end if
+   put sRxSave[pStream] into tSave
+   put tSave & "/" & chSafeLeaf(sRxName[pStream]) into tOut
+   if sRxEnc[pStream] is not 0 then
+      put chDecryptFile(sRxTmp[pStream], tOut, sRxKey[pStream]) into tErr
+      try
+         if there is a file sRxTmp[pStream] then
+            delete file sRxTmp[pStream]
+         end if
+      catch tErr2
+      end try
+      if tErr is not empty then
+         put "error" into sOnionXfer[pStream]["state"]
+         chLog "Downloaded over Tor but could not unlock '" & sRxName[pStream] & "':" && tErr
+         chOnionRecvClear pStream
+         oxCloseStream pStream
+         exit chOnionRecvFinish
+      end if
+   else
+      put chMoveFile(sRxTmp[pStream], tOut) into tErr
+      if tErr is not empty then
+         put "error" into sOnionXfer[pStream]["state"]
+         chLog "Downloaded over Tor but could not save the file:" && tErr
+         chOnionRecvClear pStream
+         oxCloseStream pStream
+         exit chOnionRecvFinish
+      end if
+   end if
+   put "done" into sOnionXfer[pStream]["state"]
+   chLog "Received '" & sRxName[pStream] & "' anonymously over Tor into" && tSave & "."
+   chOnionRecvClear pStream
+   oxCloseStream pStream
+end chOnionRecvFinish
+
+command chOnionRecvClear pStream
+   delete variable sRxBuf[pStream]
+   delete variable sRxState[pStream]
+   delete variable sRxTmp[pStream]
+   delete variable sRxName[pStream]
+   delete variable sRxEnc[pStream]
+   delete variable sRxTotal[pStream]
+   delete variable sRxGot[pStream]
+   delete variable sRxKey[pStream]
+   delete variable sRxSave[pStream]
+   delete variable sRxDeadline[pStream]
+   delete variable sOnRole[pStream]
+   delete variable sOnPub[pStream]
+   delete variable sOnReq[pStream]
+   delete variable sOnBuf[pStream]
+end chOnionRecvClear
+
+command chOnionRecvAbort pStream, pMsg
+   local tErr
+   try
+      close file sRxTmp[pStream]
+   catch tErr
+   end try
+   if sRxTmp[pStream] is not empty then
+      try
+         if there is a file sRxTmp[pStream] then
+            delete file sRxTmp[pStream]
+         end if
+      catch tErr
+      end try
+   end if
+   put "error" into sOnionXfer[pStream]["state"]
+   chLog pMsg
+   chOnionRecvClear pStream
+   oxCloseStream pStream
+end chOnionRecvAbort
+
+-- Idle watchdog for a fetch stream (armed at dial). A follow-feed SUBSCRIPTION
+-- idles between pushes, so it only gives up after long silence (the publisher
+-- likely went away) and the next tick re-dials; a download aborts on a stall.
+command chOnionRecvWatchdog pStream
+   local tGap
+   if sOnRole[pStream] is empty then
+      exit chOnionRecvWatchdog
+   end if
+   put (the milliseconds - sRxDeadline[pStream]) into tGap
+   if sOnRole[pStream] is "follow-feed" then
+      if tGap > (2 * kOnionRecvTimeout) then
+         chOnionFetchAbort pStream, ""
+         exit chOnionRecvWatchdog
+      end if
+      send ("chOnionRecvWatchdog " & pStream) to me in kOnionRecvTimeout milliseconds
+      exit chOnionRecvWatchdog
+   end if
+   if tGap > kOnionRecvTimeout then
+      chOnionRecvAbort pStream, "The anonymous (Tor) download stalled - closing it. Try again."
+      exit chOnionRecvWatchdog
+   end if
+   send ("chOnionRecvWatchdog " & pStream) to me in kOnionRecvTimeout milliseconds
+end chOnionRecvWatchdog
+
+-- The row state text for an onion transfer.
+function chOnionXferState pOx
+   if pOx["state"] is "done" then
+      return "onion done"
+   end if
+   if pOx["state"] is "error" then
+      return "onion error"
+   end if
+   if pOx["dir"] is "up" then
+      return "onion up"
+   end if
+   return "onion down"
+end chOnionXferState
+
+-- On startup an in-memory serve map is empty, so an anon channel's stored
+-- onion:<relId> releases can no longer be served (section 6.5). Prune them (the
+-- demo default) with a log, so a restarted publisher never advertises a release
+-- it cannot deliver.
+command chPruneStrandedAnon
+   local tI, tRel, tLoc, tKept, tPruned, tSavedID, tChanged
+   if chChannelCount() is 0 then
+      exit chPruneStrandedAnon
+   end if
+   put 0 into tPruned
+   put false into tChanged
+   put the itemDelimiter into tSavedID
+   repeat with tI = 1 to chChannelCount()
+      if chIsAnonChannel(tI) then
+         put "" into tKept
+         set the itemDelimiter to tab
+         repeat for each line tRel in sChannels[tI]["releases"]
+            if tRel is not empty then
+               put item 2 of tRel into tLoc
+               if tLoc begins with "onion:" then
+                  add 1 to tPruned
+               else
+                  if tKept is empty then
+                     put tRel into tKept
+                  else
+                     put tKept & return & tRel into tKept
+                  end if
+               end if
+            end if
+         end repeat
+         set the itemDelimiter to tSavedID
+         if tKept is not sChannels[tI]["releases"] then
+            put tKept into sChannels[tI]["releases"]
+            put true into tChanged
+         end if
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   if tChanged then
+      chSaveChannels
+      chActivate sActive   -- refresh the cache for the (possibly pruned) active channel
+      chLog "* " & tPruned & " anonymous release(s) could not be restored after restart (their files are no longer served); re-publish them."
+   end if
+end chPruneStrandedAnon
 
 function chTrackers
    return "udp://tracker.opentrackr.org:1337/announce"

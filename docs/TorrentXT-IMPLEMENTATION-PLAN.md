@@ -594,5 +594,6 @@ TorrentXT/
 - The sibling extensions — `SethMorrowSoftware/ShowControl` (the poll-drain model, the
   FFI conventions, the static gates, the Phase-0 spike, the packaging) and
   `SethMorrowSoftware/Box2Dxt` (the handle table, the OXT gotchas, the performance
-  playbook). Their `CLAUDE.md` files are the canonical source for every carried lesson.
+  playbook; since 2026-08-14 the suite's own `box2dxt/` member). Their `CLAUDE.md`
+  files are the canonical source for every carried lesson.
 - rqbit — GitHub `ikatson/rqbit` (the fallback Rust engine; usable as a library; HTTP API).

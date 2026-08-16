@@ -207,6 +207,11 @@ A simple starter, two flagship demos, plus the shared poll-dispatcher utility:
   color-coded transfers table, shareable channel cards, and an immutable "quick
   drop" (pin text, share a 40-char code). The DHT says *where*, BitTorrent moves
   *what*. A built-in **"What is this?"** button explains it in plain language.
+  Optionally, click **"Anonymous..."** to make a whole channel travel over **Tor**
+  (its feed *and* files ride the channel's own onion service, both IPs hidden, no
+  DHT/magnet) — needs OnionXT + cryptoXT + a local Tor daemon, and fails closed
+  without them. *(Anonymous-channels layer verified statically; needs an OXT pass
+  with a running Tor daemon.)*
 - **[`examples/torrent-rp1-chat.livecodescript`](examples/torrent-rp1-chat.livecodescript)**
   — the **rp1 peer-wire transport** demo: two machines exchange short messages
   directly over the BitTorrent peer wire (no torrent payload at all), using the
