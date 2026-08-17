@@ -209,6 +209,33 @@ Consequences for anyone editing these demos:
   ends** or the derived keys differ. If you change them, change both sides and bump the
   on-wire format.
 
+## The Quick Share lineage: this member's demo is nocloud's UPSTREAM
+
+`examples/torrent-quickshare.livecodescript` and
+`nocloud/src/nocloudquickshare.livecodescript` share an ancestor and most of a
+handler surface, and neither file says so. Measured 2026-08-17: the demo defines
+**148** `qs*` handlers, nocloud **229**, of which **144 are shared** - so nocloud
+is very close to a strict superset, and the demo's only unique handlers are the
+four that ARE the demo (`qsBar`, `qsBrowseFile`, `qsToggleTor`,
+`qsToggleWebShare`).
+
+**Direction matters and is easy to get backwards:** this demo is the in-repo
+ORIGINAL. The dashboard was spun out standalone, grew the hardened HTTP/Tor
+server and the web app, and was folded back into the monorepo at `nocloud/` on
+2026-08-13. So a fix made here does NOT reach nocloud, and a fix made there
+usually should be considered here - 144 handlers deep, a defect in one is
+overwhelmingly likely to exist in the other. The 2026-08-17 HEAD-method defects
+found in nocloud's route table are exactly that shape.
+
+> **Recorded because an audit got this wrong in a way worth keeping.** A survey
+> reported that "the only mention of nocloud anywhere in torrentxt is an
+> incidental comment", and concluded the relationship was unrecorded. It is
+> recorded - `examples/README.md` carries an explicit paragraph naming the spin-out
+> and the fold, and calling this demo "the in-repo original". What was missing was
+> a pointer from the ENGINEERING notes, which is where someone about to change one
+> of those 144 handlers actually looks. Absence from the place you searched is not
+> absence from the tree.
+
 ## Git / workflow
 
 - Develop on the per-task branch (e.g. `claude/...`); commit there, open a **draft PR**

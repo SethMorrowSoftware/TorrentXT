@@ -52,6 +52,7 @@ constant kStHeight = 620
 local sSession          -- the live session handle (0 = none)
 local sTorrent          -- a torrent we create + seed, for torrent-scoped checks
 local sTorrent2         -- a second torrent from the extended-add check
+local sTorrent3         -- a third, from the plain btAddMagnet check beside it
 local sTempDir          -- parent dir we seed from
 local sContentDir       -- the content folder inside it
 
@@ -302,6 +303,7 @@ command stRun
    stResetCounters
    put 0 into sTorrent
    put 0 into sTorrent2
+   put 0 into sTorrent3
 
    stSection "session + ABI"
    -- btStartSession is the one handler that can throw (on ABI skew); a clean
@@ -468,10 +470,35 @@ command stRun
    stAssert "btRp1Send to a non-peer fails cleanly", \
       (btRp1Send(sSession, 999999, textEncode("nobody is listening", "UTF-8")) < 0)
 
+   -- The three handlers this section used to wave at as "confirm by hand".
+   -- The excuses were about the SUCCESS path and were read as if they covered
+   -- the whole handler: the shim checks the handle (or the session, or the
+   -- buffer) FIRST and returns a code before it can move a byte, so every one
+   -- of them has a refusal leg that is safe, offline and deterministic. That
+   -- distinction is exactly what the 2026-08-17 coverage-gate fix surfaced -
+   -- until then this NOTE was the only surviving mention of all three, and the
+   -- gate counted a sentence saying they were untested as proof they were.
+   stSection "destructive + buffer handlers: the refusal legs"
+   -- btx_move_storage returns BTX_ERR_BAD_HANDLE before h.move_storage() runs,
+   -- so a stale id relocates nothing. Destructive on a LIVE handle only.
+   stAssert "btMoveStorage on a stale id refuses, moving nothing", \
+      (btMoveStorage(999999, sTempDir) is -2)
+   -- Non-empty Data so the .lcb does NOT short-circuit: this proves the
+   -- foreign call ran and the shim rejected the handle, not that we skipped it.
+   stAssert "btSetFilePriorities on a stale id refuses", \
+      (btSetFilePriorities(999999, textEncode("0", "UTF-8")) is -2)
+   -- read_resume_data uses the ec-overload, so garbage sets an error code
+   -- rather than throwing. 0 is "no torrent added".
+   stAssert "btAddTorrentWithResume refuses garbage resume bytes", \
+      (btAddTorrentWithResume(sSession, textEncode("not-bencoded", "UTF-8"), \
+         sTempDir) is 0)
+   -- ...and 0 alone cannot tell a refusal from the empty-Data short-circuit
+   -- that never calls the shim at all, so pin the shim's own message.
+   stAssert "...and says why (the shim ran, it did not short-circuit)", \
+      (btLastError() contains "invalid resume data")
+
    stSection "not auto-checked - confirm by hand"
-   stNote "btMoveStorage + btRemoveTorrent(deleteFiles=true) are destructive;"
-   stNote "btSetFilePriorities needs a binary buffer; btAddTorrentWithResume"
-   stNote "needs async resume bytes; btAddMagnet is covered via btAddMagnetEx."
+   stNote "btRemoveTorrent(deleteFiles=true) deletes real files: manual only."
    catch tRunErr
       stNote "RUNTIME ERROR - a binding call failed: " & tRunErr
       add 1 to sFailed
@@ -562,6 +589,15 @@ command stRunTorrentChecks pTorrentData
    stAssert "btClearPieceDeadlines", (btClearPieceDeadlines(sTorrent) is 0)
 
    stSection "extended add"
+   -- btAddMagnet is the plain form of the Ex call below. It used to be listed
+   -- in the hand-check note at the end of this file as "covered via
+   -- btAddMagnetEx", which is an argument about SHAPE, not a test: the two
+   -- take different argument counts, so the plain form's own marshalling was
+   -- never exercised anywhere. The 2026-08-17 coverage-gate fix - which stopped
+   -- counting a name inside a string literal as a call - is what surfaced that,
+   -- because the note was the only surviving mention.
+   put btAddMagnet(sSession, "magnet:?xt=urn:btih:2222222222222222222222222222222222222222", sTempDir) into sTorrent3
+   stAssert "btAddMagnet returns a handle", (sTorrent3 > 0)
    put btAddMagnetEx(sSession, "magnet:?xt=urn:btih:1111111111111111111111111111111111111111", sTempDir, "16", "16") into sTorrent2
    stAssert "btAddMagnetEx (paused) returns a handle", (sTorrent2 > 0)
    stAssert "btAddTorrentFileEx returns a handle", (btAddTorrentFileEx(sSession, pTorrentData, sTempDir, "16", "16") > 0)
@@ -603,9 +639,13 @@ command stCleanup
       if sTorrent2 is not empty and sTorrent2 > 0 then
          btRemoveTorrent sSession, sTorrent2, false
       end if
+      if sTorrent3 is not empty and sTorrent3 > 0 then
+         btRemoveTorrent sSession, sTorrent3, false
+      end if
       btStopSession sSession
    end if
    put 0 into sSession
    put 0 into sTorrent
    put 0 into sTorrent2
+   put 0 into sTorrent3
 end stCleanup
