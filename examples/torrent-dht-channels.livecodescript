@@ -11,7 +11,7 @@ script "dhtChannelsApp"
 -- Your channel identity / names / subscriptions persist automatically to a small
 -- file in your per-user folder, so they survive across runs (and as a standalone
 -- .exe / app, which cannot save its own stack). Click "Lock Identity..." to seal
--- that file with a passphrase via cryptoXT (Argon2id + secretbox); you then enter
+-- that file with a passphrase via SodiumXT (Argon2id + secretbox); you then enter
 -- it each launch, and there is no recovery if you lose it.
 --
 -- THE DEMO (run it on two or more machines):
@@ -34,7 +34,7 @@ script "dhtChannelsApp"
 -- PRIVACY (optional): a channel is PUBLIC by default - anyone with its address
 -- reads the file list, anyone with a magnet downloads the file. Click "Privacy"
 -- to set a passphrase, and that channel encrypts BOTH its feed AND every file you
--- publish to it with cryptoXT (libsodium): the key is derived from the passphrase
+-- publish to it with SodiumXT (libsodium): the key is derived from the passphrase
 -- with Argon2id (salted by the channel's public key), the feed is sealed with
 -- crypto_secretbox before the DHT put (the file list is hidden), and each file is
 -- sealed with crypto_secretstream before it is shared, so the torrent carries
@@ -46,7 +46,7 @@ script "dhtChannelsApp"
 -- Fail-closed: a private channel that cannot be encrypted is never published in
 -- the clear.
 --
--- REQUIRES, for the privacy features only, the cryptoXT extension
+-- REQUIRES, for the privacy features only, the SodiumXT extension
 -- (org.openxtalk.library.sodium) to be installed alongside this. Public channels
 -- and all non-encryption features work without it.
 --
@@ -55,7 +55,7 @@ script "dhtChannelsApp"
 -- caught by shutdownRequest so the DHT routing table + prefs are saved and the
 -- session shuts down cleanly even on Cmd-Q / Dock quit. In the builder: include
 -- org.openxtalk.library.torrent (required) and org.openxtalk.library.sodium
--- (cryptoXT - OPTIONAL, only for private channels + identity lock; the app fails
+-- (SodiumXT - OPTIONAL, only for private channels + identity lock; the app fails
 -- closed with a clear message when it is absent). Identity, channels, and
 -- subscriptions persist to a small per-user file (NOT the stackfile), so they
 -- survive across runs and as a packaged app.
@@ -78,8 +78,8 @@ script "dhtChannelsApp"
 -- WHOLE feed + every file travel over the channel's own Tor onion service (both
 -- IPs hidden, nothing on the DHT or a magnet), reachable from the channel card
 -- alone - the onion address is derived from the channel's existing ed25519 key.
--- It composes with Privacy (Tor hides WHERE, cryptoXT hides WHAT + authenticates
--- WHO). Needs the OnionXT extension (org.openxtalk.library.onion) + cryptoXT + a
+-- It composes with Privacy (Tor hides WHERE, SodiumXT hides WHAT + authenticates
+-- WHO). Needs the OnionXT extension (org.openxtalk.library.onion) + SodiumXT + a
 -- local Tor daemon (127.0.0.1:9050/9051 or Tor Browser 9150/9151). Fails closed:
 -- with any piece missing, anon is inert and every public feature works normally.
 -- Plaintext anon hides the route but does NOT authenticate the sender; anon is
@@ -2162,7 +2162,7 @@ local sPrefLockedOut    -- "true" if the prefs file is locked and we could NOT o
 local sPolling          -- "true" while the loops are armed
 local sChannels         -- array: index -> {seed, name, releases, pass} - YOUR channels
 local sActive           -- index of the active channel (drives the sMy* cache below)
-local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
+local sCanEncrypt       -- "true" if SodiumXT (libsodium) is installed + working
 local sKeyCache         -- array: pubkeyHex&":"&pass -> 32-byte master key (Argon2id is slow)
 local sFollowPass       -- array: followed pubkey -> its passphrase ("" = public)
 local sPub              -- active channel public key (hex) - shareable
@@ -2203,7 +2203,7 @@ local sFeedHinted       -- array: followed pubkey -> "true" once the no-feed hin
 -- follower reaches it from the channel card alone. All of this is inert unless
 -- sHasOnion, and every anon action fails closed. The onion identity is the
 -- channel's OWN key - no new key is minted.
-local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once at start)
+local sHasOnion         -- "true" if OnionXT loads AND SodiumXT works (probed once at start)
 local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
 local sOnionIdentityOk  -- "true" once the offline seed<->pubkey byte-compare passed (section 6.1)
 local sOnionTriedTB     -- "true" once we retried the Tor Browser control port pair
@@ -2217,7 +2217,7 @@ local sFeedStreams      -- array: pubkey -> return-delimited list of subscribed 
 -- publisher: the in-memory serve map (relId -> file), keyed "pub:relId". NOT
 -- persisted (the demo prunes stranded onion releases on load; section 6.5).
 local sOnionServe       -- array: "pub:relId" -> absolute path of the file to stream
-local sOnionServeEnc    -- array: "pub:relId" -> kFlagEnc if that release is a cryptoXT .enc
+local sOnionServeEnc    -- array: "pub:relId" -> kFlagEnc if that release is a SodiumXT .enc
 local sOnionServeName   -- array: "pub:relId" -> the original filename (for the header)
 local sOnionServeTotal  -- array: "pub:relId" -> total bytes to stream
 -- follower: the live dial per anon channel we follow
@@ -2238,7 +2238,7 @@ local sRxBuf            -- array: stream -> reassembly buffer (drained + compact
 local sRxState          -- array: stream -> "header" / "body" / "done"
 local sRxTmp            -- array: stream -> temp output path we are writing into
 local sRxName           -- array: stream -> real (sanitized) filename to save as
-local sRxEnc            -- array: stream -> nonzero if the payload is a cryptoXT .enc
+local sRxEnc            -- array: stream -> nonzero if the payload is a SodiumXT .enc
 local sRxTotal          -- array: stream -> total payload bytes expected
 local sRxGot            -- array: stream -> payload bytes written so far
 local sRxKey            -- array: stream -> 32-byte file key (encrypted receive), else empty
@@ -2257,7 +2257,7 @@ constant kChAppVersion = "1.0.0"
 constant kUiVersion = "channels-kit2-2"
 -- prefs file header: an 8-byte magic, then a 1-byte mode ("P" plain / "E" sealed).
 -- A SEALED file is [magic]["E"][salt 16][sxSecretBox], the same 16-byte-salt +
--- Argon2id convention cryptoXT's own file-encrypt demo uses.
+-- Argon2id convention SodiumXT's own file-encrypt demo uses.
 constant kPrefMagic = "BTXPREF1"
 -- seconds of followed-but-feedless silence before the one-time diagnosis line
 -- (the fetch itself keeps retrying on the 60 s tick; nothing is aborted)
@@ -2279,7 +2279,7 @@ constant kChRowOnion = "0,150,150"      -- an onion (Tor) transfer row (teal; se
 -- ---- OnionXT (optional Tor anonymity) constants ------------------------------
 -- Model C: an anon channel's feed AND files ride an OnionXT onion stream (both
 -- IPs hidden) and NO torrent / DHT put is ever made for them. Requires OnionXT +
--- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
+-- SodiumXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
 -- ABI (onionxt/docs/05-api-reference.md); verified statically here, needs an
 -- on-engine OXT pass with a running Tor daemon before any runtime claim. OXT
 -- resolves constants by lexical position, so they are all declared here, once,
@@ -2288,7 +2288,7 @@ constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync
 constant kOnionVer = 1                 -- file-stream protocol version
 constant kOnionVPort = 80              -- the onion service's advertised virtual port
 constant kOnionChunk = 65536           -- 64 KiB: max payload bytes in one data frame
-constant kFlagEnc = 1                  -- header flags bit0: payload is a cryptoXT .enc
+constant kFlagEnc = 1                  -- header flags bit0: payload is a SodiumXT .enc
 constant kOnionPumpTick = 15           -- ms between send-pump frames (never a tight loop)
 constant kOnionSendTimeout = 30000     -- ms idle watchdog, sender
 constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slow)
@@ -3007,7 +3007,7 @@ command chAddTips
    set the tooltip of button "chRename" to "Give the active channel a friendly display name its followers will see."
    set the tooltip of button "chPublish" to "Pick a folder. It is packaged, seeded, and added to the active channel's feed."
    set the tooltip of button "chPrivacy" to "Set a passphrase to encrypt this channel's feed AND the files you publish to it."
-   set the tooltip of button "chAnon" to "Make this whole channel anonymous: its feed AND files travel over Tor (both IPs hidden, no DHT/magnet), reachable from the channel card alone. Needs OnionXT + cryptoXT + a local Tor daemon. Compose it with Privacy for encrypted contents too."
+   set the tooltip of button "chAnon" to "Make this whole channel anonymous: its feed AND files travel over Tor (both IPs hidden, no DHT/magnet), reachable from the channel card alone. Needs OnionXT + SodiumXT + a local Tor daemon. Compose it with Privacy for encrypted contents too."
    set the tooltip of field "chTor" to "Status of your local Tor connection. 'ready' means anonymous channels can publish and be reached."
    set the tooltip of field "chFollowKey" to "Paste someone's channel card or 64-character address, then click Follow."
    set the tooltip of button "chFollow" to "Subscribe to that channel and fetch its signed list of files."
@@ -3047,7 +3047,7 @@ command chHelp
    put tMsg & "   on the DHT. It still does not hide your IP, and private publishing is one file at a time." & return & return into tMsg
    put tMsg & "   ANONYMOUS (Tor): click Anonymous to make a whole channel travel over Tor - its file" & return into tMsg
    put tMsg & "   list AND every file ride the channel's own onion service, both IPs hidden, nothing on" & return into tMsg
-   put tMsg & "   the DHT or a magnet, reachable from the channel card alone. Needs OnionXT + cryptoXT +" & return into tMsg
+   put tMsg & "   the DHT or a magnet, reachable from the channel card alone. Needs OnionXT + SodiumXT +" & return into tMsg
    put tMsg & "   a local Tor daemon. The onion is bound to the channel key, so the address and the" & return into tMsg
    put tMsg & "   channel identity are linkable by design (use a separate channel for an unlinkable one)." & return into tMsg
    put tMsg & "   Tor is slow for large media, and PLAINTEXT anon hides the route but does NOT" & return into tMsg
@@ -3086,7 +3086,7 @@ command chStart
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    -- can this build encrypt? gates the optional private-channel feature
    put chCanEncrypt() into sCanEncrypt
-   -- probe OnionXT (needs cryptoXT) and run the OFFLINE seed<->pubkey byte-compare
+   -- probe OnionXT (needs SodiumXT) and run the OFFLINE seed<->pubkey byte-compare
    -- (section 6.1) BEFORE reading channels: a mismatch disables anon entirely, so
    -- a channel's derived .onion can never be wrong. Both are one-shot at start.
    put chHasOnion() into sHasOnion
@@ -3106,10 +3106,10 @@ command chStart
    chUpdateNowPub
    chUpdateLockButton      -- reflect whether the saved identity is passphrase-locked
    if not sCanEncrypt then
-      chLog "Note: cryptoXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
+      chLog "Note: SodiumXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
    end if
    -- bring up the Tor control link (non-blocking). The anon path is completely
-   -- inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
+   -- inert when OnionXT/SodiumXT/Tor are absent; nothing else changes.
    if sHasOnion then
       chOnionStart
    else
@@ -3333,7 +3333,7 @@ end chRenameChannel
 command chSetPrivacy
    local tPass, tName, tR
    if not sCanEncrypt then
-      answer "Private channels need cryptoXT (the org.openxtalk.library.sodium extension), which is not installed on this machine. Install it to use passphrases."
+      answer "Private channels need SodiumXT (the org.openxtalk.library.sodium extension), which is not installed on this machine. Install it to use passphrases."
       exit chSetPrivacy
    end if
    ask "Passphrase for this channel (leave blank to make it PUBLIC)." & return & \
@@ -3488,9 +3488,9 @@ end chStop
 -- A standalone app cannot save its own mainstack, so the stack custom properties
 -- (channels, follows, passphrases, DHT cache) would reset every launch. We mirror
 -- them to one file in a per-user folder: hydrated into the properties on open,
--- written on every change and on close. Optionally SEALED with cryptoXT, so the
+-- written on every change and on close. Optionally SEALED with SodiumXT, so the
 -- ed25519 secret keys + passphrases are not left on disk in the clear. The sealed
--- layout ([magic]["E"][16-byte salt][secretbox]) matches cryptoXT's file-encrypt
+-- layout ([magic]["E"][16-byte salt][secretbox]) matches SodiumXT's file-encrypt
 -- demo: a random 16-byte salt + Argon2id (sxPwHash "2" / Interactive).
 
 -- a writable per-user path for the prefs file (creates the folder if needed)
@@ -3534,7 +3534,7 @@ command chPrefLoad
       put byte 10 to -1 of tRaw into tBody
    else if tHeader is (kPrefMagic & "E") then
       if not sCanEncrypt then
-         answer "Your saved channels are passphrase-locked, but cryptoXT (org.openxtalk.library.sodium) is not installed, so they cannot be unlocked here."
+         answer "Your saved channels are passphrase-locked, but SodiumXT (org.openxtalk.library.sodium) is not installed, so they cannot be unlocked here."
          put "true" into sPrefLockedOut
          exit chPrefLoad
       end if
@@ -3615,7 +3615,7 @@ end chPrefSave
 command chProtectIdentity
    local tP1, tP2
    if not sCanEncrypt then
-      answer "Locking your identity needs cryptoXT (org.openxtalk.library.sodium), which is not installed."
+      answer "Locking your identity needs SodiumXT (org.openxtalk.library.sodium), which is not installed."
       exit chProtectIdentity
    end if
    if sVaultPass is empty then
@@ -3773,7 +3773,7 @@ command chPublishFile
    if sChannels[sActive]["pass"] is not empty then
       -- ---- PRIVATE: encrypt one file (chunked) before sharing it ----
       if not sCanEncrypt then
-         chLog "This channel is private but cryptoXT is not installed - publish is unavailable. Install org.openxtalk.library.sodium."
+         chLog "This channel is private but SodiumXT is not installed - publish is unavailable. Install org.openxtalk.library.sodium."
          exit chPublishFile
       end if
       answer file "Choose a FILE to share privately (it is encrypted before it leaves your machine):"
@@ -3959,7 +3959,7 @@ command chFollow
    -- an anon card is un-followable without OnionXT: refuse with a clear reason
    -- rather than silently doing a DHT get for an onion-only channel
    if tCardAnon is "true" and not sHasOnion then
-      chLog "That is an anonymous (Tor) channel, but OnionXT + cryptoXT are not installed here - it cannot be followed on this machine. Public channels are unaffected."
+      chLog "That is an anonymous (Tor) channel, but OnionXT + SodiumXT are not installed here - it cannot be followed on this machine. Public channels are unaffected."
       exit chFollow
    end if
    put (tKey is among the lines of sFollows) into tDup
@@ -4720,13 +4720,13 @@ end chBuildFeed
 
 -- ---- OPTIONAL feed encryption (the channel's file LIST) ----------------------
 -- A channel can carry a passphrase. If it does, its feed is encrypted with
--- cryptoXT (libsodium crypto_secretbox, XSalsa20-Poly1305) before the DHT put, so
+-- SodiumXT (libsodium crypto_secretbox, XSalsa20-Poly1305) before the DHT put, so
 -- only someone with the passphrase can read the file LIST (the FILES are
 -- encrypted separately - see "Phase 2: actual FILE encryption" below). The
 -- symmetric key is derived from the passphrase with Argon2id (sxPwHash), salted
 -- by the channel's public key so publisher and followers derive the SAME key. The
 -- feed stays ed25519-signed on top, so authenticity is unchanged. Requires the
--- org.openxtalk.library.sodium extension (cryptoXT) to be installed.
+-- org.openxtalk.library.sodium extension (SodiumXT) to be installed.
 
 -- the 8-byte tag that marks an encrypted feed value on the wire (v2 = libsodium;
 -- the old v1 AES format is intentionally not readable by this build)
@@ -4761,7 +4761,7 @@ function chFileKey pPass, pPubHex
    return sxKdfDerive(chMasterKey(pPass, pPubHex), "2", textEncode("btxfile1", "ASCII"), 32)
 end chFileKey
 
--- one-time capability probe: is cryptoXT (libsodium) installed and working? We do
+-- one-time capability probe: is SodiumXT (libsodium) installed and working? We do
 -- a real secretbox round-trip with a random key (fast - no Argon2id), wrapped in a
 -- try so a missing org.openxtalk.library.sodium is a clean "no", not an error.
 -- Result is cached in sCanEncrypt at startup.
@@ -4844,8 +4844,8 @@ function chPublishActiveFeed
    return btDhtPutMutable(sSession, sPub, sSec, "", tVal)
 end chPublishActiveFeed
 
--- ---- Phase 2: actual FILE encryption (cryptoXT secretstream) -----------------
--- A private channel encrypts the FILE itself, not just the feed. cryptoXT streams
+-- ---- Phase 2: actual FILE encryption (SodiumXT secretstream) -----------------
+-- A private channel encrypts the FILE itself, not just the feed. SodiumXT streams
 -- it through libsodium's crypto_secretstream (XChaCha20-Poly1305) entirely C-side
 -- (sxEncryptFile), so a big file never enters a LiveCode Data and the per-chunk
 -- authentication + FINAL tag make truncation or tampering detectable on decrypt.
@@ -4853,7 +4853,7 @@ end chPublishActiveFeed
 -- useless; the real filename rides in the (encrypted) feed and is restored on
 -- download. The file key is chFileKey (derived from the passphrase, distinct from
 -- the feed key). NOTE: encryption is synchronous, so the UI pauses on a very large
--- file. Requires the org.openxtalk.library.sodium extension (cryptoXT).
+-- file. Requires the org.openxtalk.library.sodium extension (SodiumXT).
 
 -- a unique temp path with a NEUTRAL name (the torrent name leaks nothing)
 function chTempEncPath
@@ -4878,7 +4878,7 @@ function chHashFromMagnet pMag
    return ""
 end chHashFromMagnet
 
--- Encrypt pSrc to pDst with the 32-byte file key pKey (cryptoXT secretstream,
+-- Encrypt pSrc to pDst with the 32-byte file key pKey (SodiumXT secretstream,
 -- streamed C-side). Returns "" on success, else an error string.
 function chEncryptFile pSrc, pDst, pKey
    local tErr
@@ -4893,7 +4893,7 @@ function chEncryptFile pSrc, pDst, pKey
    return ""
 end chEncryptFile
 
--- Decrypt pSrc (a .enc) to pDst with the 32-byte file key pKey. cryptoXT throws on
+-- Decrypt pSrc (a .enc) to pDst with the 32-byte file key pKey. SodiumXT throws on
 -- a wrong key or a truncated/corrupt input. Returns "" on success, else the error.
 function chDecryptFile pSrc, pDst, pKey
    local tErr
@@ -4984,7 +4984,7 @@ end chMaybeDecryptFinished
 -- pass with a running Tor daemon before any runtime claim. See the suite's
 -- docs/ONIONXT-INTEGRATION-PLAN.md section 6 and its VERIFY register (12.3).
 
--- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both
+-- Is OnionXT installed AND SodiumXT working? OnionXT depends on SodiumXT, so both
 -- must be present for any anonymous transfer (even a plaintext one). A guarded
 -- oxVersion() probe, mirroring chCanEncrypt.
 function chHasOnion
@@ -5313,7 +5313,7 @@ command chOnionPill
       if sCanEncrypt then
          put "Tor: no extension" into tState
       else
-         put "Tor: needs cryptoXT" into tState
+         put "Tor: needs SodiumXT" into tState
       end if
       put "bad" into tKind
    else if not oxIsControlAuthenticated() then
@@ -5831,7 +5831,7 @@ end chOnionCloseStream
 command chSetAnon
    local tGo, tMagCount, tRel, tLoc, tSavedID, tHash, tH
    if not sHasOnion then
-      answer "Anonymous channels need OnionXT + cryptoXT and a local Tor daemon (127.0.0.1:9050/9051 or 9150/9151). Public channels are unaffected."
+      answer "Anonymous channels need OnionXT + SodiumXT and a local Tor daemon (127.0.0.1:9050/9051 or 9150/9151). Public channels are unaffected."
       exit chSetAnon
    end if
    if not sOnionIdentityOk then
@@ -6068,7 +6068,7 @@ end chOnionFollowFetch
 command chOnionDownload pKey, pRelId, pTitle, pEnc, pOrigName
    local tAddr, tStream, tName
    if not sHasOnion then
-      chLog "This is an anonymous release, but OnionXT + cryptoXT are not installed here."
+      chLog "This is an anonymous release, but OnionXT + SodiumXT are not installed here."
       exit chOnionDownload
    end if
    if not chOnionReadyNow() then

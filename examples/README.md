@@ -7,7 +7,7 @@ session automatically. No helper stacks, no manual layout.
 
 ## What is here
 
-| File | What it is | Needs cryptoXT? |
+| File | What it is | Needs SodiumXT? |
 |------|------------|-----------------|
 | `torrent-quickshare.livecodescript` | The simplest demo: drag a file, get a code, a friend pastes it and downloads it straight from you. Optionally send anonymously over Tor, serve a **folder** as a browsable `.onion` page, or hand out a **direct web link** any browser can open (with automatic router port-opening). | Only for the optional passphrase lock |
 | _(sibling)_ **No Cloud Quick Share** | The revamped Quick Share dashboard, first spun out standalone and then **folded into this monorepo at `nocloud/` (2026-08-13; the standalone repo is now a mirror)**. It keeps the polished two-column dashboard, the plain-English 3-way share choice, the hardened HTTP/Tor server, and all the quality-of-life touches. The `torrent-quickshare` demo above remains the in-repo original. | Only for the optional passphrase lock |
@@ -28,13 +28,13 @@ peer-to-peer messaging (a different paradigm: no files, just live messages).
    `Tools > Extension Manager`. The library id is `org.openxtalk.library.torrent`.
    If you are building it yourself, see `../docs/building.md` and
    `../tools/package-extension.py`.
-3. **(Optional) Install cryptoXT** if you want the encryption features (the private
+3. **(Optional) Install SodiumXT** if you want the encryption features (the private
    channels in the channels demo, and the passphrase lock in quickshare and on your
    channel identity). Its library id is `org.openxtalk.library.sodium`. Everything
    except those encryption features works without it.
 4. **(For Quick Share's optional Tor mode - anonymous sends and folder web pages)
    Install OnionXT** (library id `org.openxtalk.library.onion`, which itself needs
-   cryptoXT) and run a **local Tor daemon** with the control port enabled - a system
+   SodiumXT) and run a **local Tor daemon** with the control port enabled - a system
    tor on `127.0.0.1:9051`, or Tor Browser on `9151`. Quick Share detects all of this
    and fails closed with a clear message when it is missing; every other feature still
    works.
@@ -64,7 +64,7 @@ send that code to a friend and they paste it into "Receive a file" and click
 Download. The file transfers straight from your machine to theirs, no server and no
 size limit, with the DHT finding the peers. Keep your window open until they have
 the whole file.
-Optional: type a **passphrase** before dropping the file (needs cryptoXT) and the
+Optional: type a **passphrase** before dropping the file (needs SodiumXT) and the
 share is encrypted end to end. The code carries a verifier, so a wrong passphrase is
 caught instantly with no wasted download.
 
@@ -149,9 +149,9 @@ built-in editor - a file list, a text pane, and Save. This is deliberately locke
   header. **Internet and Tor visitors can view the site but can never reach the editor**,
   even while the port is open to the world for the public link. Carrier-NAT (100.64/10)
   addresses are treated as *remote*, not LAN.
-- **Password-gated.** The password is run through **Argon2id** (via **cryptoXT** /
+- **Password-gated.** The password is run through **Argon2id** (via **SodiumXT** /
   `org.openxtalk.library.sodium`); a correct login mints a random session token the
-  browser sends back on every save. Without cryptoXT the editor cannot be enabled.
+  browser sends back on every save. Without SodiumXT the editor cannot be enabled.
 - **Off by default**, and confined: every write is resolved by `qsEditSafePath`, which
   refuses anything that could escape the served folder (any `..`, drive/`scheme:` colon,
   or control byte), so a save can only ever land **inside the shared folder**.
@@ -180,7 +180,7 @@ The full decentralized story, on two or more machines. Give a channel a name, cl
 signed feed on the DHT. Send someone your channel address (the "Copy" button); on
 their machine they paste it, click **Follow**, and see your signed releases, which
 they can Download peer to peer. You can run several channels. Set a **passphrase**
-(needs cryptoXT) to make a channel private: the file list AND the files are
+(needs SodiumXT) to make a channel private: the file list AND the files are
 encrypted, and only followers you give the passphrase to can read anything. Your
 identity, channels, and subscriptions persist automatically, and **Lock Identity**
 seals that saved state with a passphrase. The UI carries the suite UI kit v2
@@ -231,7 +231,7 @@ different computers** (ideally on different networks). A few things to expect:
 ## Packaging a demo as a standalone (.exe / .app)
 
 When you build a standalone, open `File > Standalone Application Settings`, go to the
-Inclusions pane, and **manually include the TorrentXT extension** (and cryptoXT if
+Inclusions pane, and **manually include the TorrentXT extension** (and SodiumXT if
 you use encryption). The native library is bundled into the app automatically, so you
 do not ship loose `.dll` / `.so` / `.dylib` files. Because the demos persist their
 state to the external prefs file described above, a standalone keeps its channels and
@@ -253,7 +253,7 @@ building something new.
 - **"handler not found" / nothing happens on open:** the TorrentXT extension is not
   installed or not loaded. Check `Tools > Extension Manager`.
 - **The private-channel / passphrase features are greyed out or say "install
-  cryptoXT":** install `org.openxtalk.library.sodium`. Everything else still works
+  SodiumXT":** install `org.openxtalk.library.sodium`. Everything else still works
   without it.
 - **No peers / no transfer:** give the DHT a few seconds, confirm the other side is
   running and reachable, and remember both peers need to be online at the same time.

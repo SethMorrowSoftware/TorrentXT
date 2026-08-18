@@ -185,10 +185,19 @@ redraws.** The rules:
 - **Payload never crosses the FFI into script** (rule 3, above) — the gigabytes stay
   engine ⇄ disk.
 
-## Example demos: cryptoXT dependency (the channels + quickshare demos)
+## Example demos: SodiumXT dependency (the channels + quickshare demos)
+
+> **RENAMED 2026-08-17: this was written as "cryptoXT" throughout, and that name
+> shipped to users.** 216 occurrences across 20 files told people to install
+> cryptoXT - an extension that does not exist and never did. The id in the same
+> sentences was always `org.openxtalk.library.sodium`, so nothing was broken;
+> the demos simply named the dependency wrongly, and a tester reasonably read it
+> as a deprecated component they were missing. Every occurrence is now SodiumXT.
+> Reported from an engine session, which is the only place the wrong name was
+> ever going to be read.
 
 The `torrent-dht-channels` and `torrent-quickshare` example demos do their **optional
-encryption** through **cryptoXT** (the sibling `org.openxtalk.library.sodium` / SodiumXT
+encryption** through **SodiumXT** (the sibling `org.openxtalk.library.sodium` / SodiumXT
 extension, libsodium), NOT OpenXTalk's built-in `encrypt using "aes-256-cbc"`. The flow is:
 a passphrase derives a key with **Argon2id** (`sxPwHash`), the channel feed is sealed with
 **`sxSecretBox`** (XSalsa20-Poly1305), and files are sealed with **`sxEncryptFile`**
@@ -197,7 +206,7 @@ channel's public key (so publisher and followers derive the same key); the quick
 uses a random salt carried in the share code.
 
 Consequences for anyone editing these demos:
-- The encryption features **require cryptoXT to be installed** alongside the torrent
+- The encryption features **require SodiumXT to be installed** alongside the torrent
   extension. Each demo probes it once at startup (a guarded `sxSecretBox` round-trip in a
   `try`) into `sCanEncrypt`; when absent, the private/passphrase features fail closed with a
   clear "install org.openxtalk.library.sodium" message and **every other feature still

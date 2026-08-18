@@ -21,7 +21,7 @@ script "quickShareApp"
 -- needed. Keep the sending window open until your friend has the whole file.
 --
 -- OPTIONAL ENCRYPTION: type a passphrase before dropping a file and it is
--- encrypted end-to-end with cryptoXT (libsodium): the key is derived with Argon2id
+-- encrypted end-to-end with SodiumXT (libsodium): the key is derived with Argon2id
 -- and the file is sealed with crypto_secretstream. Only the CIPHERTEXT (under a
 -- neutral .enc name) ever hits the swarm; the real filename and the salt ride
 -- inside the (now longer) share code, and the passphrase - which you give your
@@ -30,7 +30,7 @@ script "quickShareApp"
 -- so a wrong passphrase is caught immediately and nothing is downloaded. On a
 -- correct passphrase the file downloads, unlocks automatically, and the encrypted
 -- .enc copy is cleaned up so only the real file is left. The encryption features
--- REQUIRE the cryptoXT extension (org.openxtalk.library.sodium); plain sharing
+-- REQUIRE the SodiumXT extension (org.openxtalk.library.sodium); plain sharing
 -- works without it.
 --
 -- Single-thread playbook: a 250 ms poll drains events and a 1 s loop repaints the
@@ -52,7 +52,7 @@ script "quickShareApp"
 local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the poll/repaint loops are armed
 local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
-local sCanEncrypt       -- "true" if cryptoXT (libsodium) is installed + working
+local sCanEncrypt       -- "true" if SodiumXT (libsodium) is installed + working
 local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
@@ -68,7 +68,7 @@ local sOxWriteFailed    -- array: stream -> "true" once its first oxWrite failur
 -- OnionXT (optional Tor anonymity, Model C). When the Tor toggle is on, a file's
 -- bytes travel over an OnionXT onion stream (both IPs hidden) and NO torrent is
 -- created. All of this is inert unless sHasOnion. See the ox* wiring below.
-local sHasOnion         -- "true" if OnionXT loads AND cryptoXT works (probed once)
+local sHasOnion         -- "true" if OnionXT loads AND SodiumXT works (probed once)
 local sTorReady         -- "true" if Tor is bootstrapped + ready (LIVE cache; re-checked at use)
 local sTorSend          -- "true" while the "Send privately over Tor" toggle is armed
 local sWebServe         -- "true" while the "Serve as web download" checkbox is on
@@ -88,7 +88,7 @@ local sRxBuf            -- array: stream -> reassembly buffer (drained + compact
 local sRxState          -- array: stream -> "header" / "body" / "done"
 local sRxTmp            -- array: stream -> temp output path we are writing into
 local sRxName           -- array: stream -> real (sanitized) filename to save as
-local sRxEnc            -- array: stream -> nonzero if the payload is a cryptoXT .enc
+local sRxEnc            -- array: stream -> nonzero if the payload is a SodiumXT .enc
 local sRxTotal          -- array: stream -> total payload bytes expected
 local sRxGot            -- array: stream -> payload bytes written so far
 local sRxKey            -- array: stream -> 32-byte file key (encrypted receive), else empty
@@ -115,7 +115,7 @@ local sFsTxDeadline     -- array: stream -> the milliseconds of the last activit
 -- http://<ip>:<port>/<token>/_qs/info.
 local sHttpRoutes       -- array: "METHOD /path" -> handler name in this script
 -- The optional live WEB EDITOR (Phase C). Turns the served folder read-WRITE from a
--- browser, so it is deliberately locked down: OFF by default; a cryptoXT (Argon2id)
+-- browser, so it is deliberately locked down: OFF by default; a SodiumXT (Argon2id)
 -- edit password; a random per-login session token; and - the hard rule - editing is
 -- LAN-ONLY (a request from a non-local peer, or any Tor request, is refused), while
 -- the site itself stays publicly shareable. Every write path is confined to the
@@ -154,7 +154,7 @@ local sCwTxPos          -- array: socket -> next byte offset to read (0-based; h
 local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
 local sCwTxName         -- array: socket -> the file's leaf name (for the log)
 
--- Optional end-to-end encryption (mirrors the channels demo), via cryptoXT
+-- Optional end-to-end encryption (mirrors the channels demo), via SodiumXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
 -- the swarm only ever sees the .enc blob, the real filename and the Argon2id salt
 -- ride inside the share code, and the passphrase (shared separately) is what
@@ -168,7 +168,7 @@ constant kQsVerify = "BTXQSVERIFY"
 -- ---- OnionXT (optional Tor anonymity) constants ------------------------------
 -- Model C: with the Tor toggle on, the file's bytes ride an OnionXT onion stream
 -- (both IPs hidden) and NO torrent is created. Requires the OnionXT extension +
--- cryptoXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
+-- SodiumXT + a LOCAL Tor daemon. Every ox* call is against OnionXT's published
 -- ABI; verified statically here, needs an on-engine OXT pass with a running Tor
 -- daemon (the project convention). See the suite's docs/ONIONXT-INTEGRATION-PLAN.md.
 constant kTorCodePrefix = "BTXTOR1:"   -- marks an anonymous (Tor) share code
@@ -176,7 +176,7 @@ constant kOnionMagic = "BTXO"          -- 4 ASCII bytes: file-stream frame sync 
 constant kOnionVer = 1                 -- stream protocol version
 constant kOnionVPort = 80              -- the onion service's advertised virtual port
 constant kOnionChunk = 65536           -- 64 KiB: max payload bytes in one data frame
-constant kFlagEnc = 1                  -- header flags bit0: payload is a cryptoXT .enc
+constant kFlagEnc = 1                  -- header flags bit0: payload is a SodiumXT .enc
 constant kOnionPumpTick = 15           -- ms between send-pump frames (never a tight loop)
 constant kOnionSendTimeout = 30000     -- ms idle watchdog, sender
 constant kOnionRecvTimeout = 60000     -- ms idle watchdog, receiver (Tor is slow)
@@ -700,7 +700,7 @@ command qsBuild
    uiButton "qsCopy", "Copy", "500,244,596,274"
    -- OPTIONAL live web editor (LAN-only). Tick it and set an edit password to make the
    -- web-shared FOLDER editable from a browser on your own network (visit the shared
-   -- link with /_edit on the end). Off by default; needs cryptoXT for the password.
+   -- link with /_edit on the end). Off by default; needs SodiumXT for the password.
    uiCheckbox "qsEditToggle", "Enable web editing", "24,284,214,306"
    uiLabel "qsEditPassCap", "Edit password:", "220,286,318,306", 10
    uiInput "qsEditPass", "322,284,486,306"
@@ -774,8 +774,8 @@ command qsAddTips
    set the tooltip of button "qsWebCheck" to "Only for a PLAINTEXT file shared over Tor: also let anyone with Tor Browser download it at a web link (both IPs stay hidden; the file is not encrypted and the sender is not verified). Leave the passphrase empty to use this."
    set the tooltip of field "qsWebLink" to "The browser download link for this share. Open it in Tor Browser, or click Copy to send it."
    set the tooltip of button "qsWebCopy" to "Copy the web download link to the clipboard."
-   set the tooltip of button "qsEditToggle" to "Make the web-shared FOLDER editable from a browser - but ONLY from a device on your own local network (never over the internet or Tor). Set an edit password first. Visit the shared link with /_edit added on the end to open the editor. Needs cryptoXT (org.openxtalk.library.sodium)."
-   set the tooltip of field "qsEditPass" to "A password you choose to unlock the live editor. Anyone on your LAN who opens the /_edit page must type it before they can change files. Needs cryptoXT installed."
+   set the tooltip of button "qsEditToggle" to "Make the web-shared FOLDER editable from a browser - but ONLY from a device on your own local network (never over the internet or Tor). Set an edit password first. Visit the shared link with /_edit added on the end to open the editor. Needs SodiumXT (org.openxtalk.library.sodium)."
+   set the tooltip of field "qsEditPass" to "A password you choose to unlock the live editor. Anyone on your LAN who opens the /_edit page must type it before they can change files. Needs SodiumXT installed."
    set the tooltip of field "qsEditHint" to "The live editor only answers devices on your local network; internet and Tor visitors can view the site but never reach the editor."
    set the tooltip of field "qsTorPill" to "Status of your local Tor connection. 'ready' means anonymous sends and receives will work."
 end qsAddTips
@@ -801,10 +801,10 @@ command qsStart
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    put "true" into sPolling
-   -- probe cryptoXT once so the passphrase fields can fail closed when it is absent
+   -- probe SodiumXT once so the passphrase fields can fail closed when it is absent
    put qsCanEncrypt() into sCanEncrypt
    -- probe OnionXT and bring up the Tor control link (non-blocking). The anon path
-   -- is completely inert when OnionXT/cryptoXT/Tor are absent; nothing else changes.
+   -- is completely inert when OnionXT/SodiumXT/Tor are absent; nothing else changes.
    put qsHasOnion() into sHasOnion
    put "false" into sTorSend
    put "false" into sWebServe
@@ -835,7 +835,7 @@ command qsStart
    if sCanEncrypt then
       qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
-      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs cryptoXT / org.openxtalk.library.sodium, which is not installed.)"
+      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs SodiumXT / org.openxtalk.library.sodium, which is not installed.)"
    end if
    uiStatus "Ready - drag a file to share, or paste a code to download.", "ok"
    send "qsPollOnce" to me in 0 milliseconds
@@ -959,7 +959,7 @@ command qsShareFile pPath
    -- onion stream and NO torrent is created (mutual-exclusion invariant, section 3).
    if sTorSend is "true" then
       if not sHasOnion then
-         qsLog "Turn off 'Send privately over Tor', or install OnionXT + cryptoXT + a local Tor daemon."
+         qsLog "Turn off 'Send privately over Tor', or install OnionXT + SodiumXT + a local Tor daemon."
          exit qsShareFile
       end if
       if not qsOnionReadyNow() then
@@ -980,7 +980,7 @@ command qsShareFile pPath
       exit qsShareFile
    end if
    if tPass is not empty and not sCanEncrypt then
-      qsLog "cryptoXT (org.openxtalk.library.sodium) is not installed - sharing WITHOUT a passphrase. Install it to encrypt."
+      qsLog "SodiumXT (org.openxtalk.library.sodium) is not installed - sharing WITHOUT a passphrase. Install it to encrypt."
       put empty into tPass
    end if
    if tPass is empty then
@@ -1007,7 +1007,7 @@ command qsShareFile pPath
       qsLog "Got a code for" && quote & tName & quote & ". Click Copy and send it to your friend."
    else
       -- encrypted share: derive a key from the passphrase + a fresh random salt
-      -- (the salt rides in the share code), encrypt to a temp .enc with cryptoXT,
+      -- (the salt rides in the share code), encrypt to a temp .enc with SodiumXT,
       -- then seed the ciphertext.
       put qsTempEncPath() into tEncPath
       put sxRandomBytes(16) into tSalt
@@ -1091,7 +1091,7 @@ command qsGetFile
    if tCode begins with kCodePrefix then
       -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>:<base64 verifier>
       if not sCanEncrypt then
-         qsLog "This code is locked, but cryptoXT (org.openxtalk.library.sodium) is not installed - cannot decrypt."
+         qsLog "This code is locked, but SodiumXT (org.openxtalk.library.sodium) is not installed - cannot decrypt."
          exit qsGetFile
       end if
       if tPass is empty then
@@ -1390,8 +1390,8 @@ function qsTrim pText
    return tT
 end qsTrim
 
--- ---- optional end-to-end encryption (cryptoXT / libsodium) -------------------
--- Is cryptoXT installed and working? A real secretbox round-trip with a random
+-- ---- optional end-to-end encryption (SodiumXT / libsodium) -------------------
+-- Is SodiumXT installed and working? A real secretbox round-trip with a random
 -- key (fast - no Argon2id), wrapped in a try so a missing org.openxtalk.library.
 -- sodium is a clean "no". Probed once at start so the passphrase fields can fail
 -- closed rather than erroring.
@@ -1446,7 +1446,7 @@ function qsTempEncPath
    return tBase & "/btxshare-" & the milliseconds & "-" & random(999999) & ".enc"
 end qsTempEncPath
 
--- Encrypt/decrypt a file with the 32-byte key pKey via cryptoXT (libsodium
+-- Encrypt/decrypt a file with the 32-byte key pKey via SodiumXT (libsodium
 -- secretstream, streamed entirely C-side so the bytes never enter a Data, with
 -- per-chunk authentication). Returns "" on success, else an error string.
 function qsEncryptFile pSrc, pDst, pKey
@@ -1509,7 +1509,7 @@ end qsMaybeDecryptFinished
 -- pass with a running Tor daemon before any runtime claim. See the suite's
 -- docs/ONIONXT-INTEGRATION-PLAN.md and its VERIFY register (section 12.3).
 
--- Is OnionXT installed AND cryptoXT working? OnionXT depends on cryptoXT, so both
+-- Is OnionXT installed AND SodiumXT working? OnionXT depends on SodiumXT, so both
 -- must be present for any anonymous transfer (even a plaintext one). A guarded
 -- oxVersion() probe, mirroring qsCanEncrypt. VERIFY: oxVersion resolves only when
 -- the OnionXT extension is loaded.
@@ -1644,7 +1644,7 @@ end qsOnionServicePublished
 -- The pill is the kit's uiPill (chip + centered label), painted ONLY here so
 -- its states can never disagree; the kinds map the states semantically:
 -- ready = "ok" (green), connecting = "wait" (amber), and every cannot-run
--- state (no extension / needs cryptoXT / no daemon) = "bad" (red). The long
+-- state (no extension / needs SodiumXT / no daemon) = "bad" (red). The long
 -- start-Tor guidance moved to the log (qsOnionTryTB) - a chip cannot carry a
 -- sentence, and the tooltip still explains the pill.
 command qsOnionPill
@@ -1656,7 +1656,7 @@ command qsOnionPill
       if sCanEncrypt then
          put "Tor: no extension" into tState
       else
-         put "Tor: needs cryptoXT" into tState
+         put "Tor: needs SodiumXT" into tState
       end if
       put "bad" into tKind
       set the disabled of button "qsTorToggle" to true
@@ -1854,7 +1854,7 @@ function qsBEu32 pBytes
 end qsBEu32
 
 -- SEND entry: turn a dropped file into a fresh, unlinkable onion service and (once
--- the descriptor uploads) reveal a BTXTOR1 code. Reuses the existing cryptoXT path
+-- the descriptor uploads) reveal a BTXTOR1 code. Reuses the existing SodiumXT path
 -- when a passphrase is set. NO torrent is created.
 command qsStartOnionShare pPath, pName, pPass
    local tTotal, tSalt, tKey, tVerifier, tEncPath, tEncFlag, tStreamFile
@@ -1897,7 +1897,7 @@ command qsStartOnionShare pPath, pName, pPass
       put tEncPath into tStreamFile
       put kFlagEnc into tEncFlag
    else if pPass is not empty then
-      qsLog "cryptoXT is not installed - sending over Tor WITHOUT encryption (your IP is still hidden, but the sender is not verified)."
+      qsLog "SodiumXT is not installed - sending over Tor WITHOUT encryption (your IP is still hidden, but the sender is not verified)."
    end if
    -- one active anon share at a time: tear down any previous service + temp
    if sActiveShare["service"] is not empty then
@@ -2255,7 +2255,7 @@ end qsOnionSendWatchdog
 -- A plaintext Tor share ALSO answers a plain browser: open http://<onion>/ in Tor
 -- Browser and download it, no app needed. IP-anonymous (Tor), but NOT encrypted
 -- and the sender is not verified - only plaintext shares are ever served this way
--- (a browser cannot decrypt a cryptoXT .enc). Routes: "/" = an index page with a
+-- (a browser cannot decrypt a SodiumXT .enc). Routes: "/" = an index page with a
 -- Download link; "/download" = the file bytes; anything else (favicon, ...) = 404.
 command qsOnionServeHttp pStream
    local tReq, tMethod, tPath, tHead, tFn, tCrlf
@@ -2622,7 +2622,7 @@ end qsInfoRoute
 -- editor state locals up top for the trust model. Its routes are registered once in
 -- qsStart and are always present; every one gates on qsEditReachable first, so a Tor
 -- visitor or a public clearweb peer just gets a 404 and never learns an editor exists.
--- cryptoXT (sx*) is required for the password - without it the editor cannot be enabled
+-- SodiumXT (sx*) is required for the password - without it the editor cannot be enabled
 -- (it fails closed). Writes are confined to the served folder by qsEditSafePath.
 -- ----------------------------------------------------------------------------
 
@@ -2686,7 +2686,7 @@ function qsEditServedRoot
    return ""
 end qsEditServedRoot
 
--- Is the editor even reachable for this connection? It must be ENABLED, cryptoXT must
+-- Is the editor even reachable for this connection? It must be ENABLED, SodiumXT must
 -- be present, there must be a served folder, AND the peer must be local. The outer
 -- gate: when false the route answers 404 (invisible to the caller), never hinting an
 -- editor could exist.
@@ -2734,13 +2734,13 @@ end qsEditAuthed
 -- Enable the editor with a login password. Derives an Argon2id key from the password +
 -- a fresh random salt, seals a known marker under it as the verifier, and stores salt +
 -- verifier (never the password or the key). Any existing session is invalidated, so
--- changing the password forces a re-login. Requires cryptoXT; returns "" on success or
+-- changing the password forces a re-login. Requires SodiumXT; returns "" on success or
 -- an error string. KDF params (opslimit "2", interactive memory) match the share-code
 -- path - keep them identical across the demo.
 function qsEditEnable pPassword
    local tSalt, tKey, tErr
    if not sCanEncrypt then
-      return "The live editor needs cryptoXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
+      return "The live editor needs SodiumXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
    end if
    if pPassword is empty then
       return "Set an edit password first."
@@ -4094,7 +4094,7 @@ on socketTimeout pSocketID
    end if
 end socketTimeout
 
--- A random capability token, hex (URL-safe). Uses cryptoXT's CSPRNG when present;
+-- A random capability token, hex (URL-safe). Uses SodiumXT's CSPRNG when present;
 -- else OXT's random() (weaker, but still an unguessable demo link). pBytes is the
 -- entropy in bytes; empty defaults to the clearweb token size.
 function qsMakeToken pBytes
@@ -4277,7 +4277,7 @@ end qsCwIpReply
 command qsReceiveOnion pCode
    local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream, tErr
    if not sHasOnion then
-      qsLog "This is a private Tor share, but OnionXT (or cryptoXT) is not installed - ask your friend to share it normally, or install OnionXT + cryptoXT + Tor."
+      qsLog "This is a private Tor share, but OnionXT (or SodiumXT) is not installed - ask your friend to share it normally, or install OnionXT + SodiumXT + Tor."
       exit qsReceiveOnion
    end if
    put char ((the number of chars of kTorCodePrefix) + 1) to -1 of pCode into tRest
@@ -4298,7 +4298,7 @@ command qsReceiveOnion pCode
    put "" into tKey
    if tB64Verify is not empty then
       if not sCanEncrypt then
-         qsLog "This code is locked, but cryptoXT is not installed - cannot decrypt."
+         qsLog "This code is locked, but SodiumXT is not installed - cannot decrypt."
          exit qsReceiveOnion
       end if
       if tPass is empty then
@@ -4593,7 +4593,7 @@ end qsToggleWeb
 -- Flip the "Enable web editing" checkbox (managed two-state; autoHilite off). ON arms
 -- the LAN-only editor from the edit password (a fresh Argon2id key + verifier); OFF
 -- forgets the password and any live login session. Anything that would leave it half-on
--- (no cryptoXT, blank password, KDF error) reports and leaves the box unchecked.
+-- (no SodiumXT, blank password, KDF error) reports and leaves the box unchecked.
 command qsToggleEdit
    local tPass, tErr
    if sEditOn is "true" then
@@ -4604,7 +4604,7 @@ command qsToggleEdit
    end if
    if not sCanEncrypt then
       set the hilite of button "qsEditToggle" to false
-      qsLog "Live editing needs cryptoXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
+      qsLog "Live editing needs SodiumXT (org.openxtalk.library.sodium) for its password. Install it, then try again."
       exit qsToggleEdit
    end if
    put field "qsEditPass" into tPass
