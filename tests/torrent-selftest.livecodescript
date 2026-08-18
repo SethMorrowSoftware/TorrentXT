@@ -44,6 +44,9 @@ script "torrentSelfTest"
 -- destructive handlers (btMoveStorage, btRemoveTorrent-with-delete) - those are
 -- noted for a manual pass. A green run means the whole binding surface is wired.
 
+-- STATUS: last run GREEN in the 2026-08-17 engine pass (Windows x86_64, NT 10.0, OXT 9.6.3) - 101/101, folded into
+-- tests/suite-selftest.livecodescript. One torrent session per process
+-- (runbook trap 5.1): close other torrent stacks before running it.
 constant kStTitle = "TorrentXT - API Self-Test"
 constant kStWidth = 660
 constant kStHeight = 620

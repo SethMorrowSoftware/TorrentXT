@@ -147,6 +147,13 @@ pass" and let the user confirm.
 
 ## LiveCodeScript / LCB / OXT gotchas (carried; OXT is stricter than LiveCode)
 
+> **Engine BEHAVIOUR - as opposed to the conventions below - is collected in
+> [`docs/OXT-ENGINE-NOTES.md`](../docs/OXT-ENGINE-NOTES.md)**, with the verbatim
+> symptom, what each one broke, and whether a gate now holds it. Keep
+> member-specific gotchas here; put anything the ENGINE does there, so there is
+> one authoritative list instead of six that drift.
+
+
 1. **No smart/curly quotes** (U+201C/201D/2018/2019) anywhere — even in a comment or
    string — they fail OXT compilation. ASCII `"` and `'` only. The static checker
    enforces zero.
