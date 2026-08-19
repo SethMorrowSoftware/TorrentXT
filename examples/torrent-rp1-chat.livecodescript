@@ -124,6 +124,27 @@ end uiChrome
 -- anything else for neutral/muted. Demos route probe results through this
 -- so a stack that cannot run says so in red, at the top, immediately.
 command uiStatus pText, pKind
+   -- PIN THE STACK, THEN CHECK THE FIELD EXISTS. Both halves were missing and
+   -- both are load-bearing on a TIMER-driven call.
+   --
+   -- An unqualified `field "uiStatus"` resolves against the DEFAULTSTACK, not
+   -- against the stack whose script is running. Inside openStack those are the
+   -- same thing, which is why every demo's startup status line always worked.
+   -- A handler arriving from `send ... in` has no such guarantee: with a second
+   -- stack in front, the write lands in the wrong stack or resolves to nothing,
+   -- and enet-lan-chat's once-a-second dashboard threw
+   -- "Chunk: error in object expression" REPEATEDLY on 2026-08-18. dht-chat hid
+   -- the same fault behind its own `if there is a field` guard - its status line
+   -- simply stopped updating, silently, which is the worse outcome of the two.
+   --
+   -- The pin is holde-em's idiom, engine-proven there, and its comment names
+   -- this exact hazard. The existence check stays as well: a demo may call the
+   -- status line before its chrome is built, and a cosmetic line must never
+   -- take down a poll chain.
+   set the defaultStack to the short name of this stack
+   if there is no field "uiStatus" then
+      exit uiStatus
+   end if
    put pText into field "uiStatus"
    if pKind is "ok" then
       set the foregroundColor of field "uiStatus" to kUiOk
@@ -375,6 +396,13 @@ command uiCopyFlash pBtn
 end uiCopyFlash
 
 command uiCopyFlashReset pBtn
+   -- Pinned for the same reason uiStatus is: this one arrives 1200ms later by
+   -- `send`, so the defaultStack is whatever is current THEN, not the stack
+   -- that flashed the button. Its existence guard means the failure is silent
+   -- rather than loud - the label just never comes back, or comes back on
+   -- another stack's button - which is why it needed finding rather than
+   -- reporting itself.
+   set the defaultStack to the short name of this stack
    if there is no button pBtn then
       exit uiCopyFlashReset
    end if
