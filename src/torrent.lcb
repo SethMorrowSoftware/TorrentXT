@@ -1791,7 +1791,7 @@ end handler
 -- number as a decimal string; pValue is the ALREADY-BENCODED value v. Sign the
 -- returned Data in your own crypto layer (an ed25519 detached signature over
 -- these bytes) and hand the signature to btDhtPutSigned. This exists so a signer
--- that must keep its key private (e.g. cryptoXT/SodiumXT) can produce a BEP44
+-- that must keep its key private (e.g. SodiumXT) can produce a BEP44
 -- signature without any secret key ever crossing into this library. Empty Data
 -- on failure.
 public handler btDhtBep44SignBuf(in pSalt as String, in pSeq as String, in pValue as Data) returns Data

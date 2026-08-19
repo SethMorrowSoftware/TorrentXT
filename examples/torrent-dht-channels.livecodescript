@@ -79,8 +79,9 @@ script "dhtChannelsApp"
 -- IPs hidden, nothing on the DHT or a magnet), reachable from the channel card
 -- alone - the onion address is derived from the channel's existing ed25519 key.
 -- It composes with Privacy (Tor hides WHERE, SodiumXT hides WHAT + authenticates
--- WHO). Needs the OnionXT extension (org.openxtalk.library.onion) + SodiumXT + a
--- local Tor daemon (127.0.0.1:9050/9051 or Tor Browser 9150/9151). Fails closed:
+-- WHO). OnionXT is pure script, not a packaged extension, and this demo already
+-- CARRIES it embedded between the sentinels below - so anon needs only SodiumXT and
+-- a local Tor daemon (127.0.0.1:9050/9051 or Tor Browser 9150/9151). Fails closed:
 -- with any piece missing, anon is inert and every public feature works normally.
 -- Plaintext anon hides the route but does NOT authenticate the sender; anon is
 -- only anonymous between the two onion endpoints. See docs/ONIONXT-INTEGRATION-PLAN.md.
@@ -2387,11 +2388,19 @@ command uiStatus pText, pKind
    -- against the stack whose script is running. Inside openStack those are the
    -- same thing, which is why every demo's startup status line always worked.
    -- A handler arriving from `send ... in` has no such guarantee: with a second
-   -- stack in front, the write lands in the wrong stack or resolves to nothing,
-   -- and enet-lan-chat's once-a-second dashboard threw
-   -- "Chunk: error in object expression" REPEATEDLY on 2026-08-18. dht-chat hid
-   -- the same fault behind its own `if there is a field` guard - its status line
-   -- simply stopped updating, silently, which is the worse outcome of the two.
+   -- stack in front, the write lands in the wrong stack or resolves to nothing.
+   --
+   -- THE PIN RESTS ON THE DOCUMENTED RESOLUTION RULE, NOT ON A THROW WE SAW.
+   -- This comment used to cite enet-lan-chat's once-a-second dashboard throwing
+   -- "Chunk: error in object expression" REPEATEDLY on 2026-08-18, and dht-chat
+   -- hiding the same fault behind a guard. Neither half held up: that throw was
+   -- the ARGUMENT at the call site (`the number of keys of sPeers`, which does
+   -- not parse - OXT-ENGINE-NOTES 1.7) and never reached uiStatus at all, and
+   -- the guard credited to the kit was dht-chat's own wxSetStatus wrapper - the
+   -- master had no existence check until the same commit that added this pin.
+   -- What a guarded call site WOULD do if the defaultStack diverged is fail
+   -- silently, which is the argument for a gate rather than for more guards.
+   -- See OXT-ENGINE-NOTES 5.3, now classed DOCUMENTED.
    --
    -- The pin is holde-em's idiom, engine-proven there, and its comment names
    -- this exact hazard. The existence check stays as well: a demo may call the

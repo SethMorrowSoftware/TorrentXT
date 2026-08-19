@@ -33,11 +33,26 @@ peer-to-peer messaging (a different paradigm: no files, just live messages).
    channel identity). Its library id is `org.openxtalk.library.sodium`. Everything
    except those encryption features works without it.
 4. **(For Quick Share's optional Tor mode - anonymous sends and folder web pages)
-   Install OnionXT** (library id `org.openxtalk.library.onion`, which itself needs
-   SodiumXT) and run a **local Tor daemon** with the control port enabled - a system
-   tor on `127.0.0.1:9051`, or Tor Browser on `9151`. Quick Share detects all of this
-   and fails closed with a clear message when it is missing; every other feature still
-   works.
+   Put OnionXT in the message path.** Unlike steps 2 and 3, this is NOT an Extension
+   Manager item: OnionXT is pure LiveCodeScript over a local Tor daemon, so
+   `org.openxtalk.library.onion` is the id it goes by, not an installable package.
+   Open `../../onionxt/src/onionxt.livecodescript` as a stack and
+   `start using stack "onionxt"` (the wiring is spelled out in
+   `../../onionxt/docs/10-usage-guide.md` section 2). Then run a **local Tor daemon**
+   with the control port enabled - a system tor on `127.0.0.1:9051`, or Tor Browser on
+   `9151`. Quick Share detects all of this and fails closed with a clear message when
+   it is missing; every other feature still works.
+
+   Within `torrentxt/examples`, `torrent-dht-channels` already CARRIES OnionXT
+   embedded between the sentinels `tools/sync-demo-embeds.py` (at the suite root)
+   owns, so it needs no wiring at all; Quick Share is the one demo here that still
+   needs it by hand. That is deliberate and recorded in that tool's `NOT_EMBEDDED`
+   table: Quick Share defines `socketError` / `socketClosed` / `socketTimeout` at
+   column 0 with its own clearweb logic that `pass`es through, and
+   `onionxt.livecodescript` defines all three too, so an embed would define each
+   twice - a hard compile error at paste time. For the same reason, do not paste the
+   library into this demo's stack script by hand: the demo IS the stack script, so
+   there is no second script to merge into.
 
 ## Running any demo
 

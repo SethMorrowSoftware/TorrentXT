@@ -557,7 +557,7 @@ Build the **exact BEP 44 canonical buffer** that must be signed for a mutable it
 `pSalt` is `""`). `pSeq` is the sequence number as a decimal string; `pValue` is the
 **already-bencoded** value `v`. Sign the returned bytes in your own crypto layer (an
 ed25519 detached signature) and pass the signature to `btDhtPutSigned`. This exists
-so a signer that must keep its key private - e.g. a **SodiumXT / SodiumXT** identity
+so a signer that must keep its key private - e.g. a **SodiumXT** identity
 key via `sxSignDetached` - can produce a BEP 44 signature with no secret key ever
 crossing into this library. Empty `Data` on failure.
 - **Usage:** function - `put btDhtBep44SignBuf("rp-prekeys", "1", tValue) into tBuf`.

@@ -203,8 +203,33 @@ redraws.** The rules:
 > Reported from an engine session, which is the only place the wrong name was
 > ever going to be read.
 
+> **CORRECTED 2026-08-19: "Every occurrence is now SodiumXT" was untrue on the
+> day it was written.** Measured against the whole tree rather than the diff:
+> the pass changed 216 occurrences across 20 files, and 229 across 25 files
+> existed - so both figures above are the size of the CHANGE, not the size of
+> the problem. The 13 it missed were exactly the paths the sweep did not walk:
+> nine in `nocloud/` (`LICENSE`, `site/index.html`, `webapp/app.js`) and four
+> in `torrentxt/`. Two of the nine are the class this rename existed to kill -
+> a string built into `innerHTML` and served to a user's browser, and a
+> standalone-builder instruction naming the extension to include - so the wrong
+> name outlived its own removal in the one place a stranger reads it. The nine,
+> plus `src/torrent.lcb`'s "(e.g. cryptoXT/SodiumXT)" and
+> `tests/bep44_golden_test.py`'s "a SodiumXT/cryptoXT identity key", were
+> corrected on 2026-08-19. The two that remain are deliberate: the provenance
+> citations at `tests/bep44_golden_test.py:18` and `:31` name the pre-suite
+> cryptoXT repo a pinned vector came from, and dated provenance is annotated,
+> never rewritten.
+>
+> The lesson is worth more than the fix. The pass counted the occurrences it
+> CHANGED and reported that as the occurrences that EXISTED - the same shape as
+> coinxt's constant gate printing the constants it had parsed as the ones it had
+> checked, and as the "shipped is not run" trap in the suite CLAUDE.md. A
+> completion claim ("every occurrence") is a claim about the whole tree, so it
+> has to be measured against the whole tree; the diff can only ever tell you how
+> much you did, never how much there was.
+
 The `torrent-dht-channels` and `torrent-quickshare` example demos do their **optional
-encryption** through **SodiumXT** (the sibling `org.openxtalk.library.sodium` / SodiumXT
+encryption** through **SodiumXT** (the sibling `org.openxtalk.library.sodium`
 extension, libsodium), NOT OpenXTalk's built-in `encrypt using "aes-256-cbc"`. The flow is:
 a passphrase derives a key with **Argon2id** (`sxPwHash`), the channel feed is sealed with
 **`sxSecretBox`** (XSalsa20-Poly1305), and files are sealed with **`sxEncryptFile`**

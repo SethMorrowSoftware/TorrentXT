@@ -8,7 +8,7 @@ record_golden_test.py.
 Why this exists
 ---------------
 For callers that must keep their signing key in their OWN crypto layer (e.g. a
-SodiumXT/cryptoXT identity key that must never cross into TorrentXT), the mutable
+SodiumXT identity key that must never cross into TorrentXT), the mutable
 put splits in two: the shim builds the BEP44 canonical buffer, the caller signs
 it, and the shim stores the finished signature. Correctness hinges on ONE thing -
 the buffer TorrentXT builds must be byte-identical to the buffer the external
