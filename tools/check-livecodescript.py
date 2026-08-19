@@ -283,6 +283,18 @@ LCS_ANTIPATTERNS = [
      "`constant NAME is ...` is the LiveCode BUILDER spelling - "
      "LiveCodeScript declares `constant NAME = ...` (the engine refuses the "
      "`is` form, and the before-use check cannot even see it)"),
+    # `keys` is not a CHUNK, so `the number of keys of X` does not parse as a
+    # count - the engine reads `keys of X` as an OBJECT expression and answers
+    # "Chunk: error in object expression". Found 2026-08-18 in enet-lan-chat's
+    # dashboard, once a second, and the tree carried NINE of them across three
+    # demos - every one on a path no engine run had reached. The correct
+    # spelling was already in use in ten other files, including three whose
+    # harnesses have run green, so this is two idioms coexisting rather than
+    # one unknown: the gate picks the one with evidence behind it.
+    (re.compile(r"\bthe\s+number\s+of\s+keys\s+of\b"),
+     "`the number of keys of X` does not parse - `keys` is not a chunk, so the "
+     "engine reads `keys of X` as an object expression. Write "
+     "`the number of lines of the keys of X`"),
 ]
 
 # xTalk has NO `does not begin with` / `does not end with` / `does not contain`

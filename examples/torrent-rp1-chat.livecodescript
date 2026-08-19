@@ -661,7 +661,7 @@ command rcSendMessage
    if tBody is empty then
       exit rcSendMessage
    end if
-   if the number of keys of sPeers is 0 then
+   if the number of lines of the keys of sPeers is 0 then
       rcLog "No rp1 peers yet - wait for a handshake before sending."
       exit rcSendMessage
    end if
@@ -695,7 +695,7 @@ command rcDashOnce
       exit rcDashOnce
    end if
    send "rcDashOnce" to me in 1000 milliseconds
-   put the number of keys of sPeers into tCount
+   put the number of lines of the keys of sPeers into tCount
    if sRoomId is empty then
       exit rcDashOnce
    end if
