@@ -214,6 +214,24 @@ function stReportText
 end stReportText
 
 command stShow
+   -- PIN THE STACK, AND FAIL CLOSED IF THE WINDOW IS NOT THERE. An unqualified
+   -- `field "stResults"` resolves against THE DEFAULTSTACK, not against the
+   -- stack whose script is running (OXT-ENGINE-NOTES 5.3). Inside openStack
+   -- those are the same object, which is why the synchronous half of every run
+   -- has always rendered. This handler is ALSO called from an async pump, on a
+   -- `send ... in` tick, where they are not: with another window in front the
+   -- write would throw "Chunk: error in object expression", and in the suite
+   -- core that throw lands in stPump, which is where the timer re-arms.
+   -- PRECAUTIONARY, NOT DIAGNOSED. It was written on 2026-08-20 while chasing
+   -- two engine reports that ended mid-CROSS-section, and that was the wrong
+   -- cause: the third run, same build, completed 1981/0/1 through both
+   -- loopbacks and the summary. Those two were early Copies, which is what the
+   -- trailer in stReportText now says out loud. What stands on its own is the
+   -- hazard class - engine-observed in enet-lan-chat's ecDashOnce on
+   -- 2026-08-18 - and the fact that this is the same fault, and the same fix,
+   -- as the ui-kit's uiStatus, one carried block over.
+   set the defaultStack to the short name of this stack
+   if there is no field "stResults" then exit stShow
    put stReportText() into field "stResults"
    put sPassed & " passed, " & sFailed & " failed, " & sSkipped & " skipped, " \
          & sTotal & " total" into field "stSummary"
@@ -229,6 +247,10 @@ end stShow
 -- paint the results list: red FAIL, green PASS, amber SKIP, muted the rest
 command stPaint
    local tN, tI, tLine, tErr
+   -- Pinned for the reason stShow above is: stReportDone calls this one too,
+   -- and an async harness reaches stReportDone from a timer tick.
+   set the defaultStack to the short name of this stack
+   if there is no field "stResults" then exit stPaint
    put the number of lines of field "stResults" into tN
    lock screen
    try

@@ -903,6 +903,9 @@ end qsStop
 
 command qsPollOnce
    local tEvents, tEvent
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit qsPollOnce
    end if
@@ -918,6 +921,9 @@ end qsPollOnce
 
 command qsDashOnce
    local tNow, tWaitKey, tS, tWaitName, tWaitHash
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit qsDashOnce
    end if

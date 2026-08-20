@@ -1551,6 +1551,9 @@ end tcApplyUpLimit
 -- ---- the poll loop (one FFI drain per pass) ----------------------------------
 command tcPollOnce
    local tEvents, tEvent
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit tcPollOnce
    end if
@@ -1616,6 +1619,9 @@ end tcHandleEvent
 -- tcRefreshLoop reschedules itself; tcRefreshOnce just repaints. Direct callers
 -- (adds, controls, events) use tcRefreshOnce so they never start a 2nd timer.
 command tcRefreshLoop
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit tcRefreshLoop
    end if

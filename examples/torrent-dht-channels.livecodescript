@@ -3698,6 +3698,9 @@ end chUpdateLockButton
 
 command chPollOnce
    local tEvents, tEvent
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit chPollOnce
    end if
@@ -3713,6 +3716,9 @@ end chPollOnce
 
 command chDashOnce
    local tNow, tKey
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit chDashOnce
    end if
@@ -3743,6 +3749,9 @@ end chDashOnce
 -- active one, so they all stay reachable) and re-pull your subscriptions
 command chChannelTick
    local tKey, tI, tKp, tFeed, tVal, tR
+   -- pin the stack: a `send ... in` tick has no defaultStack guarantee, and every
+   -- control this reaches is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
    if sPolling is not "true" then
       exit chChannelTick
    end if
