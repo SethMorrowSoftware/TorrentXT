@@ -191,8 +191,30 @@ command stNote pText
    put "      " & pText & return after sResultText
 end stNote
 
+-- THE REPORT IS A LIVE SURFACE, so its text is ambiguous by construction:
+-- sResultText grows as the run goes, the async harnesses re-render it every
+-- tick, and an unfinished report simply STOPS - with no marker, at whatever
+-- section the pump had reached. That reads exactly like a hang. It cost a
+-- round trip on the 2026-08-19 suite pass: a fully green run came back ending
+-- mid-CROSS-section, and nothing in the pasted text could tell an early Copy
+-- from a stalled pump. The async deadline is FORTY SECONDS (kStDeadlineMs in
+-- the suite core), and the list stops visibly growing long before it expires,
+-- so "it looks finished" is the normal state of a run that is not. Every
+-- render of the report goes through here, so that state can never be silent
+-- again - on screen or on the clipboard.
+function stReportText
+   if sStRunDone is "true" then
+      return sResultText
+   end if
+   return sResultText \
+         & "      ----------------------------------------------------" & return \
+         & "      RUN NOT FINISHED - this is NOT the end of the report." & return \
+         & "      An async section is still running. Wait for the SUMMARY" & return \
+         & "      section at the bottom, then Copy." & return
+end stReportText
+
 command stShow
-   put sResultText into field "stResults"
+   put stReportText() into field "stResults"
    put sPassed & " passed, " & sFailed & " failed, " & sSkipped & " skipped, " \
          & sTotal & " total" into field "stSummary"
    if sStRunDone is "true" then
@@ -239,10 +261,27 @@ end stReportDone
 command stCopyResults
    -- The whole point of the button: the maintainer pastes the run back
    -- verbatim into the OXT-pass record, so nobody has to retype a result.
+   -- It copies stReportText(), not sResultText, so an early copy carries its
+   -- own "not finished" trailer into the record - and says so here too,
+   -- because the one moment a maintainer is looking at this window is the
+   -- moment the dialog appears.
+   --
+   -- The COUNTS ride along, ahead of the lines. They live in their own field
+   -- (stSummary) and used to be left behind, so the runbook taught a message
+   -- box incantation to fetch them by hand - one more step between a finished
+   -- run and a recorded one, at the exact moment the operator is done. A
+   -- report with no totals cannot be checked against the next run's.
    local tError
    try
-      set the clipboardData["text"] to sResultText
-      answer "Results copied to the clipboard."
+      set the clipboardData["text"] to sPassed & " passed, " & sFailed \
+            & " failed, " & sSkipped & " skipped, " & sTotal & " total" \
+            & return & return & stReportText()
+      if sStRunDone is "true" then
+         answer "Results copied to the clipboard."
+      else
+         answer "Copied - but the run has NOT finished. An async section is" \
+               && "still going; wait for the SUMMARY section, then copy again."
+      end if
    catch tError
       answer "Could not reach the clipboard:" && tError
    end try
