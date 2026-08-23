@@ -70,6 +70,7 @@
 #include <libtorrent/units.hpp>
 #include <libtorrent/create_torrent.hpp>
 #include <libtorrent/file_storage.hpp>
+#include <libtorrent/version.hpp>   /* LIBTORRENT_VERSION_NUM: the 2.0/2.1 create_torrent guard below */
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bitfield.hpp>
@@ -2834,18 +2835,35 @@ extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
     BTX_GUARD_BUFFER({
         if (!contentPath || !*contentPath) { set_error("empty content path"); return 0; }
 
-        /* Scan the file/dir into a file_storage, hash it, and bencode the result
-         * into the caller buffer. This reads content off disk on THIS thread (a
-         * deliberate, documented blocking call — it is a build step, not the hot
-         * path), but still only the METAINFO crosses the FFI, never payload. */
+        /* Scan the file/dir, hash it, and bencode the result into the caller
+         * buffer. This reads content off disk on THIS thread (a deliberate,
+         * documented blocking call — it is a build step, not the hot path),
+         * but still only the METAINFO crosses the FFI, never payload.
+         *
+         * pieceSize 0 == auto (let libtorrent pick). flags pass through to
+         * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose.
+         *
+         * TWO API GENERATIONS, version-guarded: libtorrent 2.1 REMOVED the
+         * create_torrent(file_storage&) constructor in its create_torrent
+         * overhaul (the replacement takes std::vector<create_file_entry>,
+         * built by lt::list_files). The pinned FetchContent build (v2.0.11),
+         * apt's and brew's 2.0.x all take the old branch; the Windows vcpkg
+         * lanes rolled to 2.1 on 2026-08-23 and broke at this line — MSVC's
+         * candidate list in that failure is the authority for the new
+         * signature. The 2.1 branch is compile-proven by those CI lanes, not
+         * executed here (this environment builds against the 2.0.11 pin). */
+#if LIBTORRENT_VERSION_NUM >= 20100
+        std::vector<lt::create_file_entry> files = lt::list_files(contentPath);
+        if (files.empty()) { set_error("no files at content path"); return 0; }
+        lt::create_torrent ct(std::move(files), pieceSize, lt::create_flags_t{
+            static_cast<std::uint32_t>(static_cast<unsigned>(flags))});
+#else
         lt::file_storage fs;
         lt::add_files(fs, contentPath);
         if (fs.num_files() == 0) { set_error("no files at content path"); return 0; }
-
-        /* pieceSize 0 == auto (let libtorrent pick). flags pass through to
-         * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose. */
         lt::create_torrent ct(fs, pieceSize, lt::create_flags_t{
             static_cast<std::uint32_t>(static_cast<unsigned>(flags))});
+#endif
 
         /* Optional announce URLs: a newline-separated list. Each non-empty,
          * trimmed line becomes its own tracker tier (so they are tried in order);

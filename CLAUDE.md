@@ -277,6 +277,22 @@ found in nocloud's route table are exactly that shape.
 > of those 144 handlers actually looks. Absence from the place you searched is not
 > absence from the tree.
 
+**libtorrent 2.1 REMOVED the `create_torrent(file_storage&)` constructor, and the Windows
+vcpkg lanes met it first (2026-08-23).** Both `native-torrentxt.yml` Windows jobs went red at
+`torrent_shim.cpp`'s `btx_create_torrent` on a script-only commit: vcpkg had rolled
+libtorrent to 2.1, whose create_torrent overhaul replaces the `file_storage` scan
+(`add_files`) with `std::vector<create_file_entry>` (`lt::list_files`). The shim now carries
+both branches behind `#if LIBTORRENT_VERSION_NUM >= 20100`, with MSVC's own candidate list
+from the failing run as the authority for the new signature. Evidence split, stated
+honestly: the 2.0 branch is EXECUTED here (apt libtorrent 2.0.10, ASan/UBSan, all three
+ctests green - the sanitize lane's exact recipe) and is byte-identical source to what the
+committed binaries were built from, which is why they are NOT refreshed in this change (the
+preprocessor selects the same code at the 2.0.11 pin; `check-binary-freshness.py` green);
+the 2.1 branch is COMPILE-PROVEN by the Windows CI lanes only and has never executed
+anywhere. If the pinned FetchContent tag or the apt/brew packages ever roll to 2.1, the
+smoke test's create-torrent leg is the first thing to run before trusting a binary from
+that build.
+
 ## Git / workflow
 
 - Develop on the per-task branch (e.g. `claude/...`); commit there, open a **draft PR**
