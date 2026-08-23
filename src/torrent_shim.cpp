@@ -70,6 +70,7 @@
 #include <libtorrent/units.hpp>
 #include <libtorrent/create_torrent.hpp>
 #include <libtorrent/file_storage.hpp>
+#include <libtorrent/load_torrent.hpp>  /* load_torrent_buffer: the .torrent parse both generations share */
 #include <libtorrent/version.hpp>   /* LIBTORRENT_VERSION_NUM: the 2.0/2.1 create_torrent guard below */
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/bdecode.hpp>
@@ -1191,18 +1192,24 @@ extern "C" BTX_API int BTX_CALL btx_add_torrent_file(int s, const void *data,
 
         /* Parse the .torrent METAINFO from the IN buffer. This is metainfo only;
          * the payload never crosses (rule 3) — only the small bencoded dict that
-         * names the files/pieces. The ec-overload never throws on malformed
-         * bytes; it reports via ec, which is exactly how a deliberately corrupt
-         * .torrent fails gracefully instead of unwinding across the boundary. */
-        lt::error_code ec;
-        auto ti = std::make_shared<lt::torrent_info>(
-            reinterpret_cast<char const *>(data), len, ec);
-        if (ec) { set_error("invalid .torrent: " + ec.message()); return 0; }
-
+         * names the files/pieces. This used to be the torrent_info-from-buffer
+         * ec-constructor, which libtorrent 2.1 compiles out with the rest of the
+         * deprecated surface; load_torrent_buffer is the replacement and exists
+         * in 2.0.10+ too, so ONE spelling serves both generations (unlike the
+         * version-guarded sites above). Its ec overload is 2.1-only, hence the
+         * local try: a malformed .torrent still reports "invalid .torrent"
+         * gracefully instead of riding the generic firewall, and nothing
+         * unwinds across the boundary. */
         lt::add_torrent_params atp;
-        atp.ti = ti;
+        try {
+            atp = lt::load_torrent_buffer(
+                lt::span<char const>(reinterpret_cast<char const *>(data), len));
+        } catch (std::exception const &e) {
+            set_error(std::string("invalid .torrent: ") + e.what()); return 0;
+        }
         if (savePath && *savePath) atp.save_path = savePath;
 
+        lt::error_code ec;
         lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
         if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
         return register_torrent(st, h);
@@ -1265,14 +1272,18 @@ extern "C" BTX_API int BTX_CALL btx_add_torrent_file_ex(int s, const void *data,
         SessionState *st = session_for(s);
         if (!st || !st->ses) { set_error("no live session"); return 0; }
         if (!data || len <= 0) { set_error("empty .torrent buffer"); return 0; }
-        lt::error_code ec;
-        auto ti = std::make_shared<lt::torrent_info>(
-            reinterpret_cast<char const *>(data), len, ec);
-        if (ec) { set_error("invalid .torrent: " + ec.message()); return 0; }
+        /* Same two-generation parse as btx_add_torrent_file above (see the
+         * comment there): load_torrent_buffer serves 2.0.10+ and 2.1 alike. */
         lt::add_torrent_params atp;
-        atp.ti = ti;
+        try {
+            atp = lt::load_torrent_buffer(
+                lt::span<char const>(reinterpret_cast<char const *>(data), len));
+        } catch (std::exception const &e) {
+            set_error(std::string("invalid .torrent: ") + e.what()); return 0;
+        }
         if (savePath && *savePath) atp.save_path = savePath;
         apply_add_flags(atp, flagsDec, maskDec);
+        lt::error_code ec;
         lt::torrent_handle h = st->ses->add_torrent(std::move(atp), ec);
         if (ec) { set_error("add_torrent failed: " + ec.message()); return 0; }
         return register_torrent(st, h);
@@ -1674,6 +1685,34 @@ extern "C" BTX_API int BTX_CALL btx_piece_bitfield(int t, void *out, int cap) {
     });
 }
 
+/* ---- libtorrent 2.0 vs 2.1 spellings, at FILE scope on purpose ---------- *
+ * libtorrent 2.1 compiles its deprecated surface out entirely (vcpkg builds
+ * with TORRENT_ABI_VERSION >= 4), which removes peer_info::ip and
+ * torrent_info::files(); the replacements (remote_endpoint(), layout()) do
+ * not exist in 2.0, so both spellings must stay. The conditionals live in
+ * these helpers rather than at the call sites because every entry body is a
+ * BTX_GUARD_* macro ARGUMENT, and a preprocessor directive inside a macro
+ * argument is ill-formed - MSVC refuses it (C2121) while gcc happens to
+ * accept it, which is exactly how the first version of this fix passed
+ * locally and failed on the Windows lanes. Verified against the fetched
+ * RC_2_1 headers, not from memory: peer_info.hpp:392 remote_endpoint(),
+ * torrent_info.hpp:228 layout(), both unconditional in 2.1. */
+static lt::tcp::endpoint btx_peer_endpoint(lt::peer_info const &pi) {
+#if LIBTORRENT_VERSION_NUM >= 20100
+    return pi.remote_endpoint();
+#else
+    return pi.ip;
+#endif
+}
+
+static lt::file_storage const &btx_file_layout(lt::torrent_info const &ti) {
+#if LIBTORRENT_VERSION_NUM >= 20100
+    return ti.layout();
+#else
+    return ti.files();
+#endif
+}
+
 extern "C" BTX_API int BTX_CALL btx_peer_list(int t, void *out, int cap) {
     BTX_GUARD_BUFFER({
         bool ok = false; lt::torrent_handle h = torrent_only(t, nullptr, &ok);
@@ -1703,9 +1742,10 @@ extern "C" BTX_API int BTX_CALL btx_peer_list(int t, void *out, int cap) {
                  * that is stable across Boost versions (the error_code overload was
                  * dropped in newer Boost.Asio); a throw on a degenerate address is
                  * caught by the surrounding firewall. */
-                std::string ep = pi.ip.address().to_string();
+                const lt::tcp::endpoint pep = btx_peer_endpoint(pi);
+                std::string ep = pep.address().to_string();
                 ep += ':';
-                ep += std::to_string(pi.ip.port());
+                ep += std::to_string(pep.port());
                 r.put_str(btx::F_PEER_ENDPOINT, ep);
                 r.put_str(btx::F_PEER_CLIENT, pi.client);
                 r.put_int(btx::F_PEER_DOWN_RATE, pi.down_speed);
@@ -1749,7 +1789,7 @@ extern "C" BTX_API int BTX_CALL btx_file_list(int t, void *out, int cap) {
         uint16_t emitted = 0;
 
         if (ti) {
-            const lt::file_storage &fs = ti->files();
+            const lt::file_storage &fs = btx_file_layout(*ti);
             const int n = fs.num_files();
             /* per-file downloaded bytes + priorities in two bulk calls (cheaper
              * than N round-trips); tiny control data, never payload. */
@@ -2828,30 +2868,33 @@ extern "C" BTX_API int BTX_CALL btx_save_resume(int t) {
  *  Create torrents (seeding side — plan Phase 3)
  * ====================================================================== */
 
-extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
-                                                   int pieceSize, int flags,
-                                                   const char *trackers,
-                                                   void *out, int cap) {
-    BTX_GUARD_BUFFER({
-        if (!contentPath || !*contentPath) { set_error("empty content path"); return 0; }
-
-        /* Scan the file/dir, hash it, and bencode the result into the caller
-         * buffer. This reads content off disk on THIS thread (a deliberate,
-         * documented blocking call — it is a build step, not the hot path),
-         * but still only the METAINFO crosses the FFI, never payload.
-         *
-         * pieceSize 0 == auto (let libtorrent pick). flags pass through to
-         * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose.
-         *
-         * TWO API GENERATIONS, version-guarded: libtorrent 2.1 REMOVED the
-         * create_torrent(file_storage&) constructor in its create_torrent
-         * overhaul (the replacement takes std::vector<create_file_entry>,
-         * built by lt::list_files). The pinned FetchContent build (v2.0.11),
-         * apt's and brew's 2.0.x all take the old branch; the Windows vcpkg
-         * lanes rolled to 2.1 on 2026-08-23 and broke at this line — MSVC's
-         * candidate list in that failure is the authority for the new
-         * signature. The 2.1 branch is compile-proven by those CI lanes, not
-         * executed here (this environment builds against the 2.0.11 pin). */
+/* The body lives in a FILE-SCOPE helper, not in the entry point, because the
+ * entry bodies are BTX_GUARD_* macro ARGUMENTS and the version conditional
+ * below needs preprocessor directives - ill-formed inside a macro argument
+ * (MSVC C2121; gcc happens to accept it, which is how the first version of
+ * this guard passed the local sanitizer build and still broke both Windows
+ * lanes). Throws from here propagate to the caller's firewall unchanged.
+ *
+ * Scan the file/dir, hash it, and bencode the result into the caller
+ * buffer. This reads content off disk on THIS thread (a deliberate,
+ * documented blocking call - it is a build step, not the hot path),
+ * but still only the METAINFO crosses the FFI, never payload.
+ *
+ * pieceSize 0 == auto (let libtorrent pick). flags pass through to
+ * create_torrent (v1/v2/hybrid, optimize, etc.) as the caller chose.
+ *
+ * TWO API GENERATIONS: libtorrent 2.1 REMOVED the
+ * create_torrent(file_storage&) constructor in its create_torrent
+ * overhaul (the replacement takes std::vector<create_file_entry>,
+ * built by lt::list_files - RC_2_1 create_torrent.hpp:267,601). The
+ * pinned FetchContent build (v2.0.11), apt's and brew's 2.0.x all take
+ * the old branch; the Windows vcpkg lanes rolled to 2.1 on 2026-08-23
+ * and broke here first. The 2.1 branch is compile-proven against the
+ * fetched RC_2_1 headers and by the Windows CI lanes, not executed in
+ * this environment (which builds against the 2.0.11 pin). */
+static int btx_build_torrent_blob(const char *contentPath, int pieceSize,
+                                  int flags, const char *trackers,
+                                  void *out, int cap) {
 #if LIBTORRENT_VERSION_NUM >= 20100
         std::vector<lt::create_file_entry> files = lt::list_files(contentPath);
         if (files.empty()) { set_error("no files at content path"); return 0; }
@@ -2912,6 +2955,15 @@ extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
         if (need > static_cast<size_t>(cap < 0 ? 0 : cap))
             return -static_cast<int>(need);
         return static_cast<int>(need);
+}
+
+extern "C" BTX_API int BTX_CALL btx_create_torrent(const char *contentPath,
+                                                   int pieceSize, int flags,
+                                                   const char *trackers,
+                                                   void *out, int cap) {
+    BTX_GUARD_BUFFER({
+        if (!contentPath || !*contentPath) { set_error("empty content path"); return 0; }
+        return btx_build_torrent_blob(contentPath, pieceSize, flags, trackers, out, cap);
     });
 }
 

@@ -293,6 +293,30 @@ anywhere. If the pinned FetchContent tag or the apt/brew packages ever roll to 2
 smoke test's create-torrent leg is the first thing to run before trusting a binary from
 that build.
 
+**THE FIRST VERSION OF THAT FIX WAS WRONG TWICE, AND BOTH WAYS ARE THE LESSON
+(2026-08-23, same day, second push).** The Windows lanes went red again, and the fuller
+log told a story the first 60-line tail had hidden. One: a preprocessor directive inside
+a macro ARGUMENT is ill-formed, and every `btx_*` entry body is a `BTX_GUARD_*` macro
+argument - gcc happens to accept `#if` there, MSVC refuses it (C2121), so the guard that
+passed the local sanitizer build could never have compiled on Windows. Version
+conditionals now live only at file scope (`btx_peer_endpoint`, `btx_file_layout`, and
+`btx_build_torrent_blob`, which owns the whole create-torrent body). Two: tailing 60
+lines of a failed build showed the LAST error and hid three more 2.1 removals at lower
+line numbers - `peer_info::ip` (2.1: `remote_endpoint()`), `torrent_info::files()` (2.1:
+`layout()`), and the `torrent_info` from-buffer ec-constructor in BOTH `.torrent` add
+paths. That last one needed no guard at all: `lt::load_torrent_buffer` exists from
+2.0.10 on, so one spelling serves both generations, and its throwing overload sits in a
+local try so a malformed `.torrent` still reports "invalid .torrent" instead of riding
+the generic firewall. The verification that should have happened the first time now
+has: the RC_2_1 header tree was fetched and the WHOLE shim compiled against it with the
+deprecated surface off (`g++ -fsyntax-only -DTORRENT_ABI_VERSION=4`, 0 errors) - which
+is what found the two `.torrent` sites MSVC's own error cascade had masked - alongside
+the 2.0 path executing green under ASan/UBSan (the smoke test drives
+`load_torrent_buffer` on both the refusal and success legs). Because this round changes
+code that compiles at the 2.0.11 pin (unlike the first, preprocessor-identical round),
+the committed Linux binaries ARE refreshed in this change per rule 5; the Windows DLLs
+stay at their recorded needs-the-next-dispatch state.
+
 ## Git / workflow
 
 - Develop on the per-task branch (e.g. `claude/...`); commit there, open a **draft PR**
