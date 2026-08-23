@@ -1616,7 +1616,17 @@ on socketError pSocketID, pError
    if pSocketID is sControlSocket then
       oxStatusUpdate "control", "error: " & pError
       oxDisconnectControl
+      exit socketError
    end if
+   -- NOT OURS: pass it on (2026-08-23). These three names are the ENGINE's,
+   -- shared by every socket library in the message path, and the family rule
+   -- this file itself documents for apps (docs/05, docs/10) applies to the
+   -- library too: swallowing another library's socket event is a silent HANG
+   -- there. Found by the suite's cross-library name gate when nostrxt's
+   -- relay layer became the second library defining these. Verified
+   -- statically; needs an OXT re-pass (the own-socket branches above are
+   -- the engine-proven ones and are unchanged).
+   pass socketError
 end socketError
 
 on socketClosed pSocketID
@@ -1633,7 +1643,10 @@ on socketClosed pSocketID
    if pSocketID is sControlSocket then
       oxStatusUpdate "control", "disconnected"
       oxDisconnectControl
+      exit socketClosed
    end if
+   -- NOT OURS: pass it on (see socketError above).
+   pass socketClosed
 end socketClosed
 
 on socketTimeout pSocketID
@@ -1649,11 +1662,17 @@ on socketTimeout pSocketID
       end if
       exit socketTimeout
    end if
-   -- Control socket: only fatal before authentication completes.
-   if pSocketID is sControlSocket and sControlState is not "authenticated" then
-      oxStatusUpdate "control", "error: control handshake timed out"
-      oxDisconnectControl
+   -- Control socket (ours even when authenticated - an idle timeout there
+   -- is normal): only fatal before authentication completes.
+   if pSocketID is sControlSocket then
+      if sControlState is not "authenticated" then
+         oxStatusUpdate "control", "error: control handshake timed out"
+         oxDisconnectControl
+      end if
+      exit socketTimeout
    end if
+   -- NOT OURS: pass it on (see socketError above).
+   pass socketTimeout
 end socketTimeout
 
 -- ==========================================================================
