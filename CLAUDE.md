@@ -315,7 +315,11 @@ the 2.0 path executing green under ASan/UBSan (the smoke test drives
 `load_torrent_buffer` on both the refusal and success legs). Because this round changes
 code that compiles at the 2.0.11 pin (unlike the first, preprocessor-identical round),
 the committed Linux binaries ARE refreshed in this change per rule 5; the Windows DLLs
-stay at their recorded needs-the-next-dispatch state.
+stay at their recorded needs-the-next-dispatch state. (Precision for the 2026-08-24
+Windows engine pass, which ran torrentxt green at 101/101 in the suite paste: that run
+executed the COMMITTED pre-change DLLs - a reconfirmation of the old parse path - so the
+load_torrent_buffer spelling is engine-proven NOWHERE yet; its first engine contact will
+be a Linux pass over the rebuilt .so, or Windows after the next release dispatch.)
 
 ## Git / workflow
 
