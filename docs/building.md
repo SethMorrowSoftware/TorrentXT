@@ -163,14 +163,27 @@ it exists for fast per-push feedback and its artifacts are never committed.
 
 ### macOS — universal + codesign/notarize
 
+- Since 2026-08-23 the suite's `release-binaries.yml` builds the universal
+  dylib in CI (the `mac-lipo` job: each slice thin against a per-arch build of
+  the pinned static OpenSSL, both slices tested, `lipo -create`) — unsigned,
+  which the owner accepted that day. The rest of this section is the manual
+  recipe, still equivalent, and the codesign/notarize half no lane does.
 - Build **universal** with `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`; one
-  `universal-mac/torrentxt.dylib` serves Apple silicon and Intel.
-- Before public release the dylib must be **codesigned** (Developer ID) and the
-  package **notarized**. That needs an Apple Developer ID and a `notarytool`
-  keychain profile / app-specific password — credentials this repo does **not**
-  carry. The CI workflow contains a **disabled placeholder** step
-  (`codesign … && notarytool submit …`); enable it once the secrets exist. **A
-  human owns the notarization credentials and the go/no-go.**
+  `universal-mac/torrentxt.dylib` serves Apple silicon and Intel. That single
+  pass assumes your static deps (OpenSSL, Boost) are themselves universal; with
+  per-arch dependency trees - the CI route - build each slice with a SINGLE
+  arch value and `lipo -create` the pair (one value per slice, never both:
+  two fat inputs share architectures and `lipo -create` refuses duplicates).
+- Codesigning (Developer ID) + **notarization** is NO LONGER a release gate:
+  unsigned distribution was explicitly accepted 2026-08-23, and the committed
+  dylib ships with the linker's automatic ad-hoc signature (a
+  browser-downloaded zip needs its quarantine attribute cleared; a git
+  checkout does not). It remains the polish for a friction-free public
+  download, and the mechanics stand for whenever that is wanted: an Apple
+  Developer ID and a `notarytool` keychain profile / app-specific password —
+  credentials this repo does **not** carry — and the CI workflow's **disabled
+  placeholder** step (`codesign … && notarytool submit …`). **A human owns
+  those credentials and the go/no-go.**
 
 ### Windows — the module-definition for clean exports
 
@@ -275,10 +288,11 @@ gates below run for every member in the root `suite-gates.yml`. The jobs:
   decision — a maintainer installing an artifact, or the suite's manual
   `release-binaries.yml` assembly (which installs, verifies, and refreshes the
   manifests via `tools/install-release-binaries.py`).
-  **macOS is the one platform not shipped from CI**: the lane builds the
-  host arch (arm64) against Homebrew, which is neither universal nor self-contained;
-  the real universal + codesigned + notarized dylib is a separate release build (see
-  the `README.md` in `src/code/universal-mac/` and the macOS section above). Gated to
+  **macOS**: the per-member lane builds the host arch (arm64) against Homebrew,
+  which is neither universal nor self-contained; the real universal dylib is
+  `release-binaries.yml`'s `mac-lipo` job since 2026-08-23 (unsigned - codesign +
+  notarize still exists nowhere; see the `README.md` in `src/code/universal-mac/`
+  and the macOS section above). Gated to
   `main` because CI builds are not byte-reproducible, so a per-branch binary commit
   would collide with main's and block PR merges.
 
