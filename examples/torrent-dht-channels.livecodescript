@@ -1603,7 +1603,30 @@ command oxShutdown
    oxDisconnectControl
 end oxShutdown
 
-on socketError pSocketID, pError
+-- THE ENGINE'S THREE SOCKET MESSAGES, SPLIT IN TWO (2026-08-24).
+--
+-- The LOGIC lives in oxSocketError / oxSocketClosed / oxSocketTimeout, which
+-- are ordinary ox*-prefixed functions answering ONE question: was that socket
+-- MINE, and did I handle it? The `on socketError` / `on socketClosed` /
+-- `on socketTimeout` handlers below are now pure dispatch - call the named
+-- one, exit if it consumed the event, otherwise pass.
+--
+-- WHY, because the split looks like ceremony until you need it: these three
+-- names are the ENGINE's, so every socket library in the message path
+-- declares the same three, and two scripts cannot define one name in ONE
+-- script - which is exactly what embedding a library into an app's stack
+-- script does (tools/sync-demo-embeds.py). That is what kept OnionXT out of
+-- nocloud's paste and left its users a manual `start using` step. With the
+-- logic behind a name of its OWN, an embedder drops these three thin
+-- wrappers and calls oxSocketError(...) from its own handler instead of
+-- passing - no copy of this logic anywhere, so nothing can go stale.
+--
+-- The own-socket branches are UNCHANGED and stay the engine-proven ones; the
+-- split itself is verified statically and needs a live-Tor re-pass.
+
+-- Was pSocketID one of OUR sockets, and did we handle the error? "true" when
+-- consumed, "false" when it belongs to somebody else.
+function oxSocketError pSocketID, pError
    -- The engine's socket-failure message. If the socket closes because of an
    -- error, this arrives instead of socketClosed. Look up the owner and fail
    -- closed (docs LiveCode ref). A message for an unknown id is a clean no-op.
@@ -1611,25 +1634,30 @@ on socketError pSocketID, pError
    put sSockToStream[pSocketID] into tHandle
    if tHandle is not empty then
       oxStreamFail tHandle, "socket error: " & pError
-      exit socketError
+      return "true"
    end if
    if pSocketID is sControlSocket then
       oxStatusUpdate "control", "error: " & pError
       oxDisconnectControl
+      return "true"
+   end if
+   return "false"
+end oxSocketError
+
+on socketError pSocketID, pError
+   if oxSocketError(pSocketID, pError) then
       exit socketError
    end if
-   -- NOT OURS: pass it on (2026-08-23). These three names are the ENGINE's,
-   -- shared by every socket library in the message path, and the family rule
-   -- this file itself documents for apps (docs/05, docs/10) applies to the
-   -- library too: swallowing another library's socket event is a silent HANG
-   -- there. Found by the suite's cross-library name gate when nostrxt's
-   -- relay layer became the second library defining these. Verified
-   -- statically; needs an OXT re-pass (the own-socket branches above are
-   -- the engine-proven ones and are unchanged).
+   -- NOT OURS: pass it on (2026-08-23). The family rule this file itself
+   -- documents for apps (docs/05, docs/10) applies to the library too:
+   -- swallowing another library's socket event is a silent HANG there. Found
+   -- by the suite's cross-library name gate when nostrxt's relay layer became
+   -- the second library defining these.
    pass socketError
 end socketError
 
-on socketClosed pSocketID
+-- Was pSocketID one of OUR sockets, and did we handle the close?
+function oxSocketClosed pSocketID
    -- The remote side closed cleanly. Deliver "closed" to a stream's app callback
    -- and forget it; for the control socket, mark disconnected.
    local tHandle
@@ -1638,18 +1666,26 @@ on socketClosed pSocketID
       oxInvokeStreamCallback tHandle, "closed", empty
       delete variable sSockToStream[pSocketID]
       delete variable sStreams[tHandle]
-      exit socketClosed
+      return "true"
    end if
    if pSocketID is sControlSocket then
       oxStatusUpdate "control", "disconnected"
       oxDisconnectControl
+      return "true"
+   end if
+   return "false"
+end oxSocketClosed
+
+on socketClosed pSocketID
+   if oxSocketClosed(pSocketID) then
       exit socketClosed
    end if
    -- NOT OURS: pass it on (see socketError above).
    pass socketClosed
 end socketClosed
 
-on socketTimeout pSocketID
+-- Was pSocketID one of OUR sockets, and did we handle the timeout?
+function oxSocketTimeout pSocketID
    -- socketTimeout REPEATS every interval while a read/write is pending (docs
    -- LiveCode ref), so it is only fatal during a handshake; on a connected stream
    -- it is just an idle read and must be ignored. Tear down only handshakes.
@@ -1660,7 +1696,7 @@ on socketTimeout pSocketID
       if tState is not "connected" then
          oxStreamFail tHandle, "SOCKS handshake timed out"
       end if
-      exit socketTimeout
+      return "true"
    end if
    -- Control socket (ours even when authenticated - an idle timeout there
    -- is normal): only fatal before authentication completes.
@@ -1669,6 +1705,13 @@ on socketTimeout pSocketID
          oxStatusUpdate "control", "error: control handshake timed out"
          oxDisconnectControl
       end if
+      return "true"
+   end if
+   return "false"
+end oxSocketTimeout
+
+on socketTimeout pSocketID
+   if oxSocketTimeout(pSocketID) then
       exit socketTimeout
    end if
    -- NOT OURS: pass it on (see socketError above).
