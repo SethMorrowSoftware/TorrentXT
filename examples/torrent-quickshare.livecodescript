@@ -1446,9 +1446,20 @@ function qsCanEncrypt
       put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
       put sxSecretBoxOpen(tBox, tKey) into tOut
    catch tErr
-      return false
+      return "false"
    end try
-   return (textDecode(tOut, "ASCII") is "probe")
+   -- ANSWER IN THE SPELLING THE DECLARATION PROMISES ("true"/"false"), not a
+   -- bare boolean. Every read of sCanEncrypt in THIS file is boolean-context,
+   -- so both spellings work here - but the same probe in nocloud (the
+   -- spun-out descendant, 144 shared handlers) grew one read that compares
+   -- `is not "true"`, and that read painted "install SodiumXT" on a machine
+   -- where SodiumXT was installed and working. Reported 2026-08-24, fixed
+   -- there; normalised here so the class cannot reappear the next time a
+   -- string comparison is added on either side of the lineage.
+   if textDecode(tOut, "ASCII") is "probe" then
+      return "true"
+   end if
+   return "false"
 end qsCanEncrypt
 
 -- A small helper: base64 with the line breaks stripped so a code stays one line.
