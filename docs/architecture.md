@@ -2,7 +2,7 @@
 
 This is the as-built map of how the pieces fit. The full rationale (engine
 choice, the phased plan, the risk register) lives in
-`docs/TorrentXT-IMPLEMENTATION-PLAN.md`; the hard-won-lesson list lives in
+`docs/archive/TorrentXT-IMPLEMENTATION-PLAN.md`; the hard-won-lesson list lives in
 `/CLAUDE.md`. This file explains the *shape* of the code so a new contributor
 can find their footing.
 

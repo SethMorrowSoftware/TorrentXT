@@ -1,5 +1,12 @@
 # TorrentXT — Implementation Plan & Specification
 
+> **ARCHIVED / HISTORICAL (filed here 2026-08-26).** The original design brief.
+> It remains the authority on WHY the binding is shaped the way it is, and it is
+> not a status page: for the as-built account use [`../../CLAUDE.md`](../../CLAUDE.md),
+> for the shipped surface [`../api-reference.md`](../api-reference.md), and for how
+> the pieces fit today [`../architecture.md`](../architecture.md). Where this
+> document and the code disagree, the code wins.
+
 > **Working name:** TorrentXT · **LCB module:** `org.openxtalk.library.torrent` ·
 > **Native lib (bare token):** `torrentxt` · **C ABI prefix:** `btx_` · **Public LCB prefix:** `bt`
 >

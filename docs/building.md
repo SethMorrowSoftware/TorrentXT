@@ -47,7 +47,7 @@ All are plain `-D` flags. Defaults favour a portable, reproducible build.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `TORRENTXT_BUILD_TESTS` | `OFF` | Build + register the ctest suite (`record_handle_test` and `torrent_smoke_test`). |
+| `TORRENTXT_BUILD_TESTS` | `OFF` | Build + register the ctest suite (`record_handle_test`, `torrent_smoke_test` and `rp1_integration_test`). |
 | `TORRENTXT_USE_SYSTEM_LIBTORRENT` | `OFF` | Use `find_package(LibtorrentRasterbar)` + `find_package(Boost)` (vcpkg / apt / system install) instead of FetchContent. Fast — no upstream rebuild. |
 | `TORRENTXT_SANITIZE` | `OFF` | Build **all** our C++ under gcc ASan+UBSan (`-fno-sanitize-recover=all`). Ignored on MSVC. (`record_handle_test` is sanitized even without this — see below.) |
 | `TORRENTXT_LIBTORRENT_TAG` | `v2.0.11` | The pinned libtorrent git tag for the FetchContent path. Change only deliberately. |
@@ -199,7 +199,7 @@ bumping `BTX_ABI_VERSION` for the new symbol anyway).
 
 ## Tests
 
-`-DTORRENTXT_BUILD_TESTS=ON` registers up to two ctest executables:
+`-DTORRENTXT_BUILD_TESTS=ON` registers up to three ctest executables:
 
 1. **`record_handle_test`** — `tests/record_handle_test.cpp`. **No libtorrent.**
    Header-only: it exercises the big-endian / length-prefixed record framing (the
@@ -222,7 +222,21 @@ bumping `BTX_ABI_VERSION` for the new symbol anyway).
    `src/torrent_shim.cpp` and the test source exist** (Phase 1+), so the Phase-0
    skeleton still configures and tests green.
 
-Run both with:
+3. **`rp1_integration_test`** — `tests/rp1_integration_test.cpp`. Links the shim +
+   libtorrent and proves the **rp1 peer-wire path on the wire**, in ONE process with
+   no OXT and no second machine: two real libtorrent sessions on loopback, the actual
+   rp1 plugin attached to each, the same metadata-less phantom swarm added to both, an
+   explicit `connect_peer` wiring them together, and one message from A confirmed at B
+   byte-for-byte. That reaches the four things the smoke test cannot — extended-handshake
+   negotiation, the `tick()` flush of a queued send, `on_extended` delivery, and the
+   phantom (no-metadata) connection holding long enough to talk. Registered on the same
+   condition as the smoke test (the test source and the `torrentxt` target both exist),
+   with a **120 s ctest timeout** (the per-peer tick that flushes a send runs about once
+   a second, and a slow runner needs the room) and `ASAN_OPTIONS=detect_container_overflow=0`,
+   which mutes the known false positive a shim built WITH ASan hits against a libtorrent
+   built without it.
+
+Run all three with:
 
 ```sh
 ctest --test-dir build --output-on-failure

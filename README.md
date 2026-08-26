@@ -24,6 +24,8 @@ runtime.
 
 ---
 
+> **Documentation:** [`docs/README.md`](docs/README.md) indexes every page for this member — getting started, the full `bt*` API reference, the architecture map, the native build, and the original design brief.
+
 ## Features
 
 - **Add anything** — magnet links, `.torrent` files, and resume data; metadata is
@@ -68,7 +70,7 @@ required.
 | Linux | x86 (32-bit) | ✅ committed |
 | Windows | x86-64 | ✅ committed |
 | Windows | x86 (32-bit) | ✅ committed |
-| macOS | universal (arm64 + x86-64) | 🚧 buildable from source; signed universal dylib pending |
+| macOS | universal (arm64 + x86-64) | 🚧 buildable from source; the universal dylib's CI lane is wired (`release-binaries.yml`'s `mac-lipo`, unsigned — the owner accepted unsigned distribution 2026-08-23, so codesign + notarize is no longer a blocker), and nothing is committed here until its first dispatch — `src/code/universal-mac/README.md` |
 
 ---
 
@@ -233,7 +235,7 @@ A simple starter, two flagship demos, plus the shared poll-dispatcher utility:
   marshalling, the wire format, the handle table, what's verifiable where.
 - **[building.md](docs/building.md)** — building the native shim from source, the
   CMake options, the CI matrix, the platform floors.
-- **[TorrentXT-IMPLEMENTATION-PLAN.md](docs/TorrentXT-IMPLEMENTATION-PLAN.md)** — the
+- **[TorrentXT-IMPLEMENTATION-PLAN.md](docs/archive/TorrentXT-IMPLEMENTATION-PLAN.md)** — the
   original design brief, kept for the *why* (engine choice, ABI design, risk
   register).
 - **[NEXT-EXTENSIONS-PLAN.md](../docs/NEXT-EXTENSIONS-PLAN.md)** — the forward plan
@@ -264,8 +266,9 @@ practical libtorrent surface, plus BEP44 signed mutable items, NAT port mapping,
 and the rp1 peer-wire transport. The shim, the LCB binding, the test suite, and
 four of five platform binaries are built; the suite CI runs the static gates on
 every push, and the full native matrix (ASan/UBSan against real libtorrent) lives
-in this member's own workflow, run when TorrentXT is worked on in isolation (it
-is inert inside the monorepo). Because OpenXTalk has no
+in the root `native-torrentxt.yml`, scoped by `paths:` so only a torrentxt touch
+builds it (the member's own `.github/workflows/build.yml` is kept for isolated
+development and is inert here). Because OpenXTalk has no
 headless way to compile or run `.lcb`, runtime behaviour is marked "verified
 statically; needs an OXT pass" and confirmed by a human in the IDE — the project
 does not claim runtime behaviour it cannot observe. That confirmation has now
@@ -276,7 +279,9 @@ and on **2026-08-10** the whole member selftest
 (`tests/torrent-selftest.livecodescript`, 96 checks) ran green on a real engine,
 twice in one day, folded into the suite harness — the v9-v11 surface
 (`btDhtGetPeers`, `btAddInfohash`, `btMapPort`/`btUnmapPort`, the `btRp1*`
-quartet) included. Remaining: the signed macOS universal dylib and the two-machine
+quartet) included. Remaining: the first `release-binaries.yml` dispatch, which is
+what commits the macOS universal dylib its `mac-lipo` job has built since
+2026-08-23 (unsigned — the owner accepted that the same day), and the two-machine
 runs of this member's OWN rp1/DHT demos (the rp1/DHT transport itself has since
 carried two-machine traffic - riptide's feed propagation 2026-08-13 and its
 DMs-over-rp1 2026-08-15 ride exactly this surface). The optional visual dashboard widget (plan phase 5) was
