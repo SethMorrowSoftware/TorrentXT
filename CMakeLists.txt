@@ -347,9 +347,42 @@ if(TORRENTXT_BUILD_TESTS)
             # Turn the sanitizers on for just this executable when the global knob
             # is off, so `-DTORRENTXT_BUILD_TESTS=ON` alone still sanitizes the
             # header-only gate (its declared contract in the source banner).
-            target_compile_options(record_handle_test PRIVATE
-                -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
-            target_link_options(record_handle_test PRIVATE -fsanitize=address,undefined)
+            #
+            # ASK whether the runtime exists instead of inferring it from "not
+            # MSVC". The banner above already promised "only on a compiler that
+            # has the runtime", but the guard only checked the compiler was not
+            # MSVC - a check for a different thing, in the same shape as the
+            # `command -v perl` guard that let this same lane die on a missing
+            # Perl module. quay.io/pypa/manylinux_2_28_x86_64 ships gcc-toolset-14
+            # WITHOUT libasan, so the flags went on and the link failed with
+            # `cannot find -lasan` at 1% of a 30-minute release build (run 8,
+            # 2026-08-26) - four minutes before gmake reported it, which is why
+            # the tail of that log named neither asan nor this target.
+            include(CheckCXXSourceCompiles)
+            set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+            check_cxx_source_compiles("int main(void){return 0;}"
+                                      TORRENTXT_HAVE_SANITIZER_RUNTIME)
+            unset(CMAKE_REQUIRED_FLAGS)
+            if(TORRENTXT_HAVE_SANITIZER_RUNTIME)
+                target_compile_options(record_handle_test PRIVATE
+                    -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+                target_link_options(record_handle_test PRIVATE -fsanitize=address,undefined)
+            else()
+                # Build it anyway, unsanitized, and SAY SO. The test still checks
+                # the big-endian framing and the generation-tagged handles; what
+                # is not met is its sanitized-gate contract. Failing the whole
+                # build here would trade a missing sanitizer for no coverage at
+                # all, on a lane whose job is to produce a shipping library.
+                message(WARNING
+                    "record_handle_test: building WITHOUT ASan/UBSan - this "
+                    "compiler accepts -fsanitize=address,undefined but has no "
+                    "runtime to link against. The test still runs and still "
+                    "checks the record codec and handle table, but its "
+                    "sanitized-gate contract (CLAUDE.md) is NOT met in this "
+                    "build. Install the toolchain's sanitizer runtime to restore "
+                    "it; the gcc ASan/UBSan lane in native-torrentxt.yml is where "
+                    "that contract is actually enforced.")
+            endif()
         endif()
         add_test(NAME record_handle_test COMMAND record_handle_test)
         # Make UBSan's diagnostics fatal at runtime too (defence in depth with
