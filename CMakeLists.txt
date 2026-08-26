@@ -334,8 +334,10 @@ if(EXISTS "${TORRENTXT_SHIM_SRC}")
     # theorised: on the run that added this script, torrent_smoke_test aborted
     # in the ASan lane (the only job configured this way) while the SAME commit
     # passed ctest on linux-x86_64 and linux-x86, which build libtorrent from
-    # source and link it statically. datachannelxt has carried the identical
-    # script for months without trouble because it has no system path at all.
+    # source and link it statically. (CORRECTED 2026-08-26, same day: this
+    # comment first said datachannelxt "has no system path at all". It has one
+    # - DATACHANNELXT_USE_SYSTEM_LIBDATACHANNEL - which its Linux CI never
+    # exercises; that member now carries the same guard as this one.)
     #
     # Approximate but on the safe side: TORRENTXT_USE_SYSTEM_LIBTORRENT could
     # in principle find a STATIC system libtorrent (a vcpkg static triplet),

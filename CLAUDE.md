@@ -161,8 +161,12 @@ pass" and let the user confirm.
    libtorrent's throws on a *different* `__cxa_*` implementation. The symptom is the
    worst kind: `torrent_smoke_test` aborted with **no output whatsoever** in the ASan
    lane while the same commit passed ctest on `linux-x86_64` and `linux-x86`, which build
-   libtorrent from source. datachannelxt has carried the identical script for months
-   without trouble for the one reason that decides this — it has no system path at all.
+   libtorrent from source. datachannelxt carried the identical script for months
+   without trouble because its Linux CI always FetchContents its dependency — but
+   the claim first written here, that it "has no system path at all", was wrong:
+   `DATACHANNELXT_USE_SYSTEM_LIBDATACHANNEL` exists, so the hazard there was latent,
+   not absent, and that member now carries the same guard (corrected 2026-08-26,
+   the same day).
    Two fixes came out of it: the CMake gate (which prints when it skips), and the smoke
    test now announcing each section on an unbuffered stdout, because `CHECK` only prints
    on failure and a block-buffered pipe loses everything to an abort.
