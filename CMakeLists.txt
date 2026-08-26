@@ -106,15 +106,63 @@ endif()
 # does not demand a newer libstdc++.so.6 than the host provides. The real glibc
 # floor is enforced by building the RELEASE binary in a manylinux2014-style image
 # (glibc 2.17) — documented, not implemented in this file.
+
+# --------------------------------------------- the macOS export-list bridge ---
+# ld64 has no --version-script. Its equivalent is -exported_symbols_list, which
+# takes literal names and globs, and Mach-O decorates every C symbol with a
+# leading underscore (so does a C++ mangled name: _ZN3btx4test* becomes
+# __ZN3btx4test*).
+#
+# The list is DERIVED from the .map at configure time rather than maintained
+# beside it. Two hand-kept lists is how a symbol reaches one platform and
+# misses the other, and this member already has one such divergence on record:
+# the version script existed for ELF and nothing filtered Mach-O, so the two
+# slices of the universal dylib shipped different export sets and
+# check-binary-freshness refused the library outright (release run 9,
+# 2026-08-26). One source of truth, two link flags.
+function(torrentxt_apple_export_list target map_file)
+    if(NOT APPLE)
+        return()
+    endif()
+    file(READ "${map_file}" _txt)
+    string(REGEX REPLACE "/\\*([^*]|\\*+[^*/])*\\*+/" "" _txt "${_txt}")
+    string(REGEX MATCH "global:(.*)local:" _unused "${_txt}")
+    set(_globals "${CMAKE_MATCH_1}")
+    string(REPLACE "\n" ";" _globals "${_globals}")
+    set(_lines "")
+    foreach(_tok IN LISTS _globals)
+        string(STRIP "${_tok}" _tok)
+        if(NOT _tok STREQUAL "")
+            string(APPEND _lines "_${_tok}\n")
+        endif()
+    endforeach()
+    if(_lines STREQUAL "")
+        message(FATAL_ERROR
+            "torrentxt_apple_export_list: parsed NO symbols out of ${map_file}. An empty "
+            "-exported_symbols_list would hide the whole ABI and the library "
+            "would load with nothing bound, so this refuses rather than "
+            "shipping it.")
+    endif()
+    set(_exp "${CMAKE_CURRENT_BINARY_DIR}/torrentxt.exported_symbols")
+    file(WRITE "${_exp}" "${_lines}")
+    target_link_options(${target} PRIVATE "-Wl,-exported_symbols_list,${_exp}")
+    set_target_properties(${target} PROPERTIES LINK_DEPENDS "${map_file}")
+endfunction()
+
 if(UNIX AND NOT APPLE)
     # Static libstdc++/libgcc: the dominant portability win for a C++ .so.
     add_library(torrentxt_link INTERFACE)
     target_link_options(torrentxt_link INTERFACE
         -static-libstdc++ -static-libgcc
-        # Do not export libtorrent/Boost/stdc++ symbols from our .so; only btx_*
-        # (which carry visibility("default")) escape. Belt-and-suspenders with
-        # -fvisibility=hidden and the version script is not needed because the
-        # explicit BTX_API attribute already gates the surface.
+        # CORRECTED 2026-08-26. This comment used to say a version script "is
+        # not needed because the explicit BTX_API attribute already gates the
+        # surface". BTX_API and -fvisibility=hidden gate OUR translation units;
+        # libtorrent, Boost and the static OpenSSL are built by their own
+        # targets and their symbols inherit the shared library's default
+        # visibility. tools/check-binary-freshness.py measured the result and
+        # SKIPS this member's export-closure leg over it: the committed Linux
+        # builds export 5419 symbols beyond the shim's own. The script is
+        # applied to the library target below; see src/torrentxt.map.
         )
 else()
     add_library(torrentxt_link INTERFACE)
@@ -259,6 +307,62 @@ if(EXISTS "${TORRENTXT_SHIM_SRC}")
     if(_lt_incs)
         target_include_directories(torrentxt SYSTEM PRIVATE ${_lt_incs})
     endif()
+
+    # Export ONLY the btx_* ABI (plus the deliberately-exported btx::test::*
+    # hooks the smoke test calls - see src/torrentxt.map for why both, and for
+    # what the old "not needed" comment got wrong).
+    #
+    # NOT ON THE SYSTEM-LIBTORRENT PATH, and the reason is the whole point of
+    # the flag. `local: *` does not only hide libtorrent and Boost. This
+    # library is linked -static-libstdc++ -static-libgcc (see torrentxt_link
+    # above), and -fvisibility=hidden does NOT reach an ARCHIVE's own objects:
+    # measured on this toolchain, a trivial .so built with exactly these flags
+    # exports 781 symbols, among them 16 __cxa_* (the C++ exception ABI) and
+    # operator new/delete. The version script takes that to 1. So the script
+    # decides whether this .so carries a PRIVATE C++ runtime or shares the
+    # process's.
+    #
+    # Private is correct for the SHIPPED artifact: libtorrent, Boost and
+    # OpenSSL are static inside it and the OXT engine that dlopens it is C, so
+    # nothing else in that process has a C++ runtime to disagree with.
+    #
+    # Private is FATAL when libtorrent is a system SHARED library, because then
+    # libtorrent-rasterbar.so is a second C++ DSO bound to libstdc++.so.6:
+    # exceptions thrown inside libtorrent and caught by the firewall here would
+    # cross between two __cxa_* implementations with two sets of eh globals,
+    # two allocators and two copies of the std:: typeinfos. Observed, not
+    # theorised: on the run that added this script, torrent_smoke_test aborted
+    # in the ASan lane (the only job configured this way) while the SAME commit
+    # passed ctest on linux-x86_64 and linux-x86, which build libtorrent from
+    # source and link it statically. datachannelxt has carried the identical
+    # script for months without trouble because it has no system path at all.
+    #
+    # Approximate but on the safe side: TORRENTXT_USE_SYSTEM_LIBTORRENT could
+    # in principle find a STATIC system libtorrent (a vcpkg static triplet),
+    # where the script would have been safe. Skipping it there costs hardening
+    # on a developer build and never on a shipped one.
+    include(CheckLinkerFlag OPTIONAL RESULT_VARIABLE _btx_have_check_linker_flag)
+    set(_btx_version_script "${CMAKE_CURRENT_SOURCE_DIR}/src/torrentxt.map")
+    if(_btx_have_check_linker_flag AND UNIX AND NOT APPLE
+       AND NOT TORRENTXT_USE_SYSTEM_LIBTORRENT)
+        check_linker_flag(CXX "-Wl,--version-script=${_btx_version_script}"
+                          BTX_HAVE_VERSION_SCRIPT)
+        if(BTX_HAVE_VERSION_SCRIPT)
+            target_link_options(torrentxt PRIVATE
+                                "-Wl,--version-script=${_btx_version_script}")
+            set_target_properties(torrentxt PROPERTIES
+                                  LINK_DEPENDS "${_btx_version_script}")
+        endif()
+    elseif(UNIX AND NOT APPLE AND TORRENTXT_USE_SYSTEM_LIBTORRENT)
+        # Say so rather than leaving it silent: this build's export table is
+        # deliberately unfiltered, so a symbol-surface measurement taken here
+        # does not describe the shipped library.
+        message(STATUS "TorrentXT: NOT applying src/torrentxt.map - a system "
+                       "libtorrent is a second C++ DSO in the process and this "
+                       "library links libstdc++ statically; see the comment "
+                       "above. The shipped (static) build applies it.")
+    endif()
+    torrentxt_apple_export_list(torrentxt "${_btx_version_script}")
 
     # macOS: build a universal (arm64;x86_64) dylib so one file serves both Apple
     # silicon and Intel (plan §7 "macOS universal"). Set on the command line for

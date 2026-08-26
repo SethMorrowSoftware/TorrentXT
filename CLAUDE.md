@@ -144,6 +144,28 @@ pass" and let the user confirm.
    the only thread that ever calls into LCB is the engine's main thread, via polling.
 4. **Boost is the build risk, not the binding.** Treat its headers as system headers;
    pin versions; stand up the CI matrix in Phase 0, not at the end.
+5. **The version script decides whether this .so carries a PRIVATE C++ runtime — so it
+   must not be applied on the system-libtorrent path** (added 2026-08-26, by the CI run
+   that landed it). `src/torrentxt.map` exists to keep the statically linked
+   libtorrent/Boost/OpenSSL symbols out of the export table, and `-fvisibility=hidden`
+   cannot do that job because visibility is a compile-time property of *our* translation
+   units and an archive's objects carry their own. What is easy to miss is that
+   `-static-libstdc++ -static-libgcc` puts libstdc++ in that same category: measured on
+   the CI toolchain, a trivial .so with exactly these flags exports **781** symbols,
+   including **16 `__cxa_*`** (the C++ exception ABI) and `operator new`/`delete`; the
+   script cuts it to **1**. Those exports are what let one copy of the C++ runtime serve
+   the whole process. Hiding them is right for the shipped artifact — everything is
+   static inside it and the OXT engine that `dlopen`s it is C — and wrong when
+   `TORRENTXT_USE_SYSTEM_LIBTORRENT=ON`, because `libtorrent-rasterbar.so` is then a
+   second C++ DSO bound to `libstdc++.so.6` and the firewall would be catching
+   libtorrent's throws on a *different* `__cxa_*` implementation. The symptom is the
+   worst kind: `torrent_smoke_test` aborted with **no output whatsoever** in the ASan
+   lane while the same commit passed ctest on `linux-x86_64` and `linux-x86`, which build
+   libtorrent from source. datachannelxt has carried the identical script for months
+   without trouble for the one reason that decides this — it has no system path at all.
+   Two fixes came out of it: the CMake gate (which prints when it skips), and the smoke
+   test now announcing each section on an unbuffered stdout, because `CHECK` only prints
+   on failure and a block-buffered pipe loses everything to an abort.
 
 ## LiveCodeScript / LCB / OXT gotchas (carried; OXT is stricter than LiveCode)
 

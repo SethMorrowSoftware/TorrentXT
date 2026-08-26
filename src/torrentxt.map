@@ -1,0 +1,61 @@
+/* torrentxt.map - the linker version script for the shipped library.
+ *
+ * WHY, and why the comment this replaces was wrong. torrentxt/CMakeLists.txt
+ * used to carry an EMPTY link-options block whose comment said a version
+ * script "is not needed because the explicit BTX_API attribute already gates
+ * the surface". That is true of OUR translation units and false of the shipped
+ * artifact: -fvisibility=hidden and BTX_API reach the code this project
+ * compiles, and libtorrent, Boost and the statically linked OpenSSL are built
+ * by their own targets, out of reach of our flags. A static archive's symbols
+ * inherit the shared library's default (public) visibility, so they land in
+ * the dynamic export table regardless.
+ *
+ * MEASURED, not assumed: tools/check-binary-freshness.py records that the
+ * committed Linux builds "export 5419 statically-linked libtorrent/boost/
+ * libstdc++ symbols beyond the shim's own" - which is why that gate SKIPS
+ * torrentxt's export-closure leg entirely. The claim and the measurement had
+ * been sitting one gate apart for months.
+ *
+ * It became load-bearing on 2026-08-26. The universal mac dylib is built by
+ * lipo-ing a per-architecture build, and each architecture's OpenSSL brings
+ * its OWN dispatch symbols - ChaCha20_ctr32_sve and OPENSSL_arm_midr on
+ * arm64, OPENSSL_ia32_cpuid and OPENSSL_ia32_rdrand_bytes on x86_64. With
+ * nothing filtering the export table the two slices therefore ship DIFFERENT
+ * export sets, and check-binary-freshness refuses a fat library whose slices
+ * disagree, because no per-set verdict is honest about one. Filtering at link
+ * time makes both slices export the same thing: the ABI.
+ *
+ * btx::test::* is exported ON PURPOSE, exactly as datachannelxt exports
+ * dcx::test::*: tests/torrent_smoke_test.cpp links the REAL shared library and
+ * calls btx::test::live_session_count() to prove the session actually died.
+ * A test hook that the shipped artifact hides cannot check the shipped
+ * artifact.
+ *
+ * -fvisibility=hidden stays. This is the belt to its braces, and it is the
+ * only one of the two that reaches a dependency's symbols.
+ *
+ * WHERE IT MUST NOT BE APPLIED (added 2026-08-26, hours after the above, by
+ * the CI run that landed it). `local: *` hides more than the dependencies: this
+ * library links -static-libstdc++ -static-libgcc, and -fvisibility=hidden does
+ * not reach an archive's own objects, so WITHOUT this script the .so also
+ * exports a full copy of the C++ runtime - measured on the CI toolchain, 781
+ * symbols including 16 __cxa_* and operator new/delete, cut to 1 by this file.
+ * Whether that copy is private or shared is therefore this file's decision.
+ *
+ * Private is right for the shipped artifact (everything static inside it, and
+ * the OXT engine that loads it is C - no other C++ runtime in the process) and
+ * wrong when libtorrent comes from the system as a SHARED library, because
+ * libtorrent-rasterbar.so then brings libstdc++.so.6 and exceptions thrown
+ * inside libtorrent would be caught by a firewall running on a different
+ * __cxa_* implementation. torrent_smoke_test aborted with no output at all in
+ * exactly that lane while the same commit passed ctest on the two Linux lanes
+ * that build libtorrent from source. torrentxt/CMakeLists.txt therefore skips
+ * this script when TORRENTXT_USE_SYSTEM_LIBTORRENT is on, and says so.
+ */
+{
+    global:
+        btx_*;
+        _ZN3btx4test*;   /* btx::test::* - see above */
+    local:
+        *;
+};

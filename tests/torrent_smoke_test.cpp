@@ -752,18 +752,44 @@ static void test_port_mapping() {
     btx_session_free(s);
 }
 
+/* Announce each section BEFORE running it, on an UNBUFFERED stdout.
+ *
+ * WHY, and it cost a CI round to learn. This file can be killed by an abort it
+ * cannot catch - the note in test_buffer_needed_contract() above records one
+ * such path (a libtorrent assertion is not a C++ exception, so BTX_GUARD never
+ * sees it), and on 2026-08-26 a link-time change produced another. That run
+ * reported "Subprocess aborted" and ctest --output-on-failure printed NOTHING,
+ * which reads like a test that never started. Two things made it silent, and
+ * both are fixed here: CHECK only prints on FAILURE, so a run that dies with
+ * every check so far passing has written nothing at all; and stdout to a ctest
+ * pipe is block-buffered, so whatever HAD been written was discarded by the
+ * abort rather than flushed.
+ *
+ * A test that can be aborted must therefore say where it got to as it goes.
+ * The cost is eleven lines of output on a green run; the alternative is a
+ * failure whose only information is that it happened. */
+#define RUN(fn)                                                                \
+    do {                                                                       \
+        std::printf("-- %s\n", #fn);                                           \
+        fn();                                                                  \
+    } while (0)
+
 int main() {
-    test_session_lifecycle();
-    test_bogus_handles_are_noops();
-    test_freed_session_handle_is_dead();
-    test_malformed_torrent_buffer();
-    test_exception_firewall();
-    test_buffer_needed_contract();
-    test_alert_drain_roundtrip();
-    test_drain_oversized_makes_progress();
-    test_dht_bep44();
-    test_rp1();
-    test_port_mapping();
+    /* Unbuffered, not line-buffered: an abort discards a partial line too, and
+     * the section banner is exactly the partial line that matters. */
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    RUN(test_session_lifecycle);
+    RUN(test_bogus_handles_are_noops);
+    RUN(test_freed_session_handle_is_dead);
+    RUN(test_malformed_torrent_buffer);
+    RUN(test_exception_firewall);
+    RUN(test_buffer_needed_contract);
+    RUN(test_alert_drain_roundtrip);
+    RUN(test_drain_oversized_makes_progress);
+    RUN(test_dht_bep44);
+    RUN(test_rp1);
+    RUN(test_port_mapping);
 
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
