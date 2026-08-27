@@ -146,17 +146,28 @@ static void test_session_lifecycle() {
          * before anything reaches libtorrent. */
         CHECK(btx_dht_load_state(s3, big, 0) == BTX_ERR_INVALID_ARG);
         CHECK(btx_dht_load_state(s3, nullptr, 4) == BTX_ERR_INVALID_ARG);
-        /* DO NOT add a malformed-blob probe here. Feeding garbage to
-         * btx_dht_load_state ABORTS THE PROCESS on libtorrent 2.0.10 (the apt
-         * build): lt::read_session_params trips an assertion inside libtorrent,
-         * which is not a C++ exception, so the BTX_GUARD firewall cannot catch
-         * it. The pinned 2.0.11 source build tolerates the same input, which is
-         * why this only shows up in the lane that links the system library.
-         * That asymmetry is a REAL hazard for an app that persists DHT state
-         * and feeds back a truncated file, and hardening the shim (bdecode and
-         * validate before handing the blob over, so we fail closed per family
-         * rule 4) is the fix - a shim change, which per suite rule 5 must ship
-         * with all four committed binaries refreshed. Tracked, not done here. */
+        /* The malformed-blob probes. A note stood here saying DO NOT add
+         * these, because feeding garbage to btx_dht_load_state ABORTED THE
+         * PROCESS on libtorrent 2.0.10 (the apt build): read_session_params
+         * trips a TORRENT_ASSERT, which is not a C++ exception, so the
+         * BTX_GUARD firewall could not catch it - while the pinned 2.0.11
+         * source build tolerated the same input, hiding the hazard from every
+         * lane but ASan's. The shim now bdecodes and validates BEFORE any
+         * byte reaches libtorrent (rule 4, fail closed), so these probes are
+         * exactly the proof that fence holds - and the ASan lane links the
+         * very library that used to abort, so a regression here is a dead
+         * process in CI, not a silent one in an app. Three shapes: garbage
+         * bytes, a truncated copy of REAL saved state (the persisted-file
+         * corruption an app actually meets), and a well-formed bencoded
+         * non-dict. */
+        CHECK(btx_dht_load_state(s3, "not bencoded at all", 19)
+              == BTX_ERR_INVALID_ARG);
+        if (n > 8) {
+            CHECK(btx_dht_load_state(s3, big, n / 2) == BTX_ERR_INVALID_ARG);
+        }
+        CHECK(btx_dht_load_state(s3, "4:list", 6) == BTX_ERR_INVALID_ARG);
+        /* And the session is still alive and usable after every refusal. */
+        CHECK(btx_dht_load_state(s3, big, n) == BTX_OK);
     }
 
     btx_session_free(s3);

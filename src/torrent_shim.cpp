@@ -2557,11 +2557,34 @@ extern "C" BTX_API int BTX_CALL btx_dht_load_state(int s, const void *data,
         if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
         if (!data || len <= 0) { set_error("empty DHT state"); return BTX_ERR_INVALID_ARG; }
 
+        /* Rule 4, fail CLOSED: bdecode and validate the blob BEFORE any byte
+         * reaches read_session_params. The comment that stood here said a
+         * malformed blob "yields default (empty) params rather than crashing";
+         * tests/torrent_smoke_test.cpp measured the opposite on the apt
+         * libtorrent 2.0.10 build - lt::read_session_params of garbage trips a
+         * TORRENT_ASSERT, which is an abort(), not a C++ exception, so the
+         * BTX_GUARD firewall above never sees it and the ENGINE dies. The
+         * pinned 2.0.11 source build tolerates the same input, which is why
+         * the committed binaries never showed it. An app that persists DHT
+         * state (the whole point of this pair) and feeds back a truncated
+         * file must get an error code, not a dead process. lt::bdecode's
+         * error_code overload is public, exported, and does not assert; the
+         * saved state is always a bencoded dict, so anything else is refused
+         * here with the same error the empty-input path uses. */
+        lt::error_code ec;
+        lt::bdecode_node root = lt::bdecode(
+            {reinterpret_cast<char const *>(data), len}, ec);
+        if (ec || root.type() != lt::bdecode_node::dict_t) {
+            set_error("malformed DHT state (not the bencoded dict "
+                      "btx_dht_save_state produces)");
+            return BTX_ERR_INVALID_ARG;
+        }
+
         /* Re-hydrate the saved session_params (DHT subset) and hand the node
          * table back to the running DHT. read_session_params is the public,
-         * exported inverse of write_session_params_buf; a malformed blob yields
-         * default (empty) params rather than crashing, and any throw is caught by
-         * the firewall above. */
+         * exported inverse of write_session_params_buf; any throw out of it is
+         * caught by the firewall above, and the assert-not-throw hazard is
+         * fenced by the validation just performed. */
         lt::session_params params = lt::read_session_params(
             {reinterpret_cast<char const *>(data), len},
             lt::session_handle::save_dht_state);
