@@ -2226,6 +2226,8 @@ local sPolling          -- "true" while the loops are armed
 local sChannels         -- array: index -> {seed, name, releases, pass} - YOUR channels
 local sActive           -- index of the active channel (drives the sMy* cache below)
 local sCanEncrypt       -- "true" if SodiumXT (libsodium) is installed + working
+local sEncryptWhy       -- why the probe said no (empty while healthy); an ABI
+                        --   skew names itself here, and chEncryptAdvice reads it
 local sKeyCache         -- array: pubkeyHex&":"&pass -> 32-byte master key (Argon2id is slow)
 local sFollowPass       -- array: followed pubkey -> its passphrase ("" = public)
 local sPub              -- active channel public key (hex) - shareable
@@ -3168,12 +3170,41 @@ end chHelp
 
 -- ---- session, identity, subscriptions, loops ---------------------------------
 command chStart
+   -- THE CAPABILITY PROBES RUN FIRST, BEFORE THE TORRENT SESSION, and the
+   -- ordering is a PORT (2026-08-27) of nocloud's 2026-08-24 fix - its
+   -- qsStart carries the full story. They used to sit below the session
+   -- block, whose failure path exits this handler - so another open
+   -- torrent stack holding the one session meant chCanEncrypt() never
+   -- ran, sCanEncrypt stayed EMPTY (falsy), and the Tor pill and every
+   -- SodiumXT-shaped caption said "needs SodiumXT" on a machine with
+   -- SodiumXT installed and working. libsodium and OnionXT have nothing
+   -- to do with libtorrent; nothing about them may depend on a session
+   -- starting. Order among the probes still matters: chHasOnion() reads
+   -- sCanEncrypt, so the crypto probe leads, and the offline seed<->pubkey
+   -- byte-compare (section 6.1) rides with it - btDhtKeypair is pure
+   -- seed->keys, sessionless - so a mismatch disables anon BEFORE any
+   -- channel is read and a channel's derived .onion can never be wrong.
+   put chCanEncrypt() into sCanEncrypt
+   put chHasOnion() into sHasOnion
+   if sHasOnion then
+      put chVerifyOnionIdentity() into sOnionIdentityOk
+      if not sOnionIdentityOk then
+         chLog "Anonymous channels are DISABLED: the libtorrent/libsodium ed25519 identities did not byte-match offline (or this SodiumXT is older than ABI 7). Public channels are unaffected."
+      end if
+   else
+      put false into sOnionIdentityOk
+   end if
    btStartSession
    put the result into sSession
    if sSession is 0 or sSession is empty then
       chLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      chLog "Publishing, following and transfers are OFF until that is resolved. This is a TorrentXT problem and says nothing about your other extensions:" && chCapabilityLine()
       uiStatus "No session (another TorrentXT stack open?) - see the log.", "bad"
       put 0 into sSession
+      -- paint the Tor pill from the probes we DID take, so the window
+      -- describes what is actually installed rather than defaulting to
+      -- "missing" (the exact lie the ordering above exists to prevent)
+      chOnionPill
       exit chStart
    end if
    btSetBool sSession, "enable_dht", true
@@ -3185,20 +3216,6 @@ command chStart
    btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
-   -- can this build encrypt? gates the optional private-channel feature
-   put chCanEncrypt() into sCanEncrypt
-   -- probe OnionXT (needs SodiumXT) and run the OFFLINE seed<->pubkey byte-compare
-   -- (section 6.1) BEFORE reading channels: a mismatch disables anon entirely, so
-   -- a channel's derived .onion can never be wrong. Both are one-shot at start.
-   put chHasOnion() into sHasOnion
-   if sHasOnion then
-      put chVerifyOnionIdentity() into sOnionIdentityOk
-      if not sOnionIdentityOk then
-         chLog "Anonymous channels are DISABLED: the libtorrent/libsodium ed25519 identities did not byte-match offline (or this SodiumXT is older than ABI 7). Public channels are unaffected."
-      end if
-   else
-      put false into sOnionIdentityOk
-   end if
    put empty into sFollowAnon
    put empty into sFollowSvc
    chEnsureIdentity
@@ -3207,7 +3224,9 @@ command chStart
    chUpdateNowPub
    chUpdateLockButton      -- reflect whether the saved identity is passphrase-locked
    if not sCanEncrypt then
-      chLog "Note: SodiumXT (org.openxtalk.library.sodium) is not installed, so private channels are unavailable. Install it to use passphrases."
+      -- chEncryptAdvice, never a hardcoded "is not installed": the probe
+      -- distinguishes absent from ABI-skewed, and the advice differs
+      chLog "Note: private channels are unavailable -" && chEncryptAdvice() && "Public channels all work."
    end if
    -- bring up the Tor control link (non-blocking). The anon path is completely
    -- inert when OnionXT/SodiumXT/Tor are absent; nothing else changes.
@@ -3434,7 +3453,7 @@ end chRenameChannel
 command chSetPrivacy
    local tPass, tName, tR
    if not sCanEncrypt then
-      answer "Private channels need SodiumXT (the org.openxtalk.library.sodium extension), which is not installed on this machine. Install it to use passphrases."
+      answer "Private channels need SodiumXT." && chEncryptAdvice()
       exit chSetPrivacy
    end if
    ask "Passphrase for this channel (leave blank to make it PUBLIC)." & return & \
@@ -3635,7 +3654,7 @@ command chPrefLoad
       put byte 10 to -1 of tRaw into tBody
    else if tHeader is (kPrefMagic & "E") then
       if not sCanEncrypt then
-         answer "Your saved channels are passphrase-locked, but SodiumXT (org.openxtalk.library.sodium) is not installed, so they cannot be unlocked here."
+         answer "Your saved channels are passphrase-locked, but SodiumXT is not working here, so they cannot be unlocked." && chEncryptAdvice()
          put "true" into sPrefLockedOut
          exit chPrefLoad
       end if
@@ -3716,7 +3735,7 @@ end chPrefSave
 command chProtectIdentity
    local tP1, tP2
    if not sCanEncrypt then
-      answer "Locking your identity needs SodiumXT (org.openxtalk.library.sodium), which is not installed."
+      answer "Locking your identity needs SodiumXT." && chEncryptAdvice()
       exit chProtectIdentity
    end if
    if sVaultPass is empty then
@@ -3883,7 +3902,7 @@ command chPublishFile
    if sChannels[sActive]["pass"] is not empty then
       -- ---- PRIVATE: encrypt one file (chunked) before sharing it ----
       if not sCanEncrypt then
-         chLog "This channel is private but SodiumXT is not installed - publish is unavailable. Install org.openxtalk.library.sodium."
+         chLog "This channel is private but its crypto is unavailable, so publish is off -" && chEncryptAdvice()
          exit chPublishFile
       end if
       answer file "Choose a FILE to share privately (it is encrypted before it leaves your machine):"
@@ -4874,18 +4893,71 @@ end chFileKey
 -- one-time capability probe: is SodiumXT (libsodium) installed and working? We do
 -- a real secretbox round-trip with a random key (fast - no Argon2id), wrapped in a
 -- try so a missing org.openxtalk.library.sodium is a clean "no", not an error.
--- Result is cached in sCanEncrypt at startup.
+-- Result is cached in sCanEncrypt at startup; WHY a "no" happened is kept in
+-- sEncryptWhy for the advice sites (ported 2026-08-27 from nocloud).
 function chCanEncrypt
    local tKey, tBox, tOut, tErr
+   put empty into sEncryptWhy
    try
       put sxRandomBytes(32) into tKey
       put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
       put sxSecretBoxOpen(tBox, tKey) into tOut
    catch tErr
+      -- WHY IT FAILED IS NOT ALWAYS "NOT INSTALLED", and telling a user
+      -- who HAS installed it to install it is the worst answer available.
+      -- The .lcb compares _sxt_abi_version() against kSXTABIVersion on
+      -- EVERY sx* call and throws "SodiumXT ABI mismatch ... Reinstall
+      -- the packaged extension." from the FIRST one, so a MIXED package
+      -- (a .lcb at one ABI beside a binary at another -
+      -- sodiumxt/CLAUDE.md's documented footgun, and the likeliest state
+      -- after an ABI bump) would otherwise land in this catch reading as
+      -- a plain missing extension. Keep the first line: the advice sites
+      -- decide what to say, and "reinstall" is a different instruction
+      -- from "install".
+      put line 1 of tErr into sEncryptWhy
       return false
    end try
-   return (textDecode(tOut, "ASCII") is "probe")
+   if textDecode(tOut, "ASCII") is not "probe" then
+      put "the secretbox round trip did not return its plaintext" into sEncryptWhy
+      return false
+   end if
+   return true
 end chCanEncrypt
+
+-- Did the probe fail because the extension is MISSING, or because it is
+-- installed and mismatched? A skew names itself in the throw; anything
+-- else (including a plain `handler not found`) reads as absent.
+function chEncryptSkewed
+   return (sEncryptWhy contains "ABI" or sEncryptWhy contains "Reinstall")
+end chEncryptSkewed
+
+-- The one sentence every "cannot encrypt" site should use, so the advice
+-- can never contradict itself across the log, the dialogs and the pill.
+function chEncryptAdvice
+   if chEncryptSkewed() then
+      return "SodiumXT is installed but its ABI does not match this package - REINSTALL the packaged extension (" & sEncryptWhy & ")."
+   end if
+   return "SodiumXT (org.openxtalk.library.sodium) is not installed."
+end chEncryptAdvice
+
+-- What the startup probes actually found, in one line. Used wherever
+-- something ELSE has failed (the torrent session, say) and the log would
+-- otherwise leave a reader to infer the extension state from a caption -
+-- the inference that made a TorrentXT session failure read as a missing
+-- SodiumXT (nocloud's 2026-08-24 report, twice from a real install; this
+-- demo shared the bug until the same fix was ported on 2026-08-27).
+function chCapabilityLine
+   local tOut
+   if sCanEncrypt then
+      put "SodiumXT OK" into tOut
+   else
+      put "SodiumXT NO (" & chEncryptAdvice() & ")" into tOut
+   end if
+   if sHasOnion then
+      return tOut & "; OnionXT OK (the Tor daemon is probed separately - watch the pill)"
+   end if
+   return tOut & "; OnionXT unavailable (its crypto needs SodiumXT first)"
+end chCapabilityLine
 
 -- The bytes to publish for a feed: plaintext UTF-8 when public; marker+secretbox
 -- when the channel has a passphrase (the secretbox output is nonce || ciphertext

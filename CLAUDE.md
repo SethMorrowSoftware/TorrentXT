@@ -269,6 +269,24 @@ Consequences for anyone editing these demos:
   `try`) into `sCanEncrypt`; when absent, the private/passphrase features fail closed with a
   clear "install org.openxtalk.library.sodium" message and **every other feature still
   works**. Never call an `sx*` handler outside an `sCanEncrypt` guard or a `try`.
+- **The probes run BEFORE `btStartSession`, and the ordering is load-bearing
+  (ported 2026-08-27).** nocloud - the quickshare demo's spun-out descendant -
+  reported twice from a real install that a TorrentXT session failure read as a
+  missing SodiumXT: its probes sat below the session block, whose failure path
+  exits the start handler, so `sCanEncrypt` was never assigned, empty is falsy,
+  and every SodiumXT-shaped caption (the Tor pill's "needs SodiumXT" included)
+  lied in the same direction - while the actual problem was another open stack
+  holding the one torrent session. nocloud fixed the ordering on 2026-08-24;
+  BOTH in-repo siblings (`torrent-dht-channels`, `torrent-quickshare`) carried
+  the identical bug until the fix was ported on 2026-08-27 - the lineage
+  paragraph below warns that a defect in one is overwhelmingly likely in the
+  other, and it was, in the third relative too. The port also carries nocloud's
+  `sEncryptWhy` / `*EncryptAdvice` mechanism (an ABI skew names itself in the
+  throw, and "reinstall" is different advice from "install" - every hardcoded
+  "is not installed" claim now routes through the advice function) and a
+  capability line on the session-failure path, so a torrent failure names the
+  extensions' true state instead of leaving captions to imply it. Verified
+  statically; needs an OXT pass.
 - This was a deliberate "drop the weak AES path" decision. Data encrypted by the **old**
   AES format does **not** open in these versions (the feed marker moved `BTXENC1:` ->
   `BTXENC2:`); that breakage was accepted.

@@ -53,6 +53,8 @@ local sSession          -- the live session handle (0/empty = none)
 local sPolling          -- "true" while the poll/repaint loops are armed
 local sShareCode        -- the most recent file's share code (plain hash or BTXQS1:)
 local sCanEncrypt       -- "true" if SodiumXT (libsodium) is installed + working
+local sEncryptWhy       -- why the probe said no (empty while healthy); an ABI
+                        --   skew names itself here, and qsEncryptAdvice reads it
 local sPendingKey       -- array: info-hash -> 32-byte file key, for a download to decrypt
 local sPendingName      -- array: info-hash -> original filename, for that download
 local sXferName         -- array: info-hash -> real name to SHOW locally (swarm sees .enc)
@@ -820,12 +822,29 @@ end qsAddTips
 
 -- ---- session + loops ---------------------------------------------------------
 command qsStart
+   -- THE CAPABILITY PROBES RUN FIRST, BEFORE THE TORRENT SESSION, and the
+   -- ordering is a PORT (2026-08-27) of nocloud's 2026-08-24 fix - its
+   -- qsStart carries the full story. They used to sit below the session
+   -- block, whose failure path exits this handler - so another open
+   -- torrent stack holding the one session meant qsCanEncrypt() never
+   -- ran, sCanEncrypt stayed EMPTY (falsy), and the Tor pill and the
+   -- passphrase captions said "needs SodiumXT" on a machine with SodiumXT
+   -- installed and working. libsodium and OnionXT have nothing to do with
+   -- libtorrent; nothing about them may depend on a session starting.
+   -- qsHasOnion() reads sCanEncrypt, so the crypto probe leads.
+   put qsCanEncrypt() into sCanEncrypt
+   put qsHasOnion() into sHasOnion
    btStartSession
    put the result into sSession
    if sSession is 0 or sSession is empty then
       qsLog "Could not start a session (is another TorrentXT stack open?):" && btLastError()
+      qsLog "Sharing and downloading are OFF until that is resolved. This is a TorrentXT problem and says nothing about your other extensions:" && qsCapabilityLine()
       uiStatus "No session (another TorrentXT stack open?) - see the log.", "bad"
       put 0 into sSession
+      -- paint the Tor pill from the probes we DID take, so the window
+      -- describes what is actually installed rather than defaulting to
+      -- "missing" (the exact lie the ordering above exists to prevent)
+      qsOnionPill
       exit qsStart
    end if
    btSetBool sSession, "enable_dht", true
@@ -839,11 +858,6 @@ command qsStart
    btDhtAddBootstrap sSession, "router.utorrent.com", 6881
    btDhtAddBootstrap sSession, "dht.transmissionbt.com", 6881
    put "true" into sPolling
-   -- probe SodiumXT once so the passphrase fields can fail closed when it is absent
-   put qsCanEncrypt() into sCanEncrypt
-   -- probe OnionXT and bring up the Tor control link (non-blocking). The anon path
-   -- is completely inert when OnionXT/SodiumXT/Tor are absent; nothing else changes.
-   put qsHasOnion() into sHasOnion
    put "false" into sTorSend
    put "false" into sWebServe
    put "false" into sWebShare
@@ -873,7 +887,7 @@ command qsStart
    if sCanEncrypt then
       qsLog "Ready. Drag a file to share it, or paste a code to download. Tip: type a passphrase first to ENCRYPT a file end-to-end."
    else
-      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption needs SodiumXT / org.openxtalk.library.sodium, which is not installed.)"
+      qsLog "Ready. Drag a file to share it, or paste a code to download. (Encryption is unavailable -" && qsEncryptAdvice() & ")"
    end if
    uiStatus "Ready - drag a file to share, or paste a code to download.", "ok"
    send "qsPollOnce" to me in 0 milliseconds
@@ -1024,7 +1038,7 @@ command qsShareFile pPath
       exit qsShareFile
    end if
    if tPass is not empty and not sCanEncrypt then
-      qsLog "SodiumXT (org.openxtalk.library.sodium) is not installed - sharing WITHOUT a passphrase. Install it to encrypt."
+      qsLog "Cannot encrypt, so sharing WITHOUT a passphrase -" && qsEncryptAdvice()
       put empty into tPass
    end if
    if tPass is empty then
@@ -1135,7 +1149,7 @@ command qsGetFile
    if tCode begins with kCodePrefix then
       -- locked share code: BTXQS1:<hash>:<base64 name>:<base64 salt>:<base64 verifier>
       if not sCanEncrypt then
-         qsLog "This code is locked, but SodiumXT (org.openxtalk.library.sodium) is not installed - cannot decrypt."
+         qsLog "This code is locked, but this machine cannot decrypt it -" && qsEncryptAdvice()
          exit qsGetFile
       end if
       if tPass is empty then
@@ -1441,11 +1455,22 @@ end qsTrim
 -- closed rather than erroring.
 function qsCanEncrypt
    local tKey, tBox, tOut, tErr
+   put empty into sEncryptWhy
    try
       put sxRandomBytes(32) into tKey
       put sxSecretBox(textEncode("probe", "ASCII"), tKey) into tBox
       put sxSecretBoxOpen(tBox, tKey) into tOut
    catch tErr
+      -- WHY IT FAILED IS NOT ALWAYS "NOT INSTALLED" (ported 2026-08-27
+      -- from nocloud, with the probes-before-session ordering): the .lcb
+      -- compares _sxt_abi_version() against kSXTABIVersion on EVERY sx*
+      -- call and throws "SodiumXT ABI mismatch ... Reinstall the packaged
+      -- extension." from the FIRST one, so a MIXED package (a .lcb at one
+      -- ABI beside a binary at another - sodiumxt/CLAUDE.md's documented
+      -- footgun) would otherwise read as a plain missing extension. Keep
+      -- the first line: qsEncryptAdvice decides what to say, and
+      -- "reinstall" is a different instruction from "install".
+      put line 1 of tErr into sEncryptWhy
       return "false"
    end try
    -- ANSWER IN THE SPELLING THE DECLARATION PROMISES ("true"/"false"), not a
@@ -1459,8 +1484,47 @@ function qsCanEncrypt
    if textDecode(tOut, "ASCII") is "probe" then
       return "true"
    end if
+   put "the secretbox round trip did not return its plaintext" into sEncryptWhy
    return "false"
 end qsCanEncrypt
+
+-- Did the probe fail because the extension is MISSING, or because it is
+-- installed and mismatched? A skew names itself in the throw; anything
+-- else (including a plain `handler not found`) reads as absent.
+function qsEncryptSkewed
+   return (sEncryptWhy contains "ABI" or sEncryptWhy contains "Reinstall")
+end qsEncryptSkewed
+
+-- The one sentence every "cannot encrypt" site should use, so the advice
+-- can never contradict itself across the log, the captions and the pill.
+function qsEncryptAdvice
+   if qsEncryptSkewed() then
+      return "SodiumXT is installed but its ABI does not match this package - REINSTALL the packaged extension (" & sEncryptWhy & ")."
+   end if
+   return "SodiumXT (org.openxtalk.library.sodium) is not installed."
+end qsEncryptAdvice
+
+-- What the startup probes actually found, in one line. Used wherever
+-- something ELSE has failed (the torrent session, say) and the log would
+-- otherwise leave a reader to infer the extension state from a caption -
+-- the inference that made a TorrentXT session failure read as a missing
+-- SodiumXT (nocloud's 2026-08-24 report, twice from a real install; this
+-- demo shared the bug until the same fix was ported on 2026-08-27).
+function qsCapabilityLine
+   local tOut
+   if sCanEncrypt then
+      put "SodiumXT OK" into tOut
+   else
+      put "SodiumXT NO (" & qsEncryptAdvice() & ")" into tOut
+   end if
+   if sHasOnion then
+      return tOut & "; OnionXT OK (the Tor daemon is probed separately - watch the pill)"
+   end if
+   -- this demo is the recorded NON-embed (tools/sync-demo-embeds.py
+   -- NOT_EMBEDDED): OnionXT arrives by `start using`, so "not in the
+   -- message path" can mean not-in-use just as well as needs-SodiumXT
+   return tOut & "; OnionXT not in the message path (put the onionxt stack in use for Tor; it also needs SodiumXT)"
+end qsCapabilityLine
 
 -- A small helper: base64 with the line breaks stripped so a code stays one line.
 function qsB64 pData
@@ -1952,7 +2016,7 @@ command qsStartOnionShare pPath, pName, pPass
       put tEncPath into tStreamFile
       put kFlagEnc into tEncFlag
    else if pPass is not empty then
-      qsLog "SodiumXT is not installed - sending over Tor WITHOUT encryption (your IP is still hidden, but the sender is not verified)."
+      qsLog "Sending over Tor WITHOUT encryption (your IP is still hidden, but the sender is not verified) -" && qsEncryptAdvice()
    end if
    -- one active anon share at a time: tear down any previous service + temp
    if sActiveShare["service"] is not empty then
@@ -4332,7 +4396,7 @@ end qsCwIpReply
 command qsReceiveOnion pCode
    local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream, tErr
    if not sHasOnion then
-      qsLog "This is a private Tor share, but OnionXT (or SodiumXT) is not installed - ask your friend to share it normally, or install OnionXT + SodiumXT + Tor."
+      qsLog "This is a private Tor share, but the Tor path is unavailable here:" && qsCapabilityLine() && "Ask your friend to share it normally, or fix the piece named there and run a local Tor daemon."
       exit qsReceiveOnion
    end if
    put char ((the number of chars of kTorCodePrefix) + 1) to -1 of pCode into tRest
@@ -4353,7 +4417,7 @@ command qsReceiveOnion pCode
    put "" into tKey
    if tB64Verify is not empty then
       if not sCanEncrypt then
-         qsLog "This code is locked, but SodiumXT is not installed - cannot decrypt."
+         qsLog "This code is locked, but this machine cannot decrypt it -" && qsEncryptAdvice()
          exit qsReceiveOnion
       end if
       if tPass is empty then
