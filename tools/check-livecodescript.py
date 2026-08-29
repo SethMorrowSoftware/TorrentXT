@@ -148,6 +148,24 @@ The checks, and the engine lesson each encodes:
       is the reliable static tell, and it is what this flags - so the LEGAL
       `"\"` (a one-backslash string, common in path normalisation) never
       false-fires. Shipped once in holde-em's heProbeKit.
+  22. A `constant` whose VALUE is not a literal - .livecodescript only.
+      An xTalk constant takes a literal, not an expression, so
+      `constant kX = "a" & return & "b"` does not compile. Because a
+      .livecodescript is ONE compilation unit, that single line takes the
+      WHOLE stack script down: no handler runs, openStack never fires, and
+      the symptom is a stack that opens to a blank window with no UI and no
+      error anyone can point at. This gate already knew constants have to be
+      DECLARED before use (check 4) and spelled with `=` rather than `is`
+      (an antipattern), and checked nothing at all about the value.
+      Shipped once, in riptide-social's phase-8 relay defaults, and found
+      by the maintainer opening the stack rather than by anything here.
+      The same rule is why rsKdfContext() is a function: a constant cannot
+      hold a NUL byte either.
+      The comma split is STRING-AWARE, because the multi-declaration form
+      (`constant kA = 1, kB = 2`) is legal and box2dxt's builder uses it
+      thirty times WITH commas inside quoted values
+      (`constant kColBtnIdle = "44,48,58", kColBtnText = "255,255,255"`) -
+      splitting naively would report those as malformed.
 
 One hold-em lineage check is deliberately NOT here, and the reason is
 recorded so it is not "rediscovered": the chunk-of-an-array-element refusal
@@ -566,6 +584,69 @@ def check_constants_before_use(path, cleaned, is_script):
                                 "position; this evaluates as empty)"
                                 % (name, dline)))
                 break
+    return problems
+
+
+_CONST_LITERAL_RX = re.compile(
+    r'^(?:"[^"]*"|[-+]?\d+(?:\.\d+)?|true|false|empty)$', re.I)
+
+
+def _split_outside_quotes(text, sep=","):
+    """Split on `sep` only where it is OUTSIDE a double-quoted run.
+
+    The multi-declaration form is legal and box2dxt's contraption builder
+    uses it with commas INSIDE quoted colour triples, so a naive split
+    reports thirty false positives in an engine-passed file. xTalk has no
+    string escapes, so quote-toggling is the whole rule (check 21 is the
+    same fact from the other side)."""
+    parts, buf, instr = [], "", False
+    for ch in text:
+        if ch == '"':
+            instr = not instr
+            buf += ch
+        elif ch == sep and not instr:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    return parts
+
+
+def check_constant_values_are_literal(path, cleaned, is_script):
+    """A constant's value must be a LITERAL - .livecodescript only.
+
+    See check 22. The failure mode is what makes this worth a gate: an
+    expression here is a compile error, a .livecodescript compiles as one
+    unit, so the whole stack goes dark with no UI and nothing to point at."""
+    problems = []
+    if not is_script:
+        return problems
+    rx = re.compile(r"^\s*constant\s+(.+)$")
+    for lineno, line in cleaned:
+        m = rx.match(line)
+        if not m:
+            continue
+        for part in _split_outside_quotes(m.group(1)):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                # `constant NAME is ...` is caught by its own antipattern,
+                # and a bare name is not this check's business either.
+                continue
+            name, _, value = part.partition("=")
+            value = value.strip()
+            if not _CONST_LITERAL_RX.match(value):
+                problems.append(Problem(path, lineno,
+                                "constant `%s` has a non-literal value `%s` - "
+                                "an xTalk constant takes a LITERAL, not an "
+                                "expression, so this does not compile; and a "
+                                ".livecodescript is ONE unit, so it takes the "
+                                "whole stack script down (no UI, no error to "
+                                "point at). Use a function, as rsKdfContext() "
+                                "does for a value a constant cannot hold"
+                                % (name.strip(), value)))
     return problems
 
 
@@ -1271,6 +1352,7 @@ def check_file(path):
         problems += check_lcb_imports(path, cleaned)
     # rules that hold in both dialects
     problems += check_constants_before_use(path, cleaned, is_script)
+    problems += check_constant_values_are_literal(path, cleaned, is_script)
     problems += check_declarations_at_top(path, cleaned, is_script)
     problems += check_shadow_trap(path, cleaned)
     problems += check_does_not_operator(path, cleaned)
