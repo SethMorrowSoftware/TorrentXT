@@ -6859,7 +6859,7 @@ end scShow
 -- the "Chunk: error in object expression" class, and finding it at boot beats
 -- finding it when somebody clicks.
 function scMissing pList
-   local tName, tMissing
+   local tName, tMissing, tC, tFound
    set the defaultStack to the short name of this stack
    repeat for each item tName in pList
       -- ALL THREE CONTROL TYPES. The kit builds fields (uiLabel/uiWrap/uiCap/
@@ -6868,8 +6868,22 @@ function scMissing pList
       -- about fields and buttons, so every uiPill a demo builds - the Tor
       -- pills in both Quick Shares, for one - reported as a missing control on
       -- a stack where it exists.
-      if there is no field tName and there is no button tName \
-            and there is no graphic tName then
+      --
+      -- AND EVERY CARD (2026-08-29). Unqualified `there is a field X` answers
+      -- for the CURRENT card only (engine notes 5.6) - OBSERVED when
+      -- riptide's five-card boot reported all 63 off-card controls missing
+      -- from a stack where every one existed. A single-card demo walks its
+      -- one card here, exactly the old behaviour.
+      put false into tFound
+      repeat with tC = 1 to the number of cards of this stack
+         if there is a field tName of card tC \
+               or there is a button tName of card tC \
+               or there is a graphic tName of card tC then
+            put true into tFound
+            exit repeat
+         end if
+      end repeat
+      if not tFound then
          put tName & comma after tMissing
       end if
    end repeat
