@@ -2341,12 +2341,21 @@ function scMissing pList
    local tName, tMissing, tC, tFound
    set the defaultStack to the short name of this stack
    repeat for each item tName in pList
-      -- ALL THREE CONTROL TYPES. The kit builds fields (uiLabel/uiWrap/uiCap/
+      -- ALL FOUR CONTROL TYPES. The kit builds fields (uiLabel/uiWrap/uiCap/
       -- uiSection/uiInput/uiArea/uiTable), buttons (uiButton/uiCheckbox) AND
       -- GRAPHICS (uiGfx/uiPanel/uiPill). The first version of this asked only
       -- about fields and buttons, so every uiPill a demo builds - the Tor
       -- pills in both Quick Shares, for one - reported as a missing control on
       -- a stack where it exists.
+      --
+      -- AND IMAGES (2026-08-31), for the same reason one step further out. A
+      -- demo may build a control the KIT does not: coinxt's wallet paints a
+      -- QR into an image, which is the only way a BMP this family builds
+      -- becomes something a phone can read. Registered and built, it reported
+      -- as missing - found by coinxt/tools/check-wallet-boot.py, which boots
+      -- the stack headlessly, so this one cost no engine time. The lesson is
+      -- the one this block already carries twice: the list of types a demo
+      -- can build is not the list of types the KIT builds.
       --
       -- AND EVERY CARD (2026-08-29). Unqualified `there is a field X` answers
       -- for the CURRENT card only (engine notes 5.6) - OBSERVED when
@@ -2357,7 +2366,8 @@ function scMissing pList
       repeat with tC = 1 to the number of cards of this stack
          if there is a field tName of card tC \
                or there is a button tName of card tC \
-               or there is a graphic tName of card tC then
+               or there is a graphic tName of card tC \
+               or there is an image tName of card tC then
             put true into tFound
             exit repeat
          end if
