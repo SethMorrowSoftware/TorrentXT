@@ -473,6 +473,77 @@ command uiFooter pText, pRect
    set the textStyle of field "uiFooter" to "italic"
    set the foregroundColor of field "uiFooter" to kUiMuted
 end uiFooter
+-- ---- contextual menus -------------------------------------------------------
+--
+-- A RIGHT-CLICK MENU, as one hidden popup button per menu.
+--
+-- The engine's contextual menu is a BUTTON whose style is "menu" and whose
+-- menuMode is "popup": its text is the item list, one per line, `popup`
+-- shows it at a point, and choosing an item sends `menuPick` with the item's
+-- LABEL. The button needs no script - with no handler of its own the message
+-- walks the hierarchy and arrives at the card and then the stack, which is
+-- where an adopter's router already lives.
+--
+-- OPT-IN, AND THAT IS DELIBERATE. This block is carried byte-identical by
+-- every demo in the suite, so a kit that BUILT a menu would change eighteen
+-- stacks to serve one. Nothing here runs unless an adopter calls
+-- uiContextMenu, and a demo that never does is unchanged in behaviour.
+--
+-- NONE OF THIS HAS RUN ON AN ENGINE. `popup`, `menuMode` and `menuPick` are
+-- documented LiveCode and OpenXTalk is a fork of it, but this suite has never
+-- exercised a menu and the headless runners model no mouse button at all - so
+-- an adopter's right-click handler belongs in a `try`, and losing the menu
+-- must never cost the ordinary click. uiPopupMenu answers whether it worked
+-- rather than throwing, so the caller can decide.
+
+command uiContextMenu pName, pItems
+   -- One hidden popup button, created once and refilled on every call so a
+   -- menu can change with the screen it belongs to. The rect is small and
+   -- inside the window because a stack's controls are measured by
+   -- tools/check-stack-size.py whether they are visible or not.
+   if there is no button pName then
+      -- THE KIT'S OWN IDIOM, and not `create button pName`. Every other
+      -- builder in this block creates the control unnamed and then names the
+      -- last one, which is the spelling the family's headless runners model
+      -- and the one every adopter has already been through an engine with.
+      create button
+      set the name of the last button to pName
+   end if
+   set the style of button pName to "menu"
+   set the menuMode of button pName to "popup"
+   set the text of button pName to pItems
+   set the rect of button pName to "2,2,18,18"
+   set the visible of button pName to false
+end uiContextMenu
+
+function uiPopupMenu pName
+   -- WHICH menu, recorded before it opens. menuPick carries the item's label
+   -- and nothing else, so an adopter with two menus would otherwise have to
+   -- keep every label in the stack globally unique - a constraint that is
+   -- invisible until the day two screens both want "Copy".
+   --
+   -- Answers true or false rather than throwing: on an engine without popup
+   -- menus the right thing is for the click to do nothing, not for the
+   -- adopter's mouseDown to die.
+   local tError
+   if there is no button pName then
+      return false
+   end if
+   set the uUiMenu of this stack to pName
+   try
+      popup button pName at the clickLoc
+   catch tError
+      set the uUiMenu of this stack to empty
+      return false
+   end try
+   return true
+end uiPopupMenu
+
+function uiMenuSource
+   -- The name of the menu the last menuPick came from.
+   return the uUiMenu of this stack
+end uiMenuSource
+
 -- ==== SUITE UI KIT v2 END ====
 
 -- ---- lifecycle ---------------------------------------------------------------
