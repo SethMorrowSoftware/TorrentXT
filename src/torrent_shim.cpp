@@ -176,6 +176,38 @@ struct PendingAlert {
  * (silent truncation would corrupt a stream). */
 static const int kRp1MaxPayload = 60000;
 
+/* THE BOUNDED INBOUND QUEUE (added 2026-09-08; this is a DoS fix).
+ *
+ * `events` is filled from libtorrent's NETWORK threads and emptied only when
+ * the app calls btx_rp1_poll, which drains at most kDrainCap (65536) bytes per
+ * call. At the cadence the demos actually poll (250 ms) that is roughly
+ * 262 KB/s of drain against a sender limited only by its bandwidth, so a peer
+ * that simply sends faster than we read grew this deque without bound - remote
+ * memory exhaustion on a NORMALLY-POLLING node, with no protocol violation
+ * required and nothing in the app doing anything wrong. An app that stops
+ * polling (a modal dialog, a blocked handler) hit the same wall sooner.
+ *
+ * The policy is datachannelxt's, deliberately: that sibling already bounds the
+ * identical structure with tail-drop plus a shed counter
+ * (datachannel_shim.cpp, enqueue_locked), and one reviewed policy in two
+ * members beats two. Tail-drop sheds the NEWEST event, because a queue this
+ * deep means the app is not keeping up and the older events are the ones it is
+ * still working through.
+ *
+ * WHAT IS DEFERRED, AND WHY. datachannelxt also reports the shed count as an
+ * E_QUEUE_OVERFLOW event. The equivalent here would be a new A_RP1_* alert
+ * code, and btx_abi.h's contract is explicit that a new alert code bumps
+ * BTX_ABI_VERSION - which check-binary-freshness.py then enforces against
+ * every committed binary by decoding btx_abi_version() out of the library
+ * itself. Bumping the constant without rebuilding all five platforms turns
+ * that gate red, and rebuilding them is a release dispatch (a human pressing
+ * "Run workflow"), not something this change can do. So the count is kept and
+ * surfaced through the EXISTING last-error channel on the next drain, and the
+ * alert waits for ABI 12. The memory bound - the actual vulnerability - does
+ * not wait. */
+static const size_t kRp1MaxQueueEvents = 65536;
+static const size_t kRp1MaxQueueBytes  = 32u * 1024u * 1024u;   /* 32 MiB */
+
 /* "ip:port", IPv6 bracketed. */
 static std::string endpoint_to_str(const lt::tcp::endpoint &ep) {
     std::string ip = ep.address().to_string();
@@ -243,6 +275,15 @@ struct Rp1Event {
     bool hasSupports = false; int supports = 0;
     bool hasToken = false;    std::vector<char> token;
     bool hasPayload = false;  std::vector<char> payload;
+
+    /* What this event costs the byte budget. A fixed slab covers the deque
+     * node and the small fields so that a flood of EMPTY events is bounded
+     * too - counting only payloads would let a peer queue millions of
+     * zero-byte messages inside a byte cap that never moves. */
+    size_t cost() const {
+        return 64 + swarmHex.size() + peerIdHex.size() + endpoint.size()
+             + token.size() + payload.size();
+    }
 };
 
 static void write_rp1_entry(btx::RecordWriter &rw, const Rp1Event &ev) {
@@ -280,8 +321,25 @@ struct Rp1SessionPlugin : lt::plugin,
     std::mutex mx;
     std::unordered_map<int, std::shared_ptr<Rp1Peer>> peers;
     std::deque<Rp1Event> events;
+    size_t queueBytes = 0;        /* sum of cost() over `events`, guarded by mx */
+    long long dropped = 0;        /* shed since the last drain reported it */
     int nextPeerId = 1;
     std::vector<char> token;   /* our outbound "rp1_tok" handshake blob */
+
+    /* The ONE way an event enters the queue. Caller holds mx. Tail-drop when
+     * either cap is hit: shed the newest, count it, never block and never
+     * throw (this runs on libtorrent's network thread, where an exception
+     * would cross a foreign boundary - suite rule 2). */
+    void enqueue_locked(Rp1Event &&ev) {
+        const size_t c = ev.cost();
+        if (events.size() >= kRp1MaxQueueEvents
+            || queueBytes + c > kRp1MaxQueueBytes) {
+            ++dropped;
+            return;
+        }
+        queueBytes += c;
+        events.push_back(std::move(ev));
+    }
 
     std::shared_ptr<lt::torrent_plugin> new_torrent(
         lt::torrent_handle const &h, lt::client_data_t) override;
@@ -295,7 +353,7 @@ struct Rp1SessionPlugin : lt::plugin,
         Rp1Event ev;
         ev.type = btx::A_RP1_PEER_CONNECTED; ev.peerId = p->id; ev.swarmHex = swarmHex;
         ev.hasEndpoint = true; ev.endpoint = endpoint_to_str(pc.remote());
-        events.push_back(std::move(ev));
+        enqueue_locked(std::move(ev));
         return p;
     }
     void drop_peer(int id, const std::string &swarmHex) {
@@ -304,11 +362,11 @@ struct Rp1SessionPlugin : lt::plugin,
         if (it != peers.end()) { it->second->alive = false; peers.erase(it); }
         Rp1Event ev;
         ev.type = btx::A_RP1_PEER_DISCONNECTED; ev.peerId = id; ev.swarmHex = swarmHex;
-        events.push_back(std::move(ev));
+        enqueue_locked(std::move(ev));
     }
     void push_event(Rp1Event ev) {
         std::lock_guard<std::mutex> lk(mx);
-        events.push_back(std::move(ev));
+        enqueue_locked(std::move(ev));
     }
     std::vector<char> current_token() {
         std::lock_guard<std::mutex> lk(mx);
@@ -344,10 +402,25 @@ struct Rp1SessionPlugin : lt::plugin,
             if (n == 0 && (2 + need) > capz) return -static_cast<int>(2 + need);
             if (w.pos() + need > capz) break;   /* leave the rest for the next poll */
             write_rp1_entry(w, events.front());
+            /* release the budget with the event, using the SAME cost() the
+             * enqueue charged - anything else leaks the byte accounting until
+             * the queue looks full while empty. */
+            const size_t c = events.front().cost();
+            queueBytes = (queueBytes > c) ? (queueBytes - c) : 0;
             events.pop_front();
             ++n;
         }
         w.patch_u16(countAt, n);
+        /* Not silent: a drain that follows shed events says so through the
+         * existing last-error channel (this runs on the caller's thread, so
+         * set_error is safe here). A proper A_RP1_QUEUE_OVERFLOW alert needs
+         * ABI 12 - see the note on kRp1MaxQueueEvents. */
+        if (dropped > 0) {
+            set_error("rp1: " + std::to_string(dropped)
+                      + " inbound event(s) shed - the queue cap was reached; "
+                        "poll more often or read less slowly");
+            dropped = 0;
+        }
         return static_cast<int>(n);
     }
 };
@@ -2624,13 +2697,26 @@ extern "C" BTX_API int BTX_CALL btx_dht_keypair(const char *seedHexOrEmpty,
     });
 }
 
+/* BEP44's 1000-byte limit is on the BENCODED value `v`, and these two entry
+ * points take a RAW value and bencode it themselves (lt::entry of a std::string
+ * -> `<len>:<bytes>`). So the raw cap is 996, not 1000: "996:" is four bytes and
+ * 4 + 996 = 1000 exactly, while a 1000-byte raw value goes out as 1005 and every
+ * node refuses it - silently, because a rejected put is indistinguishable from a
+ * put nobody has fetched yet. Corrected 2026-09-08.
+ *
+ * The OTHER two 1000s in this file are correct and must stay: btx_dht_put_signed
+ * emits its value verbatim (lt::entry::preformatted_type) and
+ * btx_dht_bep44_signbuf appends it raw after `1:v`, so both are handed the
+ * ALREADY-BENCODED bytes and 1000 is the right number for them. */
+static const int kBep44MaxRawValue = 996;
+
 extern "C" BTX_API int BTX_CALL btx_dht_put_immutable(int s, const void *data,
                                                       int len, char *outTargetHex,
                                                       int cap) {
     BTX_GUARD_BUFFER({
         SessionState *st = session_for(s);
         if (!st || !st->ses) return 0;  /* no session -> 0 (no target) */
-        if (!data || len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return 0; }
+        if (!data || len < 0 || len > kBep44MaxRawValue) { set_error("value must be 0..996 raw bytes (BEP44 caps the BENCODED value at 1000)"); return 0; }
         lt::entry e(std::string(static_cast<const char *>(data),
                                 static_cast<size_t>(len)));
         /* dht_put_item returns the target (SHA-1 of the bencoded value) NOW; the
@@ -2708,7 +2794,7 @@ extern "C" BTX_API int BTX_CALL btx_dht_put_mutable(int s, const char *publicKey
     BTX_GUARD_ACTION({
         SessionState *st = session_for(s);
         if (!st || !st->ses) { set_error("no live session"); return BTX_ERR_NO_SESSION; }
-        if (!data || len < 0 || len > 1000) { set_error("value must be 0..1000 bytes"); return BTX_ERR_INVALID_ARG; }
+        if (!data || len < 0 || len > kBep44MaxRawValue) { set_error("value must be 0..996 raw bytes (BEP44 caps the BENCODED value at 1000)"); return BTX_ERR_INVALID_ARG; }
         lt::dht::public_key pk;
         lt::dht::secret_key sk;
         if (!hex_to_buf(publicKeyHex, pk.bytes.data(), 32)) { set_error("public key must be 64 hex chars"); return BTX_ERR_INVALID_ARG; }

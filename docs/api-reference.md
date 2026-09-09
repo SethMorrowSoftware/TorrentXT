@@ -527,7 +527,7 @@ keep a stable identity across runs.
 - **Usage:** function - `put btDhtKeypair("") into tKey`, then save `tKey["seed"]`.
 
 ### `btDhtPutImmutable(in pSession as Integer, in pData as Data) returns String`
-Store `pData` (1..1000 bytes) as an immutable item. Returns its **target hash**
+Store `pData` (1..996 RAW bytes - BEP44 caps the BENCODED value at 1000, and `<len>:<bytes>` adds up to 4) as an immutable item. Returns its **target hash**
 (the lookup key) as hex, or `""` on failure; the store confirms later as a
 `dhtPut` event. Anyone with the target can fetch the value.
 - **Usage:** function - `put btDhtPutImmutable(sSession, tBytes) into tTarget`.
@@ -538,7 +538,7 @@ value arrives as a `dhtImmutableItem` event.
 - **Usage:** command - `btDhtGetImmutable sSession, tTarget`.
 
 ### `btDhtPutMutable(in pSession as Integer, in pPublicKey as String, in pSecretKey as String, in pSalt as String, in pData as Data) returns Integer`
-Store `pData` (1..1000 bytes) as a mutable item under the ed25519 key (64-hex
+Store `pData` (1..996 RAW bytes - see the immutable row) as a mutable item under the ed25519 key (64-hex
 public, 128-hex secret from `btDhtKeypair`), with an optional `pSalt` (`""` for
 none). The native layer signs it and bumps the sequence number. Returns `0` /
 negative; confirms via a `dhtPut` event. Re-putting under the same key+salt

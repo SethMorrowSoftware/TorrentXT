@@ -52,6 +52,50 @@ in Rust and the LCB layer is untouched.
    LiveCode `Data`, you have taken a wrong turn — the single-threaded ~16 ms budget
    makes that path unviable, and the whole design exists to avoid it.
 
+## The rp1 queue was UNBOUNDED, and the BEP44 caps counted the wrong bytes (2026-09-08)
+
+Two defects found by a read-through, fixed in `src/torrent_shim.cpp`. **Both are
+source-only until a `release-binaries.yml` dispatch refreshes the committed
+libraries** (`docs/REMAINING-WORK.md` C.0); the shipped binaries still carry the
+old behaviour on all five platforms.
+
+**1. The inbound rp1 queue had no cap.** `push_event` was a bare
+`events.push_back` under the mutex, fed from libtorrent's NETWORK threads, while
+the drain moves at most `kDrainCap` (65536) bytes per `btx_rp1_poll`. At the
+250 ms cadence the demos actually poll, that is roughly 262 KB/s of drain
+against a sender limited only by bandwidth: a peer that simply sends faster than
+we read grew the deque without bound. **That is remote memory exhaustion on a
+node doing nothing wrong and polling normally** - no protocol violation needed.
+The fix is datachannelxt's policy, taken deliberately rather than invented: that
+sibling already bounds the identical structure with tail-drop plus a shed
+counter, and one reviewed policy in two members beats two. Every producer now
+goes through one `enqueue_locked`; `drain` releases the byte budget with the
+same `cost()` the enqueue charged, so the accounting cannot leak the queue into
+looking full while empty.
+
+**What is deferred, and why it is not a judgement call.** datachannelxt also
+reports the shed count as an `E_QUEUE_OVERFLOW` event. The equivalent here is a
+new `A_RP1_*` alert code, and `src/btx_abi.h` states that a new alert code bumps
+`BTX_ABI_VERSION` - which `tools/check-binary-freshness.py` then enforces by
+DECODING `btx_abi_version()` out of every committed library. Bumping the
+constant without rebuilding all five platforms turns that gate red, and the
+rebuild is a release dispatch, not an edit. So the memory bound (the actual
+vulnerability) landed now and the alert waits for ABI 12; meanwhile the count
+rides the existing last-error channel on the next drain, so a shed is at least
+retrievable rather than silent.
+
+**2. Two of the four BEP44 caps counted RAW bytes where the limit is on the
+BENCODED value.** BEP44 caps `v` at 1000 bytes and `v` is `<len>:<bytes>`, so a
+1000-byte raw value goes on the wire as 1005 and every node refuses it -
+silently, because a rejected put is indistinguishable from a put nobody has
+fetched. `btx_dht_put_immutable` and `btx_dht_put_mutable` bencode internally
+and now cap at `kBep44MaxRawValue` (996: "996:" is four bytes, 4 + 996 = 1000
+exactly). **The other two 1000s are correct and must stay**:
+`btx_dht_put_signed` emits its value verbatim (`preformatted_type`) and
+`btx_dht_bep44_signbuf` appends it raw after `1:v`, so both are handed
+ALREADY-BENCODED bytes. The same off-by-the-bencoding existed one layer up in
+riptide's `kRsMaxRecord` and is fixed there too.
+
 ## Commands
 
 **Native shim + C++ tests** (the only layer with an automated test suite):

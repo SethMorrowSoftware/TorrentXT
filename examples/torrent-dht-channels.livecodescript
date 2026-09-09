@@ -759,10 +759,35 @@ end oxSetStreamCallback
 command oxWrite pStream, pData
    -- Write app bytes (already sealed by the app via SodiumXT) to the
    -- tunnel. OnionXT does not encrypt (docs/02).
+   --
+   -- THE WRITE RESULT IS READ, AND IT DID NOT USED TO BE (2026-09-09). The
+   -- engine reports a socket write failure in `the result`, and the bare
+   -- `return empty` that stood here overwrote it unconditionally - so a
+   -- broken tunnel was reported to every caller as a successful send. That is
+   -- the opposite of this module's documented contract (docs/05: "Commands set
+   -- `the result` to empty on success, or to a clear, human-readable error
+   -- string on failure ... Every wire error fails closed and tears the
+   -- resource down"), and 93 call sites across the suite branch on it, so all
+   -- of them were dead code on the failure path.
+   --
+   -- The most reachable consequence is the onion send pump, which paces
+   -- ENTIRELY on this return: nocloud's own comment says "We pace with the
+   -- kOnionPumpTick timer + oxWrite's error return instead", so a receiver
+   -- that aborts mid-transfer left the sender writing into a dead socket
+   -- forever instead of aborting the serve.
+   --
+   -- `the result` must be captured into a local on the very next line: any
+   -- intervening statement can clear it, which is the same one-statement
+   -- discipline this file already uses around `open socket`.
+   local tWriteErr
    if sStreams[pStream]["state"] is not "connected" then
       return "OnionXT: stream " & pStream & " is not open"
    end if
    write pData to socket sStreams[pStream]["socketID"]
+   put the result into tWriteErr
+   if tWriteErr is not empty then
+      return "OnionXT: write to stream " & pStream & " failed:" && tWriteErr
+   end if
    return empty
 end oxWrite
 
