@@ -2483,7 +2483,24 @@ extern "C" BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap) {
          * would jump ahead of the stashed one and break FIFO order. This latch
          * enforces "stash the tail wholesale". */
         bool stashing = false;
+        /* LIBTORRENT'S OWN QUEUE CAN OVERFLOW TOO, and until 2026-09-10 it did
+         * so in silence. alerts_dropped_alert is what libtorrent posts when its
+         * alert queue (settings_pack::alert_queue_size, 1000 by default) filled
+         * between two of our drains and it threw alerts away - which for this
+         * binding means a lost DHT item, a lost put confirmation or a lost
+         * tracker reply with nothing in the record stream to say so; the app
+         * simply waits for an event that already happened. It was unmapped, so
+         * extract_alert dropped the report of the drop. It is counted here and
+         * reported through the last-error channel at the end of this drain,
+         * the same interim the rp1 shed count rides (a proper alert code waits
+         * for ABI 12, see kRp1MaxQueueEvents). The bitset names the TYPES that
+         * were dropped, not how many alerts, so that is what is reported. */
+        size_t droppedTypes = 0;
         for (lt::alert *a : alerts) {
+            if (auto *d = lt::alert_cast<lt::alerts_dropped_alert>(a)) {
+                droppedTypes += d->dropped_alerts.count();
+                continue;
+            }
             PendingAlert pa;
             if (!extract_alert(st, a, pa)) continue;  /* unmapped -> skip */
 
@@ -2503,6 +2520,14 @@ extern "C" BTX_API int BTX_CALL btx_pop_alerts(int s, void *out, int cap) {
         }
 
         w.patch_u16(countAt, written);
+        if (droppedTypes > 0) {
+            /* Not silent: this runs on the caller's thread, so set_error is
+             * safe, and btLastError() carries it to the app after this drain. */
+            set_error("alerts: libtorrent dropped alerts of "
+                      + std::to_string(droppedTypes)
+                      + " type(s) since the last drain - its queue filled; poll "
+                        "more often or raise alert_queue_size");
+        }
         if (written == 0 && !st->stash.empty()) {
             /* A FRESH alert was too big for the buffer (nothing emitted, the tail
              * was stashed). Signal -need now so the caller grows on the next call

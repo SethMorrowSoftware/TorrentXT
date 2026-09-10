@@ -96,6 +96,20 @@ exactly). **The other two 1000s are correct and must stay**:
 ALREADY-BENCODED bytes. The same off-by-the-bencoding existed one layer up in
 riptide's `kRsMaxRecord` and is fixed there too.
 
+**3. libtorrent's own overflow report was thrown away (found 2026-09-08,
+closed 2026-09-10).** `alerts_dropped_alert` is what libtorrent posts when ITS
+alert queue (`alert_queue_size`, 1000 by default) filled between two of our
+drains and alerts were discarded - for this binding a lost DHT item, a lost
+put confirmation or a lost tracker reply, with nothing in the record stream to
+say so; the app simply waits for an event that already happened. It was
+unmapped, so `extract_alert` dropped the report of the drop. `btx_pop_alerts`
+counts it now and reports it through the last-error channel at the end of the
+drain, the same interim the rp1 shed count rides and for the same reason (a
+proper alert code is ABI 12). The bitset libtorrent hands over names the TYPES
+dropped, not a count of alerts, and the message says so. Same status as 1 and
+2: source only until the dispatch, compile- and smoke-tested here under
+ASan/UBSan against the system libtorrent.
+
 ## Commands
 
 **Native shim + C++ tests** (the only layer with an automated test suite):
