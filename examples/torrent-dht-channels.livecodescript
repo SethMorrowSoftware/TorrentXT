@@ -5560,6 +5560,11 @@ end chOnionTryTB
 -- the main thread. On the FIRST transition to ready, bring anon services online.
 command chOnionStatus pKind, pInfo
    local tWasReady
+   -- PIN (2026-09-09): this handler is registered as a library callback, so the defaultStack is
+   -- whatever stack is in front when it runs, not this one. Every
+   -- unqualified control reference below, and in everything it calls,
+   -- resolves against that stack instead. Engine notes 5.3.
+   set the defaultStack to the short name of this stack
    put sTorReady into tWasReady
    if pKind is "control" then
       if pInfo is "authenticated" then
@@ -6395,6 +6400,11 @@ end chOnionDownload
 -- Fetch-side per-stream handler (dialed streams). On "open", send the pending BTXC
 -- request; on "data", route to the BTXF feed parser or the BTXO file receiver.
 command chOnionFetchStream pStream, pEvent, pData
+   -- PIN (2026-09-09): this handler is registered as a library callback, so the defaultStack is
+   -- whatever stack is in front when it runs, not this one. Every
+   -- unqualified control reference below, and in everything it calls,
+   -- resolves against that stack instead. Engine notes 5.3.
+   set the defaultStack to the short name of this stack
    if pEvent is "open" then
       if sOnReq[pStream] is not empty then
          oxWrite pStream, sOnReq[pStream]
