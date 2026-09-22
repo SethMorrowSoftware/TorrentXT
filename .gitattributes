@@ -1,0 +1,9 @@
+# The per-platform native libraries under src/code/<arch>-<platform>/ are
+# committed on purpose (suite rule 5: a native change refreshes its committed
+# binary in the same change), so git's diff/merge behaviour on them is pinned
+# here rather than left to its heuristics. Carried from the suite root's
+# .gitattributes so it holds in this member's own repository too.
+*.so binary
+*.dll binary
+*.dylib binary
+*.exp binary
