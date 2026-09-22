@@ -12,7 +12,8 @@
 # pass' (the honesty convention).
 #
 # Do not edit by hand: edit tools/member-registry.py or the generator in
-# the suite and re-run `python3 tools/sync-member-workflows.py`.
+# the suite and re-run `python3 tools/sync-member-workflows.py`; the
+# suite's publisher carries the result into this member's repository.
 name: gates
 
 on:
