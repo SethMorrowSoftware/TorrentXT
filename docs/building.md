@@ -38,7 +38,7 @@ source. Do not "fix" the name.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `TORRENTXT_BUILD_TESTS` | `OFF` | Build and register the ctest suite: `record_handle_test`, `torrent_smoke_test`, `rp1_integration_test`. |
+| `TORRENTXT_BUILD_TESTS` | `OFF` | Build and register the ctest suite: `record_handle_test`, `torrent_smoke_test`, `rp1_integration_test`, `rp1_queue_test`. |
 | `TORRENTXT_USE_SYSTEM_LIBTORRENT` | `OFF` | `find_package(LibtorrentRasterbar 2.0)` + Boost >= 1.70 (vcpkg / apt / system install) instead of FetchContent. Fast. The version script `src/torrentxt.map` is deliberately NOT applied on this path (`../CLAUDE.md` gotcha 4). |
 | `TORRENTXT_SANITIZE` | `OFF` | Build all our C++ under gcc ASan+UBSan (`-fno-sanitize-recover=all`). Ignored on MSVC. (`record_handle_test` is sanitized regardless.) |
 | `TORRENTXT_LIBTORRENT_TAG` | `v2.0.11` | The pinned libtorrent git tag for FetchContent. Change only deliberately. |
@@ -145,7 +145,7 @@ list too (you are bumping `BTX_ABI_VERSION` for it anyway).
 
 ## Tests
 
-`-DTORRENTXT_BUILD_TESTS=ON` registers three ctest executables:
+`-DTORRENTXT_BUILD_TESTS=ON` registers four ctest executables:
 
 1. **`record_handle_test`** (`tests/record_handle_test.cpp`) - **no libtorrent.** It
    exercises the big-endian, length-prefixed record framing (the `-needed` measure-or-write
@@ -160,8 +160,11 @@ list too (you are bumping `BTX_ABI_VERSION` for it anyway).
    (gcc, not clang: clang's ASan runtime is not installed in this environment.)
 2. **`torrent_smoke_test`** (`tests/torrent_smoke_test.cpp`) - links the shim and the real
    libtorrent: session lifecycle, handle safety, add from buffer and magnet, the drain record
-   format, and the **exception firewall**. It prints each section on unbuffered stdout, so an
-   abort still shows where it happened.
+   format, and the **exception firewall**; since 2026-09-24 also the BEP44 caps at their
+   boundaries (996/997 raw, 1000/1001 already-bencoded), libtorrent's own alert-queue
+   overflow reaching `btLastError()` (forced with `alert_queue_size` = 1), and the magnet
+   parse a pre-Model-C QuickShare hands a truncated `BTXTOR1:` code to. It prints each
+   section on unbuffered stdout, so an abort still shows where it happened.
 3. **`rp1_integration_test`** (`tests/rp1_integration_test.cpp`) - the **rp1 peer-wire path
    on the wire** in one process: two real sessions on loopback with the rp1 plugin attached,
    the same metadata-less phantom swarm on both, an explicit `connect_peer`, and one message
@@ -170,9 +173,19 @@ list too (you are bumping `BTX_ABI_VERSION` for it anyway).
    connection holding long enough to talk. It has a **120 s ctest timeout** (the per-peer
    tick runs about once a second) and sets `ASAN_OPTIONS=detect_container_overflow=0`, which
    mutes the known false positive of an ASan-built shim against a non-ASan libtorrent.
+4. **`rp1_queue_test`** (`tests/rp1_queue_test.cpp`, since 2026-09-24) - the **bounded rp1
+   inbound queue** at both caps: tail-drop keeps the oldest events, the drain releases
+   exactly the budget the enqueue charged, and the shed count reaches the last error once.
+   The queue is fed only by a peer's traffic on the network thread, so this test
+   `#include`s `src/torrent_shim.cpp` and links libtorrent but NOT the `torrentxt` library:
+   it proves the source, not the shipped `.so` (a `btx::test` hook would have been a shim
+   change, and so a rebuild of every committed binary).
 
-The compiler-free gates (the static checker, every `tests/*golden*.py` suite, the record
-registry check and the `MANIFEST.sha256` check) are one command: `bash tools/run-gates.sh`.
+The compiler-free gates (the static checker, every `tests/*golden*.py` suite, the Model C
+execution gate `tools/check-script-vectors.py` and its fixture test, the record registry
+check and the `MANIFEST.sha256` check) are one command: `bash tools/run-gates.sh`. The
+execution gate needs the sibling members riptide, nostrxt and sodiumxt beside this
+checkout; see the README's section on the suite.
 
 ## Refreshing the committed per-platform binaries
 

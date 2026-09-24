@@ -40,6 +40,17 @@ for rel in tests/*golden*.py; do
 done
 shopt -u nullglob
 
+# The Model C execution gate (2026-09-24): the demos' shipped receive paths
+# RUN headlessly through riptide's runner, held to the onion golden's mirrors
+# and, in tier 2, to the committed SodiumXT (the verifier, the truncated-code
+# parse, the M9 feed-seal KAT). After the golden, which it stands on; its
+# fixture test first, because a blind gate prints OK too. Siblings: riptide,
+# nostrxt, sodiumxt (tools/member-registry.py).
+echo "== torrentxt: tools/test-script-vectors.py =="
+python3 tools/test-script-vectors.py
+echo "== torrentxt: tools/check-script-vectors.py =="
+python3 tools/check-script-vectors.py --check
+
 # Record-registry sync (shim header <-> .lcb constants): src/btx_record.h is
 # the single source of truth for the field-type, field-id and alert-type
 # enums, and every enumerator must have its mechanically named `constant

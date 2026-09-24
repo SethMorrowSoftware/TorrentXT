@@ -41,10 +41,13 @@ script "torrentClient"
 -- reschedule) so calling it from an event NEVER spawns a second timer chain.
 --
 -- HONESTY (the suite convention): the torrent surface this client drives is
--- engine-proven (the member selftest and demo passes recorded in
--- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
--- 2026-08-14 - the rebuilt chrome and layout are verified statically; needs
--- an OXT re-pass.
+-- engine-proven through the member harness (tests/torrent-selftest.livecodescript,
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24; the ledger is in
+-- torrentxt/CLAUDE.md), but no dated engine pass of THIS client is recorded
+-- there, and its UI was unified onto the suite kit 2026-08-14 - the rebuilt
+-- chrome and layout are verified statically; needs an OXT re-pass. (This
+-- paragraph used to cite "demo passes recorded in torrentxt/CLAUDE.md"; the
+-- ledger holds harness and transport rows only.)
 --
 -- THE LOOK is the suite UI kit, carried verbatim between the marker lines
 -- (master: tools/ui-kit.livecodescript; the drift gate holds every copy

@@ -557,4 +557,29 @@ if(TORRENTXT_BUILD_TESTS)
             TIMEOUT 120
             ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=detect_container_overflow=0:halt_on_error=1")
     endif()
+
+    # (d) rp1_queue_test — the bounded rp1 inbound queue (the 2026-09-08 DoS
+    #     fix) pinned at its two caps. The queue is fed only by a peer's traffic
+    #     on libtorrent's network thread and nothing exported reaches it, so the
+    #     test #includes src/torrent_shim.cpp and drives Rp1SessionPlugin
+    #     directly - ONE translation unit that carries its own copy of the shim.
+    #     It therefore links libtorrent but NOT the torrentxt library (two
+    #     definitions of every btx_* otherwise), and it proves the SOURCE, not
+    #     the shipped .so; the header of the test says why that trade was taken
+    #     over a new btx::test hook (a hook is a shim change: rule 5, a rebuild
+    #     of all five committed binaries). Same sanitizer/env contract as (c).
+    set(_rp1q_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/rp1_queue_test.cpp")
+    if(EXISTS "${_rp1q_src}" AND TARGET torrentxt)
+        add_executable(rp1_queue_test "${_rp1q_src}")
+        target_include_directories(rp1_queue_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rp1_queue_test PRIVATE torrentxt::libtorrent torrentxt_flags torrentxt_link)
+        get_target_property(_lt_incs4 torrentxt_libtorrent INTERFACE_INCLUDE_DIRECTORIES)
+        if(_lt_incs4)
+            target_include_directories(rp1_queue_test SYSTEM PRIVATE ${_lt_incs4})
+        endif()
+        add_test(NAME rp1_queue_test COMMAND rp1_queue_test)
+        set_tests_properties(rp1_queue_test PROPERTIES
+            TIMEOUT 120
+            ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=detect_container_overflow=0:halt_on_error=1")
+    endif()
 endif()

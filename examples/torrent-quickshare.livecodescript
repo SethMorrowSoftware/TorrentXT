@@ -37,10 +37,13 @@ script "quickShareApp"
 -- Transfers list. The heavy bytes move on libtorrent's own threads, never script.
 --
 -- HONESTY (the suite convention): the torrent surface this demo drives is
--- engine-proven (the member selftest and the demo passes recorded in
--- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
--- 2026-08-14 - the rebuilt chrome is verified statically; needs an OXT
--- re-pass. The clearweb socket + UPnP + local-IP layers below keep their own
+-- engine-proven through the member harness (tests/torrent-selftest.livecodescript,
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24; the ledger is in
+-- torrentxt/CLAUDE.md), but no dated engine pass of THIS demo is recorded
+-- there, and its UI was unified onto the suite kit 2026-08-14 - the rebuilt
+-- chrome is verified statically; needs an OXT re-pass. (This paragraph used
+-- to cite "demo passes recorded in torrentxt/CLAUDE.md"; the ledger holds
+-- harness and transport rows only.) The clearweb socket + UPnP + local-IP layers below keep their own
 -- standing NEEDS-AN-ON-ENGINE-PASS notes (flagged VERIFY at each site), and
 -- every ox* call still needs the on-engine pass with a live Tor daemon.
 --
@@ -110,6 +113,7 @@ local sFsTxPos          -- array: stream -> next byte offset to read (0-based; h
 local sFsTxRemaining    -- array: stream -> bytes still to send (respects a Range)
 local sFsTxName         -- array: stream -> the file's leaf name (for the log)
 local sFsTxDeadline     -- array: stream -> the milliseconds of the last activity (watchdog)
+local sFsMethod         -- array: stream -> the current request's method (HEAD must send no body)
 -- Dynamic routes (the light xTalk backend). A hosted web app can call back into
 -- this stack: sHttpRoutes maps "METHOD /path" -> the name of an xTalk handler that
 -- answers the request (see qsHttpRoute / qsHttpReply below). Works over BOTH
@@ -137,6 +141,12 @@ local sEditSession      -- the current valid edit-session token (random hex), or
 -- the most engine-dependent code here (flagged VERIFY at each site).
 local sWebShare         -- "true" while the "Share via web link" toggle is armed
 local sCwActive         -- "true" while a clearweb share is live
+-- sCwActive is EMPTY until the first share starts (nothing initialises it), so every
+-- guard reads `is not "true"`, never `not sCwActive`: `not` of an empty value is not a
+-- boolean, and whether the engine throws on it is unrecorded. qsStop runs qsStopClearweb
+-- BEFORE btStopSession, so a throw there would have skipped the session teardown for
+-- anyone who closed the demo without ever sharing a web link. nocloud made the same
+-- change at all its sites on 2026-08-14 (6471f5f); this copy caught up 2026-09-24.
 local sCwKind           -- "file" or "folder"
 local sCwRoot           -- the shared folder (no trailing slash), for a folder share
 local sCwFilePath       -- the shared file's full path, for a file share
@@ -155,6 +165,7 @@ local sCwTxPath         -- array: socket -> disk path of the file being streamed
 local sCwTxPos          -- array: socket -> next byte offset to read (0-based; honours a Range)
 local sCwTxRemaining    -- array: socket -> bytes still to send (respects a Range)
 local sCwTxName         -- array: socket -> the file's leaf name (for the log)
+local sCwMethod         -- array: socket -> the current request's method (HEAD must send no body)
 
 -- Optional end-to-end encryption (mirrors the channels demo), via SodiumXT
 -- (libsodium). A passphrase turns a share into ciphertext under a NEUTRAL name:
@@ -1234,7 +1245,7 @@ command qsGetFile
       put item 3 of tRest into tB64Salt
       put item 4 of tRest into tB64Verify
       put toLower(tHash) into tHash
-      if the number of chars of tHash is not 40 and the number of chars of tHash is not 64 then
+      if (the number of chars of tHash is not 40 and the number of chars of tHash is not 64) or not qsIsHex(tHash) then
          qsLog "That locked code looks damaged (bad hash)."
          exit qsGetFile
       end if
@@ -1280,7 +1291,7 @@ command qsGetFile
          put tCode into tMag
       else
          put toLower(tCode) into tCode
-         if the number of chars of tCode is not 40 and the number of chars of tCode is not 64 then
+         if (the number of chars of tCode is not 40 and the number of chars of tCode is not 64) or not qsIsHex(tCode) then
             qsLog "That does not look like a share code (it should be 40 characters)."
             exit qsGetFile
          end if
@@ -1298,6 +1309,25 @@ command qsGetFile
       qsLog "Downloading to" && qsSaveFolder() & ". Watch the Transfers list - your friend must be online."
    end if
 end qsGetFile
+
+-- True when pText is non-empty and every char is 0-9 or a-f (callers lowercase
+-- first). A share code used to be checked for LENGTH only, and libtorrent 2.0.x's
+-- magnet parser ignores from_hex's failure (2.1.1 checks it), so on the Linux and mac
+-- builds a 40-character non-hex code made btAddMagnet join a garbage swarm instead of
+-- refusing (found 2026-09-24 while pinning register #17). Verified statically; needs
+-- an OXT pass.
+function qsIsHex pText
+   local tI
+   if pText is empty then
+      return false
+   end if
+   repeat with tI = 1 to the number of chars of pText
+      if offset(char tI of pText, "0123456789abcdef") is 0 then
+         return false
+      end if
+   end repeat
+   return true
+end qsIsHex
 
 -- ---- transfers view + events -------------------------------------------------
 command qsRefreshXfers
@@ -1485,19 +1515,25 @@ function qsBar pPct
 end qsBar
 
 function qsBytes pBytes
-   local tUnits, tVal, tI
+   local tUnits, tVal, tI, tOldDelim, tUnit
    if pBytes is empty or pBytes is not a number then
       return "0 B"
    end if
    put "B,KiB,MiB,GiB,TiB" into tUnits
-   set the itemDelimiter to comma
    put pBytes into tVal
    put 1 into tI
+   -- Save and restore the itemDelimiter around the one span that reads items: it is
+   -- engine-global (engine note 2.3), so the bare `set ... to comma` this function had
+   -- until 2026-09-24 clobbered any caller mid-parse with another delimiter.
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
    repeat while tVal >= 1024 and tI < the number of items of tUnits
       put tVal / 1024 into tVal
       add 1 to tI
    end repeat
-   return (the round of (tVal * 10) / 10) && (item tI of tUnits)
+   put item tI of tUnits into tUnit
+   set the itemDelimiter to tOldDelim
+   return (the round of (tVal * 10) / 10) && tUnit
 end qsBytes
 
 function qsTrunc pText, pLen
@@ -1587,6 +1623,9 @@ function qsCapabilityLine
       put "SodiumXT OK" into tOut
    else
       put "SodiumXT NO (" & qsEncryptAdvice() & ")" into tOut
+   end if
+   if qsOnionOnMobile() then
+      return tOut & "; Tor: not available on this device (private transfers need a desktop running a local tor daemon)"
    end if
    if sHasOnion then
       return tOut & "; OnionXT OK (the Tor daemon is probed separately - watch the pill)"
@@ -1705,6 +1744,11 @@ end qsMaybeDecryptFinished
 -- the OnionXT extension is loaded.
 function qsHasOnion
    local tV, tErr
+   -- a phone or tablet never gets this far: no ox* call at all where a local tor
+   -- daemon cannot run (qsOnionOnMobile; the pill names the reason)
+   if qsOnionOnMobile() then
+      return false
+   end if
    if not sCanEncrypt then
       return false
    end if
@@ -1715,6 +1759,18 @@ function qsHasOnion
    end try
    return (tV is not empty)
 end qsHasOnion
+
+-- Mobile is unsupported for the Tor path (ONIONXT-INTEGRATION-PLAN 3.2 and 13.3): a
+-- phone or tablet cannot run the user-controlled local tor daemon, with an open
+-- control port, that the path needs. The design gave that its own fail-closed
+-- reason, "not available on this device"; until 2026-09-24 nothing checked the
+-- platform, so a mobile engine landed in "Tor: no daemon" (or "no extension"),
+-- whose advice - start tor, install OnionXT - cannot be followed there. `the
+-- platform` answers "iphone" on iOS and "android" on Android (LiveCode's
+-- documented values). Verified statically; needs an OXT pass on a mobile engine.
+function qsOnionOnMobile
+   return (the platform is "iphone" or the platform is "android")
+end qsOnionOnMobile
 
 -- Live, authoritative Tor readiness, re-read at the moment of use (never trust the
 -- cached sTorReady for a go/no-go). oxIsReady() is true only at 100% bootstrap.
@@ -1847,7 +1903,14 @@ command qsOnionPill
    if there is no button "qsTorToggle" then
       exit qsOnionPill
    end if
-   if not sHasOnion then
+   if qsOnionOnMobile() then
+      -- the design's distinct reason (qsOnionOnMobile): nothing to install, nothing
+      -- to start, so neither "no extension" nor "no daemon" may be what it says
+      put "Tor: not on this device" into tState
+      put "bad" into tKind
+      set the disabled of button "qsTorToggle" to true
+      set the tooltip of button "qsTorToggle" to "Not available on this device: sending over Tor needs a desktop running a local tor daemon. Normal sharing works here."
+   else if not sHasOnion then
       if sCanEncrypt then
          put "Tor: no extension" into tState
       else
@@ -2464,11 +2527,11 @@ command qsOnionServeHttp pStream
    put word 1 of tReq into tMethod
    put word 2 of tReq into tPath
    if sActiveShare["enc"] is kFlagEnc then
-      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlEncrypted()
+      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlEncrypted(), tMethod
       exit qsOnionServeHttp
    end if
    if sActiveShare["web"] is not "true" then
-      qsOnionHttpText pStream, "403 Forbidden", "text/html; charset=utf-8", qsHtmlDisabled()
+      qsOnionHttpText pStream, "403 Forbidden", "text/html; charset=utf-8", qsHtmlDisabled(), tMethod
       exit qsOnionServeHttp
    end if
    if tPath is "/download" then
@@ -2509,21 +2572,31 @@ command qsOnionServeHttp pStream
       exit qsOnionServeHttp
    end if
    if tPath is "/" then
-      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlIndex()
+      qsOnionHttpText pStream, "200 OK", "text/html; charset=utf-8", qsHtmlIndex(), tMethod
       exit qsOnionServeHttp
    end if
-   qsOnionHttpText pStream, "404 Not Found", "text/plain; charset=utf-8", "Not found."
+   qsOnionHttpText pStream, "404 Not Found", "text/plain; charset=utf-8", "Not found.", tMethod
 end qsOnionServeHttp
 
 -- Send a small text/html HTTP response and close (used for the index, the
 -- encrypted notice, and 404s - never for the file body).
-command qsOnionHttpText pStream, pStatus, pType, pBody
-   local tData, tHead, tCrlf
+command qsOnionHttpText pStream, pStatus, pType, pBody, pMethod
+   local tData, tHead, tCrlf, tBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
-   oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
+   -- the single-file path's twin of qsFsSendText's HEAD rule (2026-09-24): the index
+   -- page, the encrypted notice, the web-download-off page and the 404 all used to
+   -- send their body to a HEAD. pMethod is the request line's first word, passed by
+   -- qsOnionServeHttp; /download already stopped after its head for a HEAD.
+   -- Verified statically; needs an OXT + live-Tor pass.
+   if pMethod is "HEAD" then
+      put "" into tBody
+   else
+      put tData into tBody
+   end if
+   oxWrite pStream, (textEncode(tHead, "UTF-8") & tBody)
    oxCloseStream pStream
    qsOnionServeCleanup pStream
 end qsOnionHttpText
@@ -2573,6 +2646,7 @@ end qsHtmlEncrypted
 command qsFsPeer pStream
    put "" into sFsReq[pStream]
    put "false" into sFsServed[pStream]
+   put "" into sFsMethod[pStream]          -- no method parsed yet (qsFsServePath sets it)
    put the milliseconds into sFsTxDeadline[pStream]
    oxSetStreamCallback pStream, "qsFsStream"
    send ("qsFsWatchdog " & pStream) to me in kOnionSendTimeout milliseconds
@@ -2731,6 +2805,37 @@ end qsHttpParse
 command qsHttpRoute pMethod, pPath, pHandler
    put pHandler into sHttpRoutes[toUpper(pMethod) & space & pPath]
 end qsHttpRoute
+
+-- The route-table key a request should LOOK UP - the other half of qsHttpRoute's key,
+-- and the one place HEAD is turned back into GET (ported 2026-09-24 from nocloud's
+-- 2026-08-17 qsRouteLookupKey). Every method looks up its own "METHOD /path" key; a
+-- HEAD looks up its own when the table declares a HEAD route (an explicit one wins -
+-- it may want to answer differently) and otherwise the GET key, because HEAD is
+-- GET-without-a-body. Until the port both serve paths built the key from the literal
+-- method, so a HEAD missed the table and fell through to the static pipeline, where a
+-- route path has no file and no "." in its leaf: qsSiteSpaTarget handed back
+-- index.html, so on a shared folder with one, HEAD /_qs/info answered 200 text/html
+-- while GET /_qs/info answered JSON. The body is suppressed downstream (qsFsSendText /
+-- qsCwSendText), so the fallback reply carries the GET's headers and no bytes. Pure
+-- over pTable; nocloud mirrors it as route_lookup_key() in its golden, and this demo's
+-- tests/fileserver_golden.py does not yet. Verified statically; needs an OXT pass.
+function qsRouteLookupKey pMethod, pPath, pTable
+   local tMethod, tKey
+   put toUpper(pMethod) into tMethod
+   put tMethod & space & pPath into tKey
+   if tMethod is not "HEAD" then
+      return tKey
+   end if
+   -- an empty table (sHttpRoutes before qsStart registers the first route) declares no
+   -- HEAD route: the answer the lookup below would give, without indexing a non-array
+   if pTable is not an array then
+      return "GET" & space & pPath
+   end if
+   if pTable[tKey] is not empty then
+      return tKey
+   end if
+   return "GET" & space & pPath
+end qsRouteLookupKey
 
 -- Call a route handler; a throw or a missing handler becomes a clean 500 (so a buggy
 -- route never crashes the poll loop or leaves the connection hung).
@@ -3140,10 +3245,12 @@ command qsEditWriteRoute pConn, pRequest
       qsHttpReply pConn, 413, "text/plain; charset=utf-8", "That file is too large to save through the editor."
       exit qsEditWriteRoute
    end if
-   -- REPLACE the file wholesale. `open file ... for binary write` does NOT truncate in
-   -- this engine (it overwrites from offset 0 and leaves any longer tail in place), so
-   -- saving a SHORTER file would otherwise keep stale trailing bytes. Delete first - the
-   -- same guard qsEncryptFile uses - so the saved bytes are exactly the new content.
+   -- REPLACE the file wholesale, without leaning on what `open file ... for binary
+   -- write` does to a longer existing file. Until 2026-09-24 this comment said it does
+   -- NOT truncate here (overwriting from offset 0 and keeping any longer tail); the
+   -- LiveCode reference and engine source say it DOES, and no run has settled it on OXT
+   -- (engine note 6.14). Delete first - the same guard qsEncryptFile uses - which is
+   -- right under both readings, so the saved bytes are exactly the new content.
    if there is a file tDisk then
       delete file tDisk
    end if
@@ -3280,6 +3387,7 @@ end qsEditHtml
 command qsFsServePath pStream, pHeaders
    local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey
    put pHeaders["__method"] into tMethod
+   put tMethod into sFsMethod[pStream]       -- a HEAD reply must carry no body (qsFsSendText)
    put pHeaders["__path"] into tRaw          -- still %xx-encoded; used for the redirect Location
    put urlDecode(tRaw) into tPath            -- real chars for disk mapping
    if tPath is empty then
@@ -3293,7 +3401,8 @@ command qsFsServePath pStream, pHeaders
    end if
    -- a registered dynamic route answers FIRST (any method, so a POST works); only
    -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
-   put toUpper(tMethod) & space & tPath into tRouteKey
+   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey).
+   put qsRouteLookupKey(tMethod, tPath, sHttpRoutes) into tRouteKey
    if sHttpRoutes[tRouteKey] is not empty then
       put tPath into pHeaders["__path"]
       qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
@@ -3445,12 +3554,24 @@ command qsFsFinish pStream
 end qsFsFinish
 
 command qsFsSendText pStream, pStatus, pType, pBody
-   local tData, tHead, tCrlf
+   local tData, tHead, tCrlf, tBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
-   oxWrite pStream, (textEncode(tHead, "UTF-8") & tData)
+   -- a HEAD reply reports the Content-Length a GET would get but sends NO body
+   -- (nocloud's 2026-08-17 fix, ported 2026-09-24). A Tor reply always closes its
+   -- stream, so a body here desyncs nothing - it is a spec violation plus a body
+   -- pushed down an onion circuit to a client that discards it unread, on the
+   -- slowest transport this demo has. It reached every non-file Tor reply of the
+   -- folder server: listings, 404s, 403s and /_qs/info. (qsFsServeFile already
+   -- handled HEAD for files.) Verified statically; needs an OXT + live-Tor pass.
+   if sFsMethod[pStream] is "HEAD" then
+      put "" into tBody
+   else
+      put tData into tBody
+   end if
+   oxWrite pStream, (textEncode(tHead, "UTF-8") & tBody)
    oxCloseStream pStream
    qsFsCleanup pStream
 end qsFsSendText
@@ -3473,6 +3594,7 @@ command qsFsCleanup pStream
    delete variable sFsTxRemaining[pStream]
    delete variable sFsTxName[pStream]
    delete variable sFsTxDeadline[pStream]
+   delete variable sFsMethod[pStream]
 end qsFsCleanup
 
 command qsFsAbort pStream
@@ -3973,7 +4095,7 @@ end qsStartClearweb
 
 command qsStopClearweb
    local tK, tErr, tRc
-   if not sCwActive then
+   if sCwActive is not "true" then
       exit qsStopClearweb
    end if
    qsCwSafeClose sCwPort        -- VERIFY: closing the port-id socket stops accepting
@@ -4001,12 +4123,13 @@ end qsStopClearweb
 -- A browser connected. Stream the request in (`read ... with message`, re-armed per
 -- delivery - OnionXT's proven pattern) and answer once the header block arrives.
 command qsCwAccept pSocketID
-   if not sCwActive then
+   if sCwActive is not "true" then
       qsCwSafeClose pSocketID
       exit qsCwAccept
    end if
    put "" into sCwReq[pSocketID]
    put "false" into sCwServed[pSocketID]
+   put "" into sCwMethod[pSocketID]        -- no method parsed yet (qsCwServe sets it)
    read from socket pSocketID with message "qsCwData"
 end qsCwAccept
 
@@ -4042,6 +4165,7 @@ command qsCwServe pSocketID
    local tHeaders, tMethod, tRaw, tPath, tTok, tRest, tDisk, tIndex, tSavedID, tSpa, tRouteKey
    put qsHttpParse(sCwReq[pSocketID]) into tHeaders
    put tHeaders["__method"] into tMethod
+   put tMethod into sCwMethod[pSocketID]   -- a HEAD reply must carry no body (qsCwSendText)
    put tHeaders["__path"] into tRaw
    put urlDecode(tRaw) into tPath
    replace "\" with "/" in tPath
@@ -4064,7 +4188,8 @@ command qsCwServe pSocketID
    end if
    -- a registered dynamic route (under the token) answers FIRST, any method. Give the
    -- handler the app-relative path (token stripped) so a route is transport-neutral.
-   put toUpper(tMethod) & space & tRest into tRouteKey
+   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey).
+   put qsRouteLookupKey(tMethod, tRest, sHttpRoutes) into tRouteKey
    if sHttpRoutes[tRouteKey] is not empty then
       put tRest into tHeaders["__path"]
       qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
@@ -4231,12 +4356,22 @@ end qsCwFinish
 -- raw socket may drop unsent bytes if closed immediately, so we close in the
 -- write-completion handler).
 command qsCwSendText pSocketID, pStatus, pType, pBody
-   local tData, tHead, tCrlf
+   local tData, tHead, tCrlf, tBody
    put (numToChar(13) & numToChar(10)) into tCrlf
    put textEncode(pBody, "UTF-8") into tData
    put ("HTTP/1.1 " & pStatus & tCrlf & "Content-Type: " & pType & tCrlf & \
       "Content-Length: " & (the number of bytes in tData) & tCrlf & "Connection: close" & tCrlf & tCrlf) into tHead
-   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tData)
+   -- a HEAD reply carries the GET's Content-Length and NO body. nocloud's clearweb
+   -- sender has had this test from the start (on a kept-alive connection an unread
+   -- body is mis-read as the next response's framing); this demo closes after every
+   -- response, so here it is the spec plus wasted bytes, and the test arrived with
+   -- the 2026-09-24 HEAD port. (qsCwServeFile already handled HEAD for files.)
+   if sCwMethod[pSocketID] is "HEAD" then
+      put "" into tBody
+   else
+      put tData into tBody
+   end if
+   qsCwWriteClose pSocketID, (textEncode(tHead, "UTF-8") & tBody)
 end qsCwSendText
 
 command qsCwSendRedirect pSocketID, pLocation
@@ -4281,6 +4416,7 @@ command qsCwClean pSocketID
    delete variable sCwTxPos[pSocketID]
    delete variable sCwTxRemaining[pSocketID]
    delete variable sCwTxName[pSocketID]
+   delete variable sCwMethod[pSocketID]
 end qsCwClean
 
 -- Stack-level socket messages. Act only on OUR clearweb sockets; pass anything else
@@ -4356,7 +4492,7 @@ end qsLanIp
 -- the primary, and the local-network link. Both are copyable (qsCopy / qsWebCopy).
 command qsCwShowLinks
    local tPath, tLan, tWan
-   if not sCwActive then
+   if sCwActive is not "true" then
       exit qsCwShowLinks
    end if
    if sCwKind is "folder" then
@@ -4396,7 +4532,7 @@ end qsCwShowLinks
 -- NAT), or still detecting the public IP.
 command qsCwStatusText
    local tMsg
-   if not sCwActive then
+   if sCwActive is not "true" then
       exit qsCwStatusText
    end if
    if sCwExtIp is not empty and not qsIsPrivateIp(sCwExtIp) then
@@ -4477,7 +4613,7 @@ command qsCwIpReply pUrl, pStatus
       unload URL pUrl
    catch tErr
    end try
-   if not sCwActive then
+   if sCwActive is not "true" then
       exit qsCwIpReply
    end if
    -- validate it really looks like an IPv4 (reject an HTML error page etc.)
@@ -4496,6 +4632,10 @@ end qsCwIpReply
 -- then dial the onion and wire the receiver state machine.
 command qsReceiveOnion pCode
    local tRest, tOnion, tB64, tB64Salt, tB64Verify, tName, tPass, tSalt, tKey, tStream, tErr
+   if qsOnionOnMobile() then
+      qsLog "This is a private Tor share, and private Tor transfers are not available on this device (a phone or tablet cannot run the local tor daemon they need). Open the code on a desktop, or ask your friend to share it normally."
+      exit qsReceiveOnion
+   end if
    if not sHasOnion then
       qsLog "This is a private Tor share, but the Tor path is unavailable here:" && qsCapabilityLine() && "Ask your friend to share it normally, or fix the piece named there and run a local Tor daemon."
       exit qsReceiveOnion
@@ -4603,11 +4743,110 @@ command qsOnionRecvStream pStream, pEvent, pData
    end if
 end qsOnionRecvStream
 
+-- ---- the receiver's free-disk pre-check (design 3.3, built 2026-09-24) ---------
+-- The design asked each receiver to check free space against totalLen, doubled when
+-- encrypted, before opening its temp file; neither did until 2026-09-24, so a short
+-- disk surfaced as "Could not write the received data to disk" partway through (that
+-- abort stays as the backstop). Verified statically; needs an OXT + live-Tor pass,
+-- and diskSpace() itself has no engine record in this suite yet.
+
+-- Free bytes on the disk holding pFolder, or EMPTY when that cannot be measured.
+-- diskSpace() answers for the disk that holds THE DEFAULTFOLDER (LiveCode's documented
+-- behaviour), so point the defaultFolder at the nearest folder that exists (the save
+-- folder may not have been created yet) and put it back before returning, whatever
+-- happened. Unmeasurable is not a refusal: the write-failure abort still catches a
+-- disk that fills, and failing every transfer on a platform whose diskSpace() answers
+-- nothing would turn a guard into an outage.
+function qsFreeBytesAt pFolder
+   local tSaved, tDir, tSavedID, tAvail, tErr, tI
+   put the defaultFolder into tSaved
+   put pFolder into tDir
+   replace "\" with "/" in tDir
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   -- bounded walk up to the nearest existing folder (no real path is 64 deep)
+   repeat with tI = 1 to 64
+      if tDir is empty then
+         exit repeat
+      end if
+      if there is a folder tDir then
+         exit repeat
+      end if
+      delete the last item of tDir
+   end repeat
+   set the itemDelimiter to tSavedID
+   if tDir is empty then
+      return empty
+   end if
+   if there is no folder tDir then
+      return empty
+   end if
+   put empty into tAvail
+   try
+      set the defaultFolder to tDir
+      if the result is empty then
+         put diskSpace() into tAvail
+      end if
+   catch tErr
+      put empty into tAvail
+   end try
+   set the defaultFolder to tSaved
+   -- nested guards: `or` evaluates both operands (engine note 2.5)
+   if tAvail is not a number then
+      return empty
+   end if
+   if tAvail < 0 then
+      return empty
+   end if
+   return tAvail
+end qsFreeBytesAt
+
+-- Empty when the transfer fits, else the refusal to show. The temp lands beside
+-- pTempPath and the result in pSaveFolder; both disks are checked, each against the
+-- whole need (totalLen, times two when pEnc says encrypted: the .enc and its
+-- decrypted copy coexist until the temp is deleted). On one disk - the usual case -
+-- that is exactly the design's rule; across two it over-asks, which fails closed.
+function qsOnionDiskShortfall pTotal, pEnc, pTempPath, pSaveFolder
+   local tNeed, tTmpDir, tSavedID, tAvail, tWhy
+   put pTotal into tNeed
+   put "" into tWhy
+   if pEnc is not 0 and pEnc is not empty then
+      put pTotal * 2 into tNeed
+      put " (twice the file's size: an encrypted file is unlocked beside its download)" into tWhy
+   end if
+   if tNeed <= 0 then
+      return empty
+   end if
+   put pTempPath into tTmpDir
+   replace "\" with "/" in tTmpDir
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   delete the last item of tTmpDir
+   set the itemDelimiter to tSavedID
+   put qsFreeBytesAt(tTmpDir) into tAvail
+   if tAvail is not empty then
+      if tAvail < tNeed then
+         return "Not enough free disk space for this transfer: it needs about " & qsBytes(tNeed) & tWhy & \
+            ", and only " & qsBytes(tAvail) & " is free on the disk holding " & tTmpDir & \
+            ". Nothing was downloaded - free some space, then try the code again."
+      end if
+   end if
+   put qsFreeBytesAt(pSaveFolder) into tAvail
+   if tAvail is not empty then
+      if tAvail < tNeed then
+         return "Not enough free disk space for this transfer: it needs about " & qsBytes(tNeed) & tWhy & \
+            ", and only " & qsBytes(tAvail) & " is free on the disk holding " & pSaveFolder & \
+            ". Nothing was downloaded - free some space, then try the code again."
+      end if
+   end if
+   return empty
+end qsOnionDiskShortfall
+
 -- The receive state machine (section 3.3): reassemble the header, then drain
 -- length-prefixed frames into a temp file, draining+compacting the buffer each call
 -- so the payload never dwells whole in a Data.
 command qsOnionRecvData pStream, pData
-   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload, tShort
    if sRxState[pStream] is empty or sRxState[pStream] is "done" then
       exit qsOnionRecvData   -- already finished/cleared; ignore any trailing bytes
    end if
@@ -4658,6 +4897,13 @@ command qsOnionRecvData pStream, pData
       put tTotal into sOnionXfers[pStream]["total"]
       put 0 into sRxGot[pStream]
       put qsTempEncPath() into sRxTmp[pStream]
+      -- design 3.3: refuse up front a transfer this machine cannot hold, BEFORE the
+      -- temp opens, rather than meet a full disk on a write halfway through
+      put qsOnionDiskShortfall(tTotal, sRxEnc[pStream], sRxTmp[pStream], sRxSave[pStream]) into tShort
+      if tShort is not empty then
+         qsOnionRecvAbort pStream, tShort
+         exit qsOnionRecvData
+      end if
       open file sRxTmp[pStream] for binary write
       if the result is not empty then
          qsOnionRecvAbort pStream, "Could not open a temp file to receive into."

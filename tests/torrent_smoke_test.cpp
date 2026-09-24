@@ -37,12 +37,41 @@
  * The byte-exact record framing itself is pinned WITHOUT libtorrent by
  * tests/record_handle_test.cpp + tests/record_golden_test.py; here we only check
  * that what the live shim emits is well-formed under that same framing.
+ *
+ * Added 2026-09-24, the boundary rows for the 2026-09 fixes (the work plan's
+ * torrentxt coding row 3 - "the three 2026-09 fixes have no test that would
+ * catch their regression"):
+ *
+ *   6. test_dht_bep44_caps: the BEP44 caps AT their boundaries. 996 raw bytes
+ *      accepted and 997 refused by both self-bencoding puts, the accepted
+ *      value's target proven to be the SHA-1 of exactly 1000 bencoded bytes,
+ *      and the two ALREADY-bencoded paths (signbuf, put_signed) held at 1000
+ *      and 1001 so a "consistency fix" down to 996 fails too.
+ *   7. test_alerts_dropped_report: libtorrent's own queue overflow, forced with
+ *      alert_queue_size = 1 through the public ABI, surfaces on btLastError()
+ *      after the drain; a drain with nothing dropped says nothing.
+ *   8. test_pre_model_c_btxtor1_magnet: the native half of the Model C
+ *      register #17 (a pre-Model-C QuickShare fed a BTXTOR1: code).
+ *
+ * The third fix, the bounded rp1 inbound queue, is not reachable through the
+ * public ABI without a peer flooding a live session, so it has its own test,
+ * tests/rp1_queue_test.cpp, which compiles the shim source into itself.
  */
 
 #include "../src/torrent_shim.h"   /* the btx_* ABI + the btx::test hooks      */
 #include "../src/btx_record.h"     /* the same record walker the LCB mirrors   */
 
+/* Two libtorrent headers, and only for EVIDENCE the test computes itself:
+ * lt::hasher proves an immutable target is the SHA-1 of the bytes we expect
+ * the shim to have bencoded (so the test does not trust the shim to grade its
+ * own homework), and LIBTORRENT_VERSION_NUM selects the one row whose answer
+ * is libtorrent's rather than ours (test_pre_model_c_btxtor1_magnet). Both
+ * ride in as SYSTEM includes through the target, so -Wall stays ours. */
+#include <libtorrent/hasher.hpp>
+#include <libtorrent/version.hpp>
+
 #include <cstdio>
+#include <cstdlib>     /* std::atoi, reading the dropped-types count  */
 #include <cstring>
 #include <string>
 #include <vector>
@@ -693,6 +722,265 @@ static void test_dht_bep44() {
     CHECK(btx::test::live_session_count() == 0);
 }
 
+/* =========================================================================
+ *  6. The BEP44 caps, pinned AT their boundaries (added 2026-09-24)
+ *
+ *  WHY THE OLD ROW WAS NOT ENOUGH. The 2026-09-08 fix moved the raw cap of the
+ *  two self-bencoding puts from 1000 to 996 (kBep44MaxRawValue: "996:" is four
+ *  bytes, 4 + 996 = 1000, BEP44's limit on the BENCODED v). The only oversize
+ *  row above was 1001 - which the pre-fix cap of 1000 ALSO refused. So a
+ *  regression straight back to the defect (1000 raw bytes accepted, 1005 on
+ *  the wire, every node silently refusing the store) passed this file green.
+ *  The boundary PAIR is what pins a cap: 996 in, 997 out.
+ *
+ *  And the other side of the same comment in the shim: signbuf and put_signed
+ *  take ALREADY-bencoded bytes and keep 1000. They are pinned at 1000/1001
+ *  here too, because the likeliest well-meant regression of a fix like this
+ *  one is a later pass "making the four caps consistent".
+ * ========================================================================= */
+static std::string sha1_hex(const std::string &bytes) {
+    lt::hasher h(bytes.data(), static_cast<int>(bytes.size()));
+    const lt::sha1_hash d = h.final();
+    const std::string raw(d.data(), static_cast<std::size_t>(d.size()));
+    static const char hexd[] = "0123456789abcdef";
+    std::string out;
+    for (const char c : raw) {
+        const unsigned char b = static_cast<unsigned char>(c);
+        out += hexd[b >> 4];
+        out += hexd[b & 15];
+    }
+    return out;
+}
+
+static void test_dht_bep44_caps() {
+    unsigned char kp[512];
+    int n = btx_dht_keypair("", kp, sizeof kp);
+    CHECK(n > 0);
+    const std::string pubHex = field_text(kp, n, btx::F_DHT_PUBLIC_KEY);
+    const std::string secHex = field_text(kp, n, btx::F_DHT_SECRET_KEY);
+
+    int s = btx_session_new();
+    CHECK(s > 0);
+
+    const std::string at996(996, 'x');
+    const std::string over997(997, 'x');
+    char tgt[64];
+
+    /* immutable: 996 raw bytes take a target; 997 do not, and say why. */
+    btx_clear_error();
+    CHECK(btx_dht_put_immutable(s, at996.data(), 996, tgt, sizeof tgt) == 40);
+    CHECK(read_last_error().empty());
+    /* The target is SHA-1(bencode(v)), computed HERE, independently: if the
+     * shim bencoded the 996 bytes as anything but "996:" + the bytes - exactly
+     * 1000 on the wire - this does not match, and the whole reason for 996 is
+     * gone. */
+    CHECK(std::string(tgt, 40) == sha1_hex("996:" + at996));
+    btx_clear_error();
+    CHECK(btx_dht_put_immutable(s, over997.data(), 997, tgt, sizeof tgt) == 0);
+    CHECK(read_last_error().find("996") != std::string::npos);
+
+    /* mutable: the same pair, through the other self-bencoding put. */
+    btx_clear_error();
+    CHECK(btx_dht_put_mutable(s, pubHex.c_str(), secHex.c_str(), "",
+                              at996.data(), 996) == BTX_OK);
+    CHECK(btx_dht_put_mutable(s, pubHex.c_str(), secHex.c_str(), "",
+                              over997.data(), 997) == BTX_ERR_INVALID_ARG);
+    CHECK(read_last_error().find("996") != std::string::npos);
+
+    /* The ALREADY-bencoded paths keep 1000: "996:" + 996 bytes IS a 1000-byte
+     * bencoded v, and it must be accepted whole; one byte more is refused. */
+    const std::string v1000 = "996:" + at996;    /* 1000 bytes, bencoded     */
+    const std::string v1001 = "997:" + over997;  /* 1001 bytes, bencoded     */
+    CHECK(v1000.size() == 1000 && v1001.size() == 1001);
+    std::vector<char> sbuf(2048);
+    int sblen = btx_dht_bep44_signbuf("", "1", v1000.data(), 1000,
+                                      sbuf.data(), static_cast<int>(sbuf.size()));
+    /* 3:seqi1e1:v then the value verbatim: 11 + 1000 bytes. */
+    CHECK(sblen == 11 + 1000);
+    btx_clear_error();
+    CHECK(btx_dht_bep44_signbuf("", "1", v1001.data(), 1001,
+                                sbuf.data(), static_cast<int>(sbuf.size())) == 0);
+    CHECK(read_last_error().find("1000") != std::string::npos);
+
+    /* put_signed at 1000: signed through the same helper the external-signing
+     * KAT above uses, then accepted; at 1001 it is refused by the LENGTH check
+     * (the error names the cap), before the signature is even looked at. */
+    const char *seed =
+        "cac73f09a0478224974a525036ebd73f9727ac8932162eb7fcfb2821ad7eecc7";
+    char pub[65] = {0}, sig[129] = {0};
+    CHECK(btx::test::dht_bep44_sign(seed, "", "1", v1000.data(), 1000,
+                                    pub, sig) == 1);
+    CHECK(btx_dht_put_signed(s, pub, "", "1", v1000.data(), 1000, sig) == BTX_OK);
+    btx_clear_error();
+    CHECK(btx_dht_put_signed(s, pub, "", "1", v1001.data(), 1001, sig)
+          == BTX_ERR_INVALID_ARG);
+    CHECK(read_last_error().find("1000") != std::string::npos);
+
+    btx_session_free(s);
+    CHECK(btx::test::live_session_count() == 0);
+}
+
+/* =========================================================================
+ *  7. libtorrent's OWN queue overflow reaches the app (added 2026-09-24)
+ *
+ *  The 2026-09-10 fix: alerts_dropped_alert, libtorrent's report that ITS
+ *  alert queue filled between two drains, used to be unmapped, so the report
+ *  of the drop was dropped too. btx_pop_alerts now counts it and says so
+ *  through the last-error channel until ABI 12 gives it an alert code. This
+ *  forces a real overflow through the PUBLIC ABI, no hook:
+ *
+ *  alert_queue_size = 1 (libtorrent 2.0's alert_manager admits an alert of
+ *  priority p while queue.size() / (1 + p) < limit - so with limit 1 the queue
+ *  holds at most three critical alerts, and alerts_dropped_alert itself, at
+ *  meta priority, still fits: its bound is four). Every btx_add_magnet posts a
+ *  critical add_torrent_alert SYNCHRONOUSLY (add_torrent is a blocking call on
+ *  the network thread, after the settings post that precedes it), so five adds
+ *  with no drain between them drop at least two, deterministically - no
+ *  network, no timing. The source read for that arithmetic was libtorrent
+ *  2.0.10's alert_manager (emplace_alert, get_all); this row is what keeps it
+ *  honest on whatever libtorrent a lane links.
+ *
+ *  THE FIRST DRAFT OF THIS ROW FAILED, and the reason is a property of the
+ *  thing under test, so it is kept. It lowered the limit and added at once:
+ *  the four listen_succeeded alerts a new session queues had arrived under
+ *  the DEFAULT limit, so the queue already held four when the limit fell to
+ *  one - every add was dropped, and then get_all's own alerts_dropped_alert
+ *  (bound: size / 4 < 1) was dropped TOO, and m_dropped was reset with it.
+ *  libtorrent loses the report of a drop whenever the queue is at four times
+ *  the limit or more when the drain comes - reachable only by lowering the
+ *  limit under a full queue at run time, but reachable. The row therefore
+ *  drains AFTER the limit is live, so everything left in the queue was
+ *  admitted under it.
+ * ========================================================================= */
+static void test_alerts_dropped_report() {
+    int s = btx_session_new();
+    CHECK(s > 0);
+    std::vector<unsigned char> buf(65536);
+    const int cap = static_cast<int>(buf.size());
+    char v[32];
+
+    CHECK(btx_set_int(s, "alert_queue_size", "1") == BTX_OK);
+    /* btx_get_setting is a SYNCHRONOUS round trip to the network thread, so
+     * once it returns the limit is live; it also proves the key took. */
+    int vn = btx_get_setting(s, "alert_queue_size", v, static_cast<int>(sizeof v));
+    CHECK(vn == 1 && v[0] == '1');
+    /* Empty the queue of everything admitted under the default limit (see the
+     * note above); from here on the queue never holds more than three. */
+    for (int i = 0; i < 3; ++i) btx_pop_alerts(s, buf.data(), cap);
+
+    const char *hashes[] = {
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444",
+        "5555555555555555555555555555555555555555",
+    };
+    std::vector<int> ids;
+    for (const char *ih : hashes) {
+        /* .invalid (RFC 2606) so no row here announces to a real tracker. */
+        const std::string mag = std::string("magnet:?xt=urn:btih:") + ih
+                              + "&tr=udp://tracker.invalid:1337/announce";
+        int t = btx_add_magnet(s, mag.c_str(), "/tmp");
+        CHECK(t > 0);
+        if (t > 0) ids.push_back(t);
+    }
+
+    btx_clear_error();
+    CHECK(btx_pop_alerts(s, buf.data(), cap) >= 0);
+    const std::string err = read_last_error();
+    const std::string want = "alerts: libtorrent dropped alerts of ";
+    CHECK(err.compare(0, want.size(), want) == 0);
+    CHECK(err.find(" type(s) since the last drain") != std::string::npos);
+    /* the count is of dropped alert TYPES and is at least one */
+    CHECK(err.size() > want.size()
+          && std::atoi(err.c_str() + want.size()) >= 1);
+
+    /* ...and the report is not sticky: with the default limit restored and
+     * whatever was dropped before the restore flushed out, a drain that drops
+     * nothing leaves the last error empty. Without this half, a shim that
+     * reported on EVERY drain would pass the row above. */
+    CHECK(btx_set_int(s, "alert_queue_size", "1000") == BTX_OK);
+    vn = btx_get_setting(s, "alert_queue_size", v, static_cast<int>(sizeof v));
+    CHECK(vn == 4 && std::string(v, 4) == "1000");
+    for (int i = 0; i < 3; ++i) btx_pop_alerts(s, buf.data(), cap);
+    btx_clear_error();
+    CHECK(btx_pop_alerts(s, buf.data(), cap) >= 0);
+    CHECK(read_last_error().empty());
+
+    for (int t : ids) btx_remove(s, t, 0);
+    btx_session_free(s);
+}
+
+/* =========================================================================
+ *  8. Model C register #17, the native half (added 2026-09-24)
+ *
+ *  The last QuickShare before Model C is TorrentXT's examples/torrent-
+ *  quickshare.livecodescript at commit 05dc02f (2026-06-29; unchanged through
+ *  50218ef, the parent of 7414dfe, "quickshare: optional Tor anonymity (Model
+ *  C) via OnionXT", 2026-07-02; blob e43cfdd). Its qsGetFile knows two
+ *  prefixes: BTXQS1: and magnet:. Anything else is lowercased and, if it is
+ *  EXACTLY 40 or 64 characters, becomes "magnet:?xt=urn:btih:" & code & "&tr="
+ *  & qsTracker() and goes straight to btAddMagnet; any other length is refused
+ *  with "That does not look like a share code". A well-formed BTXTOR1: code is
+ *  never 40 or 64 characters (the prefix and a v3 onion alone are 70), so it is
+ *  refused by the script before this layer - tests/onion_frame_golden.py pins
+ *  that half. What reaches HERE is a TRUNCATED code of exactly 40 or 64
+ *  characters, and what happens to it is libtorrent's magnet parser:
+ *
+ *    64: "urn:btih:" + 64 characters is neither 40 (hex) nor 32 (base32), so
+ *        every libtorrent refuses it with invalid_info_hash - a clean refusal.
+ *    40: libtorrent 2.0.x (magnet_uri.cpp, 2.0.10 and 2.0.11) calls from_hex
+ *        on a 40-character btih and IGNORES ITS RESULT, so a non-hex value is
+ *        ACCEPTED as whatever from_hex wrote before it stopped. "btxtor1:..."
+ *        stops at the 't': the torrent added is info-hash b000...0, which then
+ *        announces and looks up peers for nothing. libtorrent 2.1.1 checks the
+ *        result and refuses. FOUND 2026-09-24 writing this row: the Linux and
+ *        mac binaries link 2.0.11 and the Windows DLLs 2.1.1, so the SAME
+ *        truncated code is refused on Windows and joins a phantom swarm
+ *        elsewhere. The same gap swallows ANY 40-character non-hex code, not
+ *        only this one (the shipped qsGetFile still checks length, not hex).
+ *        The fix belongs in btx_add_magnet (refuse a non-hex btih before
+ *        parse_magnet_uri) and is a native change, so it waits for a release
+ *        dispatch; this row PINS the current answer per libtorrent version so
+ *        that fix, or a libtorrent upgrade, flips it deliberately.
+ * ========================================================================= */
+static void test_pre_model_c_btxtor1_magnet() {
+    int s = btx_session_new();
+    CHECK(s > 0);
+    /* A v3-onion-shaped body: base32 lowercase, as the old code lowercases. */
+    const std::string onion56 =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndfpvoaaaa";
+    CHECK(onion56.size() == 56);
+    const std::string code64 = "btxtor1:" + onion56;               /* 64 */
+    const std::string code40 = "btxtor1:" + onion56.substr(0, 32); /* 40 */
+    CHECK(code64.size() == 64 && code40.size() == 40);
+    const std::string tr = "&tr=udp://tracker.invalid:1337/announce";
+
+    btx_clear_error();
+    CHECK(btx_add_magnet(s, ("magnet:?xt=urn:btih:" + code64 + tr).c_str(),
+                         "/tmp") == 0);
+    CHECK(read_last_error().find("bad magnet URI") != std::string::npos);
+
+    btx_clear_error();
+    int t = btx_add_magnet(s, ("magnet:?xt=urn:btih:" + code40 + tr).c_str(),
+                           "/tmp");
+#if LIBTORRENT_VERSION_NUM >= 20100
+    CHECK(t == 0);
+    CHECK(read_last_error().find("bad magnet URI") != std::string::npos);
+#else
+    CHECK(t > 0);   /* accepted: the 2.0.x from_hex gap, recorded above */
+    if (t > 0) {
+        char ih[64];
+        int n = btx_info_hash_hex(t, ih, static_cast<int>(sizeof ih));
+        CHECK(n == 40);
+        CHECK(std::string(ih, n > 0 ? static_cast<size_t>(n) : 0)
+              == "b000000000000000000000000000000000000000");
+        CHECK(btx_remove(s, t, 0) == BTX_OK);
+    }
+#endif
+    btx_session_free(s);
+}
+
 /* rp1 (the BEP10 extension) — the parts reachable without a live peer: the wire
  * FRAMING and extended-id selection are byte-pinned here; the session lifecycle
  * (enable/add/send/poll) is exercised for clean returns and memory safety. The
@@ -777,8 +1065,8 @@ static void test_port_mapping() {
  * abort rather than flushed.
  *
  * A test that can be aborted must therefore say where it got to as it goes.
- * The cost is eleven lines of output on a green run; the alternative is a
- * failure whose only information is that it happened. */
+ * The cost is one line of output per section on a green run; the alternative
+ * is a failure whose only information is that it happened. */
 #define RUN(fn)                                                                \
     do {                                                                       \
         std::printf("-- %s\n", #fn);                                           \
@@ -799,6 +1087,9 @@ int main() {
     RUN(test_alert_drain_roundtrip);
     RUN(test_drain_oversized_makes_progress);
     RUN(test_dht_bep44);
+    RUN(test_dht_bep44_caps);
+    RUN(test_alerts_dropped_report);
+    RUN(test_pre_model_c_btxtor1_magnet);
     RUN(test_rp1);
     RUN(test_port_mapping);
 

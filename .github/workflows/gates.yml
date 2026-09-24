@@ -11,6 +11,26 @@
 # timed or extension-touching stays 'verified statically; needs an OXT
 # pass' (the honesty convention).
 #
+# THE SIBLINGS COME FROM THE SUITE. Some of this member's gates reach
+# into sibling members (riptide, nostrxt, sodiumxt) - a committed binary to execute
+# against, an interpreter or a boot runner to reuse rather than copy -
+# and find them as ../<name> beside the member, so this job checks the
+# member out into a directory named after it and puts each sibling
+# beside it. The siblings are taken from the suite itself
+# (SethMorrowSoftware/xtalk-suite), at the suite commit this tree was
+# published from: the newest `Suite-Commit:` trailer on the
+# first-parent line, which the suite's publisher
+# (tools/publish-members.py) stamps on every commit it writes.
+# So the siblings are the versions the suite's gates ran WITH this tree,
+# not whatever each sibling's own repository holds when the job starts -
+# a publish updates the repositories one after another, and a private
+# or not-yet-published sibling would not be readable at all. A history
+# with no trailer (never published) takes the suite's main.
+# XTALK_REQUIRE_SIBLINGS turns 'sibling absent, tier skipped' into a
+# failure: in CI a skip and a pass both exit 0, and a lane that can pass
+# by measuring nothing is the shape the suite's
+# tests/cross-member-test.py records.
+#
 # Do not edit by hand: edit tools/member-registry.py or the generator in
 # the suite and re-run `python3 tools/sync-member-workflows.py`; the
 # suite's publisher carries the result into this member's repository.
@@ -28,10 +48,47 @@ jobs:
   gates:
     name: static gates + golden vectors + execution gates
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: torrentxt
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: torrentxt
+          # The whole history: the next step walks back to the newest
+          # commit the suite published.
+          fetch-depth: 0
+      - name: Which suite commit this tree was published from
+        id: suite
+        run: |
+          sha="$(git log -1 --first-parent --grep='^Suite-Commit: ' \
+                --format='%(trailers:key=Suite-Commit,valueonly,separator=%x2C)' HEAD)"
+          sha="${sha##*,}"
+          if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::notice::no Suite-Commit trailer in this history - the siblings come from the suite's main"
+            sha=main
+          fi
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check out the siblings from the suite at that commit
+        uses: actions/checkout@v4
+        with:
+          repository: SethMorrowSoftware/xtalk-suite
+          ref: ${{ steps.suite.outputs.ref }}
+          path: .xtalk-suite
+          sparse-checkout: |
+            riptide
+            nostrxt
+            sodiumxt
+      - name: Put the siblings beside the member
+        working-directory: ${{ github.workspace }}
+        run: |
+          mv .xtalk-suite/riptide riptide
+          mv .xtalk-suite/nostrxt nostrxt
+          mv .xtalk-suite/sodiumxt sodiumxt
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - name: Run the member's own gates
+        env:
+          XTALK_REQUIRE_SIBLINGS: "1"
         run: bash tools/run-gates.sh

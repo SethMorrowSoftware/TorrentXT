@@ -256,9 +256,12 @@ than write a poll loop, you `start using stack "torrentHelpers"` (or set it as a
 behavior) and then handle plain messages as TorrentXT events arrive. It drains the
 engine's event buffer on a timer with one FFI call and `send`s one semantic message
 per event, which keeps the "never call script from an engine thread" rule while
-letting you write normal event handlers. The four demos above already include their
-own poll loops, so you do not need this to run them; reach for it when you are
-building something new.
+letting you write normal event handlers. Both event queues it drains are bounded,
+so a poll interval slow enough to fill one loses events; when a drain reports that
+(through `btLastError()`), the helper sends one more message, `torrentPollWarning`,
+naming the queue and the loss (see `../docs/api-reference.md`). The four demos above
+already include their own poll loops, so you do not need this to run them; reach for
+it when you are building something new.
 
 ## Troubleshooting
 

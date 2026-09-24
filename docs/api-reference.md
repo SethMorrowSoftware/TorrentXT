@@ -660,7 +660,7 @@ harness calls them).
 |---|---|---|---|
 | `btStartPolling` | command | `btStartPolling pSession, pTarget, pIntervalMs` | Arm the drain timer for `pSession`; dispatch each event to `pTarget` (default: the current card) every `pIntervalMs` ms (default `250`). Reschedules itself. |
 | `btStopPolling` | command | `btStopPolling` | Disarm the timer. Safe when not polling. |
-| `btTorrentPollOnce` | command | (internal) | One drain pass: `btPoll` then `btRp1Poll`, `dispatch` per event (plus a catch-all `torrentEvent`), reschedule. You normally do not call this directly. It does not read `btLastError()` after the drains; an app that must notice a queue overflow reads it itself. |
+| `btTorrentPollOnce` | command | (internal) | One drain pass: `btPoll` then `btRp1Poll`, `dispatch` per event (plus a catch-all `torrentEvent`), reschedule. You normally do not call this directly. It clears the last error before each drain and reads `btLastError()` right after it, so a queue overflow reaches the target as a `torrentPollWarning` event (below). |
 | `btFormatBytes` | function | `btFormatBytes(pBytes)` | Humanise a byte count to `B`/`KiB`/`MiB`/`GiB`/`TiB`, one decimal. |
 | `btStateName` | function | `btStateName(pState)` | Map a `state` int to a label (see the state table below). |
 
@@ -668,6 +668,16 @@ The interval is a **latency/CPU knob within the queue caps**: libtorrent buffers
 between drains, so at a normal cadence only worst-case event latency scales with it,
 but a queue that fills between two drains drops (see `btPoll` and `btRp1Poll`).
 250 ms suits a UI; tighten for a busy session or a very smooth live dashboard.
+
+**`torrentPollWarning`** is the helper's one synthetic event: a drain whose
+`btLastError()` came back non-empty (the interim overflow reports, until ABI 12
+gives them alert codes). The array carries `name` (`torrentPollWarning`),
+`torrent` (`0`), `source` (`btPoll` or `btRp1Poll`) and `message` (the shim's text,
+e.g. `rp1: 3 inbound event(s) shed - ...`). It is dispatched after that drain's
+events and through the `torrentEvent` catch-all too; handle it with
+`on torrentPollWarning pEvent`. Because the helper clears the last error before
+each drain, the report stays readable through `btLastError()` only until the next
+pass. (Verified statically; needs an OXT pass.)
 
 ---
 

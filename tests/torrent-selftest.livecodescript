@@ -9,7 +9,10 @@ script "torrentSelfTest"
 --
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI, starts a
--- TorrentXT session, runs 96 checks, and shows a green/red list. Needs the loaded
+-- TorrentXT session, runs its checks (the summary line counts them: 101 on the
+-- engine, last counted 2026-08-24; 106 expected since the 2026-09-24 BEP44
+-- size-boundary rows below, verified statically; needs an OXT pass), and shows
+-- a green/red list. Needs the loaded
 -- org.openxtalk.library.torrent (v8+; the current ABI is v11). Run it STANDALONE -
 -- only one TorrentXT session may be live per OXT process, so close any client/demo
 -- stack first.
@@ -487,6 +490,29 @@ command stRun
    stAssert "btDhtGetImmutable accepts the target (async)", (btDhtGetImmutable(sSession, tTarget) is 0)
    stAssert "btDhtPutMutable signs + queues", (btDhtPutMutable(sSession, tKey["publicKey"], tKey["secretKey"], "", textEncode("v1", "UTF-8")) is 0)
    stAssert "btDhtGetMutable accepts the key (async)", (btDhtGetMutable(sSession, tKey["publicKey"], "") is 0)
+   -- THE SIZE BOUNDARY, through the binding (added 2026-09-24). BEP44 caps the
+   -- BENCODED value at 1000 bytes and these two puts bencode for you, so the
+   -- raw cap is 996 ("996:" + 996 = 1000); the shim has refused 1000 raw
+   -- bytes only since 2026-09-08 (the committed binaries carry that from the
+   -- 2026-09-12 dispatch). Nothing held the boundary: the smoke test refused
+   -- only 1001, which the old cap refused too. A boundary is pinned by the
+   -- PAIR, so on a binary older than that dispatch the two 997 rows FAIL,
+   -- which is the point. The refusal legs never reach the network; the
+   -- 996-byte puts go to the DHT exactly like the short values above.
+   local tAt996, tOver997, tBigTarget
+   put empty into tAt996
+   repeat 996 times
+      put "x" after tAt996
+   end repeat
+   put tAt996 & "x" into tOver997
+   put btDhtPutImmutable(sSession, textEncode(tAt996, "UTF-8")) into tBigTarget
+   stAssert "btDhtPutImmutable takes 996 raw bytes (1000 bencoded)", (the number of chars of tBigTarget is 40)
+   btClearError
+   put btDhtPutImmutable(sSession, textEncode(tOver997, "UTF-8")) into tBigTarget
+   stAssert "btDhtPutImmutable refuses 997 raw bytes (1001 bencoded)", (tBigTarget is empty)
+   stAssert "...and btLastError names the 996 cap", (btLastError() contains "996")
+   stAssert "btDhtPutMutable takes 996 raw bytes", (btDhtPutMutable(sSession, tKey["publicKey"], tKey["secretKey"], "", textEncode(tAt996, "UTF-8")) is 0)
+   stAssert "btDhtPutMutable refuses 997 raw bytes (-3)", (btDhtPutMutable(sSession, tKey["publicKey"], tKey["secretKey"], "", textEncode(tOver997, "UTF-8")) is -3)
 
    stSection "signed puts, rendezvous, NAT mapping, rp1 (the v9-v11 surface)"
    -- btDhtBep44SignBuf hands back the EXACT bytes libtorrent signs, so a

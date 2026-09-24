@@ -166,9 +166,11 @@ be tested, the rest is gated statically, and the engine pass closes the gap:
 | record framing + handle safety | `tests/record_handle_test.cpp` (ASan/UBSan) | anywhere (no libtorrent) |
 | record byte format | `tests/record_golden_test.py` | anywhere |
 | BEP44 buffers, file server, onion framing | `tests/bep44_golden_test.py`, `tests/fileserver_golden.py`, `tests/onion_frame_golden.py` | anywhere |
+| the demos' Model C receive paths, run headlessly against those mirrors (and the verifier and M9 feed seal on the committed SodiumXT) | `tools/check-script-vectors.py` + `tools/test-script-vectors.py` | anywhere, with the riptide, nostrxt and sodiumxt siblings beside it |
 | LCB <-> header registry | `tools/check-record-registry.py` | anywhere |
 | `.lcb` / `.livecodescript` hygiene | `tools/check-livecodescript.py` | anywhere |
 | shim over libtorrent | `tests/torrent_smoke_test.cpp` (ASan/UBSan) | CI (needs libtorrent) |
+| the bounded rp1 inbound queue | `tests/rp1_queue_test.cpp` (ASan/UBSan; compiles the shim source in) | CI (needs libtorrent) |
 | rp1 on the wire, two sessions on loopback | `tests/rp1_integration_test.cpp` | CI (needs libtorrent) |
 | the binding on a real engine | `tests/torrent-selftest.livecodescript`, folded into the suite paste | an OXT pass: 101/101 on Windows, last counted 2026-08-24 |
 | end-to-end against a real swarm | a legal, checksummed torrent (e.g. a Linux ISO) verified against its published hash | manual; not yet run |

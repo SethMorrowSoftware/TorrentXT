@@ -8,10 +8,19 @@ script "torrentHelpers"
 -- The model (plan section 3, carried verbatim from ShowControl): the engine NEVER
 -- calls back into script. libtorrent buffers every event on its own threads;
 -- we drain that buffer on a timer with ONE FFI round-trip (btPoll), then `send`
--- one semantic message per event. Throughput and event integrity are
--- independent of the poll cadence - only worst-case latency scales with it - so
--- the interval is a documented latency/CPU knob (250 ms is plenty for a UI;
--- tighten only for very smooth live dashboards).
+-- one semantic message per event. The interval is a latency/CPU knob ONLY
+-- WITHIN THE QUEUE CAPS (250 ms is plenty for a UI): both queues upstream of
+-- the drain are bounded, so a cadence slow enough to fill one LOSES events
+-- rather than delaying them. libtorrent's alert queue holds alert_queue_size
+-- alerts (1000 by default) and drops the excess; the rp1 inbound queue sheds
+-- its newest events past 65536 events or 32 MiB, and each btRp1Poll drains at
+-- most 64 KiB (about 262 KB/s at 250 ms). (This header used to call throughput
+-- and event integrity "independent of the poll cadence"; that stopped being
+-- true when the caps landed in the 2026-09-12 binaries - torrentxt/CLAUDE.md
+-- gotcha 6.) Until ABI 12 gives both losses an event code, the shim reports
+-- them through btLastError() at the end of the drain that follows the loss,
+-- and btTorrentPollOnce turns that report into a torrentPollWarning message
+-- (see there), so an app sees an overflow by handling one more message.
 
 -- script-local poll state (declared at top; LiveCode Script script-locals)
 local sPollSession      -- the session handle currently being polled (0/empty = none)
@@ -58,15 +67,36 @@ end btStopPolling
 -- then reschedule. btPoll returns a list of event arrays (see the key list in
 -- docs/api-reference.md); each array carries a "name" (the semantic message)
 -- and a "torrent" handle plus event-specific keys.
+--
+-- LOSS REPORTING (the interim until ABI 12; docs/api-reference.md, the btPoll
+-- and btRp1Poll sections). A drain that follows lost events leaves a line in
+-- btLastError(): "alerts: libtorrent dropped alerts of N type(s) ..." from
+-- btPoll, "rp1: N inbound event(s) shed ..." from btRp1Poll. That channel is
+-- STICKY - a clean drain never clears it, and any other bt* failure writes to
+-- it too - so reading it cold after a drain would report a stale error on
+-- every tick. Hence the shape below: btClearError immediately BEFORE each
+-- drain, btLastError() immediately AFTER it (before any event handler runs
+-- and makes bt* calls of its own), so a non-empty read is that drain's own
+-- report. It is dispatched as torrentPollWarning, one array like every other
+-- event ("name", "torrent" = 0, "source" = "btPoll" or "btRp1Poll",
+-- "message" = the shim's text), after that drain's events and through the
+-- torrentEvent catch-all as well. An app that ignores the message loses
+-- nothing it had: the report is left in btLastError() until the next pass
+-- clears it. Clearing on a timer cannot eat an app's own error, because a
+-- timer message never runs between an app's bt* call and its own
+-- btLastError() read unless that handler yields (`wait ... with messages`).
+-- Verified statically; needs an OXT pass (no harness drives this helper yet).
 command btTorrentPollOnce
-   local tEvents, tEvent, tName
+   local tEvents, tEvent, tName, tLoss
    if sPolling is not "true" then
       exit btTorrentPollOnce
    end if
    if sPollSession is empty or sPollSession is 0 then
       exit btTorrentPollOnce
    end if
+   btClearError
    put btPoll(sPollSession) into tEvents
+   put btLastError() into tLoss
    repeat for each element tEvent in tEvents
       put tEvent["name"] into tName
       if tName is not empty then
@@ -75,12 +105,17 @@ command btTorrentPollOnce
       -- also fire a catch-all so one handler can observe the whole stream
       dispatch "torrentEvent" to sPollTarget with tEvent
    end repeat
+   if tLoss is not empty then
+      btPollDispatchLoss "btPoll", tLoss
+   end if
    -- ALSO drain the rp1 extension's own event stream (peer up/down, handshake,
    -- message). It is a SEPARATE queue from btPoll and returns empty when rp1 is
    -- not enabled on the session, so this is a harmless no-op for normal apps and
    -- gives rp1 apps the same dispatch-by-name flow (rp1PeerConnected, rp1Handshake,
    -- rp1Message, rp1PeerDisconnected).
+   btClearError
    put btRp1Poll(sPollSession) into tEvents
+   put btLastError() into tLoss
    repeat for each element tEvent in tEvents
       put tEvent["name"] into tName
       if tName is not empty then
@@ -88,9 +123,26 @@ command btTorrentPollOnce
       end if
       dispatch "torrentEvent" to sPollTarget with tEvent
    end repeat
+   if tLoss is not empty then
+      btPollDispatchLoss "btRp1Poll", tLoss
+   end if
    -- reschedule (libtorrent keeps buffering between drains)
    send "btTorrentPollOnce" to me in (sPollInterval) milliseconds
 end btTorrentPollOnce
+
+-- Deliver one drain's btLastError() report as a torrentPollWarning event (the
+-- shape and the reasoning are in the comment above btTorrentPollOnce). Private:
+-- it is this file's plumbing, not API, and it keeps the helper's public surface
+-- exactly the five handlers docs/api-reference.md lists.
+private command btPollDispatchLoss pSource, pMessage
+   local tWarn
+   put "torrentPollWarning" into tWarn["name"]
+   put 0 into tWarn["torrent"]
+   put pSource into tWarn["source"]
+   put pMessage into tWarn["message"]
+   dispatch "torrentPollWarning" to sPollTarget with tWarn
+   dispatch "torrentEvent" to sPollTarget with tWarn
+end btPollDispatchLoss
 
 -- btFormatBytes N -- a small humaniser for dashboards (KiB/MiB/GiB).
 function btFormatBytes pBytes

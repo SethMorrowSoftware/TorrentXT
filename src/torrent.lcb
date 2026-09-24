@@ -1726,7 +1726,8 @@ public handler btDhtKeypair(in pSeed as String) returns Array
    return _parseRecord(_bufToData(sStatusPtr, tCount), 1)
 end handler
 
--- Store pData (1..1000 bytes) as an immutable item. Returns its target hash
+-- Store pData (1..996 bytes: BEP44 caps the BENCODED value at 1000, and the
+-- shim bencodes it; torrentxt/CLAUDE.md gotcha 7) as an immutable item. Returns its target hash
 -- (the lookup key) as hex, or "" on failure. The store confirms later as a
 -- dhtPut event.
 public handler btDhtPutImmutable(in pSession as Integer, in pData as Data) returns String
@@ -1758,7 +1759,7 @@ public handler btDhtGetImmutable(in pSession as Integer, in pTarget as String) r
    return tR
 end handler
 
--- Store pData (1..1000 bytes) as a mutable item under an ed25519 key; the
+-- Store pData (1..996 bytes, as btDhtPutImmutable) as a mutable item under an ed25519 key; the
 -- native layer signs it with pSecretKey (no script on the network thread).
 -- pSalt may be empty. Confirms as a dhtPut event.
 public handler btDhtPutMutable(in pSession as Integer, in pPublicKey as String, in pSecretKey as String, in pSalt as String, in pData as Data) returns Integer

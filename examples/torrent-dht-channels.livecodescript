@@ -67,7 +67,15 @@ script "dhtChannelsApp"
 -- any magnet link or info-hash directly, not only releases from channels.
 --
 -- It also includes a "Quick drop" panel using IMMUTABLE items: pin a short text,
--- get a 40-character content-address code, and fetch any code back.
+-- get a 40-character content-address code, and fetch any code back. Quick drop
+-- is PUBLIC and CLEARNET by design, even while a channel is anonymous: the text
+-- is stored in the open on the DHT (btDhtPutImmutable / btDhtGetImmutable, no
+-- anon check), put and fetched from the user's real IP. That is correct - it is
+-- outside the anon invariant (ONIONXT-INTEGRATION-PLAN 6.7) - but the original
+-- design's 7.3 Channels guard 4 asked that it stay VISIBLY labelled clearnet and
+-- never read as covered by an anon badge, so its section title, chPin's and
+-- chFetchBtn's tooltips and the help text say so (2026-09-24; its behaviour is
+-- unchanged).
 --
 -- Design follows the single-thread playbook: a 250 ms poll drains events, a 1 s
 -- loop repaints the transfers table, and a 60 s loop re-publishes your feed and
@@ -87,12 +95,16 @@ script "dhtChannelsApp"
 -- only anonymous between the two onion endpoints. See docs/ONIONXT-INTEGRATION-PLAN.md.
 --
 -- HONESTY (the suite convention): the torrent + BEP44 surface this demo drives
--- is engine-proven (the member selftest and the demo passes recorded in
--- torrentxt/CLAUDE.md), but THIS stack's UI was unified onto the suite kit
+-- is engine-proven through the member harness (tests/torrent-selftest.livecodescript,
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24) and riptide's two-machine BEP44
+-- runs (2026-08-13), both in the ledger in torrentxt/CLAUDE.md; no dated engine
+-- pass of THIS demo is recorded there, and its UI was unified onto the suite kit
 -- 2026-08-14 - the rebuilt chrome and layout are verified statically; needs an
--- OXT re-pass. The OnionXT anon-channels layer (Model C, built 2026-08-15) is
--- verified STATICALLY (tools/check-livecodescript.py); every ox* call still needs
--- an on-engine OXT pass with a running Tor daemon before any runtime claim.
+-- OXT re-pass. (This paragraph used to cite "demo passes recorded in
+-- torrentxt/CLAUDE.md"; the ledger holds harness and transport rows only.) The
+-- OnionXT anon-channels layer (Model C, built 2026-08-15) is verified STATICALLY
+-- (tools/check-livecodescript.py); every ox* call still needs an on-engine OXT
+-- pass with a running Tor daemon before any runtime claim.
 --
 -- THE LOOK is the suite UI kit, carried verbatim between the marker lines
 -- (master: tools/ui-kit.livecodescript; the drift gate holds every copy
@@ -120,12 +132,29 @@ script "dhtChannelsApp"
 -- ed25519 scalar clamp are pure byte manipulation.
 --
 -- STATUS: implemented AND run on a real OXT engine against a live tor daemon.
--- The core paths are confirmed on-engine: dialing through the SOCKS proxy, the
--- control-port connect + SAFECOOKIE auth, GETINFO / SETEVENTS, publishing a v3
--- onion service, accepting an inbound (Tor-forwarded) connection, streaming data
--- both ways, and bootstrap/HS_DESC events. The only path NOT yet exercised is the
--- optional Mode B (launching a bundled tor via `open process`), still flagged
--- "VERIFY:" below. The pure-compute paths are pinned by tools/onion-kat.py.
+-- The core paths are confirmed on-engine (onionxt/CLAUDE.md, the evidence
+-- ledger): dialing through the SOCKS proxy, the control-port connect +
+-- SAFECOOKIE auth, GETINFO / SETEVENTS, publishing a v3 onion service,
+-- accepting an inbound (Tor-forwarded) connection, streaming data both ways,
+-- and bootstrap/HS_DESC events. The offline surface runs inside every dated
+-- suite paste from 2026-08-10 (oxSelfTest), and the pure-compute paths are
+-- pinned by tools/onion-kat.py.
+--
+-- NOT yet exercised on an engine, each "verified statically; needs an OXT
+-- pass + a live-Tor pass" (the still-VERIFY list in onionxt/CLAUDE.md, which
+-- is the authority; this is its index): the optional Mode B launch
+-- (oxLaunchTor / oxStopTor over `open process`, including the 2026-09-24
+-- result checks); an OnionXT-to-OnionXT onion dial and the two-instance round
+-- trip; the raw socket id a live accept hands oxPeerAccepted; the 2026-08-23
+-- foreign-socket `pass` lines and the 2026-08-24 socket-message split on a
+-- live socket; the 2026-09-09 oxWrite result capture and callback pins; the
+-- four inline hypotheses (runbook B.12); and the live negative paths (a wrong
+-- cookie, a stalled daemon, a peer vanishing mid-handshake, and which of the
+-- two SOCKS timeout paths fires - distinguishable since 2026-09-24).
+-- Until 2026-09-24 this header said "the only path NOT yet exercised is the
+-- optional Mode B", which was true at bring-up and understated everything
+-- added since; a carried header is read in every stack that embeds this file
+-- and in the suite paste, so it lists rather than summarises.
 --
 -- Conventions (see CLAUDE.md): public API oxPascalCase; locals t..., params
 -- p..., script-locals s..., constants k...; SOCKS5 is BINARY (byte / numToByte /
@@ -969,9 +998,40 @@ command oxStreamDeadline pStream
    local tState
    put sStreams[pStream]["state"] into tState
    if tState is not "connected" and tState is not "closed" then
-      oxStreamFail pStream, "SOCKS handshake timed out"
+      oxStreamFail pStream, oxSocksTimeoutReason("deadline", tState)
    end if
 end oxStreamDeadline
+
+private function oxSocksTimeoutReason pWhich, pStage
+   -- TWO PATHS TIME A HANDSHAKE OUT, AND UNTIL 2026-09-24 THEY SAID THE SAME
+   -- WORDS. oxStreamDeadline above is OnionXT's own watchdog, armed by oxDial
+   -- for exactly kOxHandshakeTimeout ms; oxSocketTimeout below is the ENGINE's
+   -- socketTimeout message, which fires on the engine-global
+   -- socketTimeoutInterval (oxDial sets it, but so may any co-loaded library
+   -- that opens a socket after it). Both reported "SOCKS handshake timed out",
+   -- so the one real stall on record - the 2026-09-02 coin-wallet log, which
+   -- failed closed and retried - cannot say which of them fired, and engine
+   -- note 6.1 (socketTimeout REPEATS while a read is pending) stays
+   -- DOCUMENTED for want of exactly that observation.
+   --
+   -- So the reason now names the PATH and the STAGE the stream stalled in.
+   -- The stage is worth more than it looks: "connecting" means the TCP connect
+   -- to the SOCKS port never completed, "greeting" that the port accepted but
+   -- never answered the method negotiation (a stalled or not-yet-bootstrapped
+   -- tor), and "replyhead" that tor took the CONNECT and never reported back
+   -- (the circuit or the onion rendezvous is what stalled).
+   --
+   -- THE PREFIX IS KEPT VERBATIM. Every reason still begins with "SOCKS
+   -- handshake timed out", so a log search or an app that matched the old
+   -- words still matches; only the parenthesis is new. Verified statically;
+   -- needs an OXT pass + a live-Tor pass (a forced stall, runbook row 44).
+   if pWhich is "deadline" then
+      return "SOCKS handshake timed out (OnionXT deadline of " & kOxHandshakeTimeout & \
+            " ms passed, stalled at stage " & pStage & ")"
+   end if
+   return "SOCKS handshake timed out (engine socketTimeout fired, stalled at stage " & \
+         pStage & ")"
+end oxSocksTimeoutReason
 
 private command oxStreamFail pStream, pError
    -- Fail closed: report the error to the app, then close and forget the stream.
@@ -1719,7 +1779,9 @@ function oxSocketTimeout pSocketID
    if tHandle is not empty then
       put sStreams[tHandle]["state"] into tState
       if tState is not "connected" then
-         oxStreamFail tHandle, "SOCKS handshake timed out"
+         -- A different reason from oxStreamDeadline's on purpose: see
+         -- oxSocksTimeoutReason for why the two paths must be told apart.
+         oxStreamFail tHandle, oxSocksTimeoutReason("socketTimeout", tState)
       end if
       return "true"
    end if
@@ -1752,12 +1814,38 @@ end socketTimeout
 command oxLaunchTor pTorPath, pDataDir, pSocksPort, pControlPort
    -- Write a minimal torrc into pDataDir and launch pTorPath against it, so tor
    -- exits with the app (__OwningControllerProcess) and uses cookie auth. Returns
-   -- empty on a clean launch attempt, or an error string. The caller then polls
-   -- oxConnectControl / oxBootstrapProgress; this does not wait for bootstrap.
+   -- empty once the torrc is written AND `open process` has accepted the command
+   -- line, or an "OnionXT: ..." error string (docs/05's command contract). The
+   -- caller then polls oxConnectControl / oxBootstrapProgress; this does not wait
+   -- for bootstrap, and an empty result does NOT mean tor is up - only that the
+   -- engine started what it was given (tor can still exit on a bad torrc or a
+   -- port already in use: runbook trap 5.3.1).
+   --
+   -- BOTH RESULTS ARE READ, AND UNTIL 2026-09-24 NEITHER WAS. The torrc write
+   -- and `open process` report a failure through `the result` (the engine's
+   -- command convention; not yet observed for these two on OXT), and this
+   -- handler ignored both and returned empty unconditionally - so a data
+   -- directory that did not exist, or a read-only one, came back as a clean
+   -- launch, and so did any launch failure the engine reported; closing-pass
+   -- leg F's first PASS line ("torrc written, process started") claimed more
+   -- than the code had checked. Each is now captured on the very next line
+   -- (any intervening statement can clear `the result`: the oxWrite
+   -- discipline) and fails closed with a reason that names what failed. Both
+   -- sit inside try/catch as well, because a platform with no process support
+   -- may THROW rather than set the result, and a library command must answer
+   -- with a string either way. What this cannot promise: that a WRONG tor path
+   -- is reported here at all - an engine that forks and then execs may learn
+   -- of it only when the child dies, after this has returned. Leg F records
+   -- what OXT does. Verified statically; needs an OXT pass + a live-Tor pass.
+   --
+   -- The two empty-argument refusals come FIRST, before anything touches disk
+   -- or changes state, which is what lets the offline harness call
+   -- `oxLaunchTor empty, empty, empty, empty` by name (onionxt-tests section 3)
+   -- instead of carrying a coverage exemption for it.
    if pTorPath is empty or pDataDir is empty then
       return "OnionXT: oxLaunchTor needs a tor binary path and a data directory"
    end if
-   local tSocks, tControl, tTorrc, tRcPath
+   local tSocks, tControl, tTorrc, tRcPath, tLogPath, tWriteErr, tLaunchErr, tError
    if pSocksPort is empty then
       put kOxSocksPortDefault into tSocks
    else
@@ -1774,10 +1862,34 @@ command oxLaunchTor pTorPath, pDataDir, pSocksPort, pControlPort
    put "DataDirectory " & pDataDir & oxCrlf() after tTorrc
    -- Tie tor's lifetime to this process where the platform supports it.
    put "__OwningControllerProcess " & oxProcessId() & oxCrlf() after tTorrc
+   -- TOR'S LOG GOES TO A FILE, NOT TO THE PIPE (2026-09-24). The process is
+   -- opened `for read` and nothing ever reads it, and tor's default is notice
+   -- logging to stdout - so a long-running child writing into a pipe nobody
+   -- drains could fill the pipe buffer and block inside its next log write
+   -- (inferred from how pipes behave, not observed here). tor's own manual
+   -- (tor(1), under --hush) documents that console logging stops once the
+   -- torrc says to log somewhere else, so this line moves the steady stream to
+   -- a file; only the few lines tor prints before it has read this torrc
+   -- still reach the pipe.
+   -- The side benefit is the one leg F wanted: tor's own "Bootstrapped 100%"
+   -- line is now readable in <pDataDir>/onionxt-tor.log, which OnionXT still
+   -- does not read for you. Unquoted, like DataDirectory above, so a path with
+   -- a space rides the same assumption that line always has (inferred from
+   -- tor's config parser taking the rest of the line; needs the leg F run).
+   put pDataDir & "/onionxt-tor.log" into tLogPath
+   put "Log notice file " & tLogPath & oxCrlf() after tTorrc
    put pDataDir & "/onionxt-torrc" into tRcPath
-   put tTorrc into url ("binfile:" & tRcPath)
-   oxSetSocksPort tSocks
-   oxSetControlPort tControl
+   try
+      put tTorrc into url ("binfile:" & tRcPath)
+      put the result into tWriteErr
+   catch tError
+      put "the write threw:" && tError into tWriteErr
+   end try
+   if tWriteErr is not empty then
+      -- Nothing has changed yet: the ports are still the caller's, no process
+      -- exists. A missing or read-only data directory lands here.
+      return "OnionXT: oxLaunchTor could not write the torrc" && tRcPath & ":" && tWriteErr
+   end if
    -- open process is platform-specific; launch tor detached with -f <torrc>.
    -- QUOTE BOTH PATHS. The command line is split on whitespace, so an unquoted
    -- "C:/Program Files/Tor/tor.exe" arrives as the two arguments "C:/Program"
@@ -1786,7 +1898,23 @@ command oxLaunchTor pTorPath, pDataDir, pSocksPort, pControlPort
    -- normal case on Windows and macOS, not an edge case. The same applies to
    -- the torrc path, which is derived from pDataDir.
    -- VERIFY: process launch and teardown on your target OXT build.
-   open process (quote & pTorPath & quote & " -f " & quote & tRcPath & quote) for read
+   try
+      open process (quote & pTorPath & quote & " -f " & quote & tRcPath & quote) for read
+      put the result into tLaunchErr
+   catch tError
+      put "open process threw:" && tError into tLaunchErr
+   end try
+   if tLaunchErr is not empty then
+      -- The torrc stays on disk (Mode B cleans up nothing yet: docs/07), but
+      -- the library's ports are NOT re-pointed at a tor that never started.
+      return "OnionXT: oxLaunchTor could not start" && pTorPath & ":" && tLaunchErr
+   end if
+   -- Re-point the rest of the API at the launched tor only now that a launch
+   -- was accepted. Until 2026-09-24 these two ran BEFORE `open process`, so a
+   -- failed launch still left every later oxDial / oxConnectControl aimed at
+   -- ports nothing was listening on.
+   oxSetSocksPort tSocks
+   oxSetControlPort tControl
    return empty
 end oxLaunchTor
 
@@ -3134,7 +3262,9 @@ command chBuild
    set the foregroundColor of field "chFilesHeader" to kUiMuted
    set the text of field "chFiles" to "Click a transfer above to see its files and per-file progress."
    -- ===== FULL-WIDTH BOTTOM: quick drop + log =====
-   uiSection "chSecDrop", "4.  Quick drop - paste text, get a code anyone can fetch back", "16,488,1164,508"
+   -- PUBLIC by design and labelled so (header note; design 6.7 / 7.3 guard 4): never
+   -- let this panel read as covered by the Anonymous button above it
+   uiSection "chSecDrop", "4.  Quick drop (PUBLIC, not anonymous) - text goes on the open DHT from your IP; anyone with the code can read it", "16,488,1164,508"
    uiInput "chPinText", "16,512,440,534"
    uiButton "chPin", "Pin", "448,512,530,534"
    uiInput "chPinCode", "538,512,810,534"
@@ -3222,11 +3352,11 @@ command chAddTips
    set the tooltip of button "chRemoveXfer" to "Remove the selected transfer; you choose whether to delete its files."
    set the tooltip of button "chOpenFolder" to "Open the selected transfer's download folder in your file manager."
    set the tooltip of field "chFiles" to "Files inside the selected transfer, with live per-file progress."
-   set the tooltip of field "chPinText" to "Type any short text (up to 1000 bytes) to pin to the network."
-   set the tooltip of button "chPin" to "Store the text on the DHT and get back a short share code."
+   set the tooltip of field "chPinText" to "Type any short text (up to 996 bytes) to pin to the network."
+   set the tooltip of button "chPin" to "PUBLIC: store the text, unencrypted, on the open DHT - sent from your real IP, never over Tor, even when a channel is anonymous - and get back a short code. Anyone with the code can read it."
    set the tooltip of button "chPinCopy" to "Copy the share code to the clipboard."
    set the tooltip of field "chFetchCode" to "Paste a 40-character drop code to fetch its text back."
-   set the tooltip of button "chFetchBtn" to "Look up the text for that drop code."
+   set the tooltip of button "chFetchBtn" to "Look up the text for that drop code (a public DHT lookup from your real IP, not over Tor)."
 end chAddTips
 
 -- a plain-language overview, shown by the title-bar "What is this?" button
@@ -3259,7 +3389,9 @@ command chHelp
    put tMsg & "   you POSTED; BLUE rows are files you DOWNLOADED. Click one to see the files inside it" & return into tMsg
    put tMsg & "   (double-click opens its folder), and use Pause, Resume, Remove, or Open Folder. You" & return into tMsg
    put tMsg & "   can also paste any magnet link to download it directly." & return & return into tMsg
-   put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return & return into tMsg
+   put tMsg & "4) QUICK DROP - paste any text, get a short code; anyone with the code gets it back." & return into tMsg
+   put tMsg & "   It is PUBLIC and never anonymous: the text sits unencrypted on the open DHT, sent" & return into tMsg
+   put tMsg & "   from your real IP, even while a channel is anonymous. Drop nothing private there." & return & return into tMsg
    put tMsg & "TRY IT on two machines: Copy your card on one, Follow it on the other, then share a file." into tMsg
    answer tMsg with "Got it"
 end chHelp
@@ -4183,6 +4315,10 @@ command chFollow
    end if
    -- an anon card is un-followable without OnionXT: refuse with a clear reason
    -- rather than silently doing a DHT get for an onion-only channel
+   if tCardAnon is "true" and chOnionOnMobile() then
+      chLog "That is an anonymous (Tor) channel, so it cannot be followed here." && chOnionMobileWhy()
+      exit chFollow
+   end if
    if tCardAnon is "true" and not sHasOnion then
       chLog "That is an anonymous (Tor) channel, but OnionXT + SodiumXT are not installed here - it cannot be followed on this machine. Public channels are unaffected."
       exit chFollow
@@ -4832,8 +4968,12 @@ command chPin
       chLog "Type some text to pin first."
       exit chPin
    end if
-   if the number of bytes in tData > 1000 then
-      chLog "Too big to pin:" && (the number of bytes in tData) && "bytes (max 1000)."
+   -- 996, not 1000: BEP44 caps the BENCODED value at 1000 bytes and the shim bencodes
+   -- internally ("996:" is four bytes), so since 2026-09-08 btDhtPutImmutable refuses
+   -- raw input over 996 (torrentxt/CLAUDE.md gotcha 7). This read 1000 until
+   -- 2026-09-24, so text of 997-1000 bytes passed here and then failed as "Pin failed".
+   if the number of bytes in tData > 996 then
+      chLog "Too big to pin:" && (the number of bytes in tData) && "bytes (max 996)."
       exit chPin
    end if
    put btDhtPutImmutable(sSession, tData) into tTarget
@@ -5049,6 +5189,9 @@ function chCapabilityLine
    else
       put "SodiumXT NO (" & chEncryptAdvice() & ")" into tOut
    end if
+   if chOnionOnMobile() then
+      return tOut & "; Tor: not available on this device (anonymous channels need a desktop running a local tor daemon)"
+   end if
    if sHasOnion then
       return tOut & "; OnionXT OK (the Tor daemon is probed separately - watch the pill)"
    end if
@@ -5056,8 +5199,8 @@ function chCapabilityLine
 end chCapabilityLine
 
 -- The bytes to publish for a feed: plaintext UTF-8 when public; marker+secretbox
--- when the channel has a passphrase (the secretbox output is nonce || ciphertext
--- || MAC, a fresh random nonce each publish). Returns EMPTY for a private channel
+-- when the channel has a passphrase (the secretbox output is nonce || MAC ||
+-- ciphertext, a fresh random nonce each publish). Returns EMPTY for a private channel
 -- we cannot encrypt, so the caller refuses to publish in the clear (fail-closed).
 function chFeedValue pFeed, pPass, pPubHex
    local tBox, tErr
@@ -5267,6 +5410,11 @@ end chMaybeDecryptFinished
 -- oxVersion() probe, mirroring chCanEncrypt.
 function chHasOnion
    local tV, tErr
+   -- a phone or tablet never gets this far: no ox* call at all where a local tor
+   -- daemon cannot run (chOnionOnMobile; the pill names the reason)
+   if chOnionOnMobile() then
+      return false
+   end if
    if not sCanEncrypt then
       return false
    end if
@@ -5277,6 +5425,24 @@ function chHasOnion
    end try
    return (tV is not empty)
 end chHasOnion
+
+-- Mobile is unsupported for anonymous channels (ONIONXT-INTEGRATION-PLAN 3.2 and
+-- 13.3): a phone or tablet cannot run the user-controlled local tor daemon, with an
+-- open control port, that the onion path needs. The design gave that its own
+-- fail-closed reason, "not available on this device"; until 2026-09-24 nothing
+-- checked the platform, so a mobile engine landed in "Tor: no daemon" (or "no
+-- extension"), whose advice cannot be followed there. `the platform` answers
+-- "iphone" on iOS and "android" on Android (LiveCode's documented values). Verified
+-- statically; needs an OXT pass on a mobile engine.
+function chOnionOnMobile
+   return (the platform is "iphone" or the platform is "android")
+end chOnionOnMobile
+
+-- The one sentence every refusal uses on a mobile engine (chSetAnon, chFollow,
+-- chOnionDownload), so the reason reads the same wherever it surfaces.
+function chOnionMobileWhy
+   return "Anonymous (Tor) channels are not available on this device: they need a desktop running a local tor daemon, which a phone or tablet cannot host. Public channels work normally here."
+end chOnionMobileWhy
 
 -- Live, authoritative Tor readiness, re-read at the moment of use (never trust
 -- the cached sTorReady for a go/no-go). oxIsReady() is true only at 100% bootstrap.
@@ -5592,7 +5758,12 @@ command chOnionPill
    if there is no button "chAnon" then
       exit chOnionPill
    end if
-   if not sHasOnion then
+   if chOnionOnMobile() then
+      -- the design's distinct reason (chOnionOnMobile): nothing to install and
+      -- nothing to start, so neither "no extension" nor "no daemon" may say it
+      put "Tor: not on this device" into tState
+      put "bad" into tKind
+   else if not sHasOnion then
       if sCanEncrypt then
          put "Tor: no extension" into tState
       else
@@ -5945,8 +6116,12 @@ command chOnionPushFeed pPubHex
 end chOnionPushFeed
 
 -- Serve a release's bytes (section 6.4 FILE / section 3.3 sender). A missing serve
--- entry (e.g. a restart lost the map) replies with an empty header + FINISH so the
--- follower shows "release not available", never a hang.
+-- entry (e.g. a restart lost the map) replies with a zero-total header + the
+-- terminator, never a hang, and the follower's chOnionRecvData reads that as
+-- "not currently available" (built 2026-09-24; until then a plaintext follower
+-- saved a zero-byte file and logged success, and an encrypted one raised the
+-- downgrade alarm). chOnionPublishFile refuses an empty file, so a real release
+-- never sends this shape.
 command chOnionServeFile pStream, pPubHex, pRelId
    local tMapKey, tPath, tEnc, tName, tTotal
    put pPubHex & ":" & pRelId into tMapKey
@@ -6111,8 +6286,20 @@ end chOnionCloseStream
 -- Set (or clear) the whole-channel anon flag (section 6.2), modeled on chSetPrivacy.
 -- Turning ON hard-blocks on any live clearnet magnet release (section 6.7 guard 6):
 -- an anon badge over a still-seeding torrent is real-IP-on-the-DHT mixing.
+-- Turning OFF hard-blocks the same way on any anonymous "onion:" release (the
+-- original design's 7.3 Channels guard 5: a channel is all-clearnet or all-onion,
+-- and flipping it is refused while releases of the other kind exist). Built
+-- 2026-09-24: until then OFF went straight to chPublishActiveFeed, which put the
+-- WHOLE feed on the DHT - the anon releases' titles included, readable by anyone
+-- when the channel has no passphrase - from the user's real IP. Both directions
+-- offer one-click removal and never warn-and-proceed. Verified statically; needs
+-- an OXT + live-Tor pass (register #31's "Anonymous OFF" behaviour).
 command chSetAnon
-   local tGo, tMagCount, tRel, tLoc, tSavedID, tHash, tH
+   local tGo, tMagCount, tRel, tLoc, tSavedID, tHash, tH, tOnionCount, tTitleNote
+   if chOnionOnMobile() then
+      answer chOnionMobileWhy()
+      exit chSetAnon
+   end if
    if not sHasOnion then
       answer "Anonymous channels need OnionXT + SodiumXT and a local Tor daemon (127.0.0.1:9050/9051 or 9150/9151). Public channels are unaffected."
       exit chSetAnon
@@ -6185,6 +6372,33 @@ command chSetAnon
          chLog "This channel is already public."
          exit chSetAnon
       end if
+      -- count the anonymous releases; refuse OFF until they are removed (guard 5)
+      put 0 into tOnionCount
+      set the itemDelimiter to tab
+      repeat for each line tRel in sChannels[sActive]["releases"]
+         if tRel is not empty then
+            put item 2 of tRel into tLoc
+            if tLoc begins with "onion:" then
+               add 1 to tOnionCount
+            end if
+         end if
+      end repeat
+      set the itemDelimiter to tSavedID
+      if tOnionCount > 0 then
+         if sChannels[sActive]["pass"] is empty then
+            put " - in the clear, since this channel has no passphrase" into tTitleNote
+         else
+            put " - sealed under the channel passphrase, but announced from your IP all the same" into tTitleNote
+         end if
+         answer ("This channel lists " & tOnionCount & " anonymous release(s), served only over Tor. Making it public re-announces its feed on the DHT from your real IP, and their titles would go with it" & tTitleNote & ". So Anonymous stays ON while they are listed." & return & return & \
+            "Remove the " & tOnionCount & " anonymous release(s) from the feed (followers can no longer fetch them; your original files stay on disk), then make the channel public?") \
+            with "Cancel" or "Remove and continue"
+         if it is not "Remove and continue" then
+            chLog "Anonymous stays ON for '" & chActiveName() & "': it lists " & tOnionCount & " anonymous release(s), and making it public would announce their titles on the DHT. Nothing changed."
+            exit chSetAnon
+         end if
+         chOnionDropReleases
+      end if
       put "" into sChannels[sActive]["anon"]
       chSaveChannels
       chOnionWithdrawService sPub
@@ -6194,6 +6408,51 @@ command chSetAnon
    chUpdateChannelMenu
    chUpdateNowPub
 end chSetAnon
+
+-- The removal half of chSetAnon's OFF guard: drop every "onion:" release from the
+-- ACTIVE channel's stored feed (sChannels[sActive]["releases"], which chChannelTick
+-- re-announces for every public channel) and its cache (sMyReleases / sMyPost), and
+-- forget their serve-map entries, deleting the .enc temps this demo made for the
+-- encrypted ones (never a user's own file: only kFlagEnc entries are our temps).
+-- The caller then withdraws the service and re-announces, so no anonymous title
+-- can reach the DHT through either publish path.
+command chOnionDropReleases
+   local tRel, tLoc, tKept, tSavedID, tMapKey, tErr
+   put "" into tKept
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to tab
+   repeat for each line tRel in sChannels[sActive]["releases"]
+      if tRel is empty then
+         next repeat
+      end if
+      put item 2 of tRel into tLoc
+      if tLoc begins with "onion:" then
+         put sPub & ":" & (char 7 to -1 of tLoc) into tMapKey
+         if sOnionServeEnc[tMapKey] is kFlagEnc then
+            try
+               if there is a file sOnionServe[tMapKey] then
+                  delete file sOnionServe[tMapKey]
+               end if
+            catch tErr
+            end try
+         end if
+         delete variable sOnionServe[tMapKey]
+         delete variable sOnionServeEnc[tMapKey]
+         delete variable sOnionServeName[tMapKey]
+         delete variable sOnionServeTotal[tMapKey]
+      else if tKept is empty then
+         put tRel into tKept
+      else
+         put tKept & return & tRel into tKept
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   put tKept into sChannels[sActive]["releases"]
+   put tKept into sMyReleases
+   put chBuildFeed(sMyName, sMyReleases) into sMyPost
+   chSaveChannels
+   chLog "Removed the anonymous release(s) from '" & chActiveName() & "'; they are no longer offered to followers."
+end chOnionDropReleases
 
 -- The anon replacement for chPublishFile's clearnet body (section 6.5): pick ONE
 -- file, encrypt it when the channel is private (recommended), record it in the
@@ -6233,6 +6492,13 @@ command chOnionPublishFile
    put chFileSize(tPath) into tTotal
    if tTotal is empty or tTotal < 0 then
       chLog "Could not read that file's size."
+      exit chOnionPublishFile
+   end if
+   -- a zero-total BTXO header is the "release not currently available" reply
+   -- (chOnionServeFile / chOnionRecvData), so an empty release would read as
+   -- missing to every follower; refuse it here and keep that reply unambiguous
+   if tTotal is 0 then
+      chLog "That file is empty - there is nothing to publish."
       exit chOnionPublishFile
    end if
    if tTotal > kAnonSizeWarn then
@@ -6350,6 +6616,10 @@ end chOnionFollowFetch
 -- Dial an anon channel's onion and request ONE release's bytes (section 6.5).
 command chOnionDownload pKey, pRelId, pTitle, pEnc, pOrigName
    local tAddr, tStream, tName
+   if chOnionOnMobile() then
+      chLog "This is an anonymous release, so it cannot be downloaded here." && chOnionMobileWhy()
+      exit chOnionDownload
+   end if
    if not sHasOnion then
       chLog "This is an anonymous release, but OnionXT + SodiumXT are not installed here."
       exit chOnionDownload
@@ -6520,9 +6790,109 @@ command chApplyAnonFeed pKey, pFeed
    end if
 end chApplyAnonFeed
 
+-- ---- the receiver's free-disk pre-check (design 3.3, built 2026-09-24) ---------
+-- The design asked each receiver to check free space against totalLen, doubled when
+-- encrypted, before opening its temp file; neither did until 2026-09-24, so a short
+-- disk surfaced as "Could not write the received data to disk" partway through (that
+-- abort stays as the backstop). QuickShare carries its own copy (qsFreeBytesAt /
+-- qsOnionDiskShortfall). Verified statically; needs an OXT + live-Tor pass, and
+-- diskSpace() itself has no engine record in this suite yet.
+
+-- Free bytes on the disk holding pFolder, or EMPTY when that cannot be measured.
+-- diskSpace() answers for the disk that holds THE DEFAULTFOLDER (LiveCode's documented
+-- behaviour), so point the defaultFolder at the nearest folder that exists (the save
+-- folder may not have been created yet) and put it back before returning, whatever
+-- happened. Unmeasurable is not a refusal: the write-failure abort still catches a
+-- disk that fills, and failing every transfer on a platform whose diskSpace() answers
+-- nothing would turn a guard into an outage.
+function chFreeBytesAt pFolder
+   local tSaved, tDir, tSavedID, tAvail, tErr, tI
+   put the defaultFolder into tSaved
+   put pFolder into tDir
+   replace "\" with "/" in tDir
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   -- bounded walk up to the nearest existing folder (no real path is 64 deep)
+   repeat with tI = 1 to 64
+      if tDir is empty then
+         exit repeat
+      end if
+      if there is a folder tDir then
+         exit repeat
+      end if
+      delete the last item of tDir
+   end repeat
+   set the itemDelimiter to tSavedID
+   if tDir is empty then
+      return empty
+   end if
+   if there is no folder tDir then
+      return empty
+   end if
+   put empty into tAvail
+   try
+      set the defaultFolder to tDir
+      if the result is empty then
+         put diskSpace() into tAvail
+      end if
+   catch tErr
+      put empty into tAvail
+   end try
+   set the defaultFolder to tSaved
+   -- nested guards: `or` evaluates both operands (engine note 2.5)
+   if tAvail is not a number then
+      return empty
+   end if
+   if tAvail < 0 then
+      return empty
+   end if
+   return tAvail
+end chFreeBytesAt
+
+-- Empty when the download fits, else the refusal to show. The temp lands beside
+-- pTempPath and the result in pSaveFolder; both disks are checked, each against the
+-- whole need (totalLen, times two when pEnc says encrypted: the .enc and its
+-- decrypted copy coexist until the temp is deleted). On one disk - the usual case -
+-- that is exactly the design's rule; across two it over-asks, which fails closed.
+function chOnionDiskShortfall pTotal, pEnc, pTempPath, pSaveFolder
+   local tNeed, tTmpDir, tSavedID, tAvail, tWhy
+   put pTotal into tNeed
+   put "" into tWhy
+   if pEnc is not 0 and pEnc is not empty then
+      put pTotal * 2 into tNeed
+      put " (twice the file's size: an encrypted release is unlocked beside its download)" into tWhy
+   end if
+   if tNeed <= 0 then
+      return empty
+   end if
+   put pTempPath into tTmpDir
+   replace "\" with "/" in tTmpDir
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   delete the last item of tTmpDir
+   set the itemDelimiter to tSavedID
+   put chFreeBytesAt(tTmpDir) into tAvail
+   if tAvail is not empty then
+      if tAvail < tNeed then
+         return "Not enough free disk space for this download: it needs about " & chFmtBytes(tNeed) & tWhy & \
+            ", and only " & chFmtBytes(tAvail) & " is free on the disk holding " & tTmpDir & \
+            ". Nothing was downloaded - free some space, then Download again."
+      end if
+   end if
+   put chFreeBytesAt(pSaveFolder) into tAvail
+   if tAvail is not empty then
+      if tAvail < tNeed then
+         return "Not enough free disk space for this download: it needs about " & chFmtBytes(tNeed) & tWhy & \
+            ", and only " & chFmtBytes(tAvail) & " is free on the disk holding " & pSaveFolder & \
+            ". Nothing was downloaded - free some space, then Download again."
+      end if
+   end if
+   return empty
+end chOnionDiskShortfall
+
 -- ---- follower: the section-3.3 BTXO file receiver ----------------------------
 command chOnionRecvData pStream, pData
-   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload
+   local tNameLen, tName, tHi, tLo, tTotal, tFlags, tLen, tPayload, tShort
    if sRxState[pStream] is empty or sRxState[pStream] is "done" then
       exit chOnionRecvData
    end if
@@ -6557,6 +6927,19 @@ command chOnionRecvData pStream, pData
          chOnionRecvAbort pStream, "Refusing an oversized Tor transfer."
          exit chOnionRecvData
       end if
+      -- ZERO TOTAL = "release not currently available" (design 6.4, built
+      -- 2026-09-24). It is how chOnionServeFile answers a FILE request for a
+      -- relId it cannot serve (its serve map lost the entry, e.g. a publisher
+      -- restart, or the file went missing). Checked BEFORE the downgrade test:
+      -- that reply carries no flags, so an encrypted release used to raise the
+      -- tampering alarm here, and a plaintext one fell through to a zero-byte
+      -- "Received ..." success. Nothing is written and no temp is opened.
+      -- (chOnionPublishFile refuses an empty file, so no real release is zero.)
+      if tTotal is 0 then
+         chOnionRecvAbort pStream, "'" & sRxName[pStream] & "' is not currently available: the channel's publisher is online but no longer serving that release (it may have restarted or removed it). Nothing was downloaded - try again later, or ask the publisher to re-publish it."
+         put "unavailable" into sOnionXfer[pStream]["state"]
+         exit chOnionRecvData
+      end if
       if sRxKey[pStream] is not empty and (tFlags bitAnd kFlagEnc) is 0 then
          chOnionRecvAbort pStream, "This release was supposed to be encrypted but arrived unencrypted - do not trust it."
          exit chOnionRecvData
@@ -6573,6 +6956,13 @@ command chOnionRecvData pStream, pData
       put tTotal into sOnionXfer[pStream]["total"]
       put 0 into sRxGot[pStream]
       put chTempEncPath() into sRxTmp[pStream]
+      -- design 3.3: refuse up front a transfer this machine cannot hold, BEFORE the
+      -- temp opens, rather than meet a full disk on a write halfway through
+      put chOnionDiskShortfall(tTotal, sRxEnc[pStream], sRxTmp[pStream], sRxSave[pStream]) into tShort
+      if tShort is not empty then
+         chOnionRecvAbort pStream, tShort
+         exit chOnionRecvData
+      end if
       open file sRxTmp[pStream] for binary write
       if the result is not empty then
          chOnionRecvAbort pStream, "Could not open a temp file to receive into."
@@ -6727,6 +7117,11 @@ function chOnionXferState pOx
    if pOx["state"] is "error" then
       return "onion error"
    end if
+   -- the publisher answered "not currently available" (chOnionRecvData): no
+   -- error on either side, so the row must not say "error"
+   if pOx["state"] is "unavailable" then
+      return "onion n/a"
+   end if
    if pOx["dir"] is "up" then
       return "onion up"
    end if
@@ -6849,19 +7244,25 @@ function chCountReleases pFeed
 end chCountReleases
 
 function chFmtBytes pBytes
-   local tUnits, tVal, tI
+   local tUnits, tVal, tI, tOldDelim, tUnit
    if pBytes is empty or pBytes is not a number then
       return "0 B"
    end if
    put "B,KiB,MiB,GiB,TiB" into tUnits
-   set the itemDelimiter to comma
    put pBytes into tVal
    put 1 into tI
+   -- Save and restore the itemDelimiter around the one span that reads items: it is
+   -- engine-global (engine note 2.3), so the bare `set ... to comma` this function had
+   -- until 2026-09-24 clobbered any caller mid-parse with another delimiter.
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
    repeat while tVal >= 1024 and tI < the number of items of tUnits
       put tVal / 1024 into tVal
       add 1 to tI
    end repeat
-   return (the round of (tVal * 10) / 10) && (item tI of tUnits)
+   put item tI of tUnits into tUnit
+   set the itemDelimiter to tOldDelim
+   return (the round of (tVal * 10) / 10) && tUnit
 end chFmtBytes
 
 function chTrunc pText, pLen
@@ -7115,7 +7516,7 @@ command chScRun
          & ", OnionXT " & scShow(sHasOnion)
    if sHasOnion is not true then
       scSkip "the offline libtorrent/libsodium ed25519 byte-compare", \
-            "OnionXT (or SodiumXT) is absent, so anon channels are off anyway"
+            "OnionXT (or SodiumXT) is absent, or this is a mobile device, so anon channels are off anyway"
    else
       -- Section 6.1, and the one assertion in this file with teeth: if the two
       -- libraries disagree offline, a channel's derived .onion could be wrong,
