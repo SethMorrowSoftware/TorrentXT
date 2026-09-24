@@ -7,13 +7,15 @@ truth); the reference tables at the end are transcribed from that file's
 `docs/architecture.md` for the *shape* of the stack and `docs/getting-started.md`
 for the lifecycle you must follow; this file is the call-by-call contract.
 
-> **Honesty note (carried throughout the repo).** OXT has no headless way to
-> compile or run `.lcb`, so the runtime behaviour of these handlers is "verified
-> statically; needs an OXT pass." This note once flagged schema fields the shim
-> did not yet populate; that gap has closed (audited 2026-08-15: every field id
-> registered in `src/btx_record.h` is written by `src/torrent_shim.cpp`). The
-> one surviving inline caveat is the DHT-state note below - a counter a given
-> libtorrent build omits stays `0`.
+> **Honesty note.** Every public `bt*` handler in `src/torrent.lcb` has executed on a
+> real engine (the member harness: 96/96 on 2026-08-10, 101/101 on Windows on 2026-08-17,
+> -20 and -24; `btMoveStorage` on its stale-id refusal leg only (2026-08-17);
+> `btRemoveTorrent` only with deleteFiles=false - its delete path is manual-only and has
+> never run). The "Script-side helpers" section below is "verified statically; needs an
+> OXT pass". Those engine runs predate the binaries committed 2026-09-12, which, like
+> the overflow reporting under `btPoll` and `btRp1Poll`, are "verified statically; needs
+> an OXT pass". Every field id in `src/btx_record.h` is written by the shim (audited
+> 2026-08-15). The dated ledger is in `../CLAUDE.md`.
 
 ---
 
@@ -23,7 +25,7 @@ for the lifecycle you must follow; this file is the call-by-call contract.
  called either way. Where the handler hands back a *handle* or a *status code*
  the worked examples invoke it as a **command** and read `the result`
  (`btAddMagnet sSession, tUri, tPath` then `put the result into tH`) - that is
- the shape the plan and the demos teach. Where it hands back data you consume
+ the shape the demos teach. Where it hands back data you consume
  immediately (a status `Array`, a peer `List`, a `Data` blob, a diagnostic
  `String`) it reads naturally as a **function** (`put btTorrentStatus(tH) into
  tRec`). Both shapes are noted per entry; pick the one that reads cleanly.
@@ -64,8 +66,8 @@ Pause, request and flush resume data, stop, destroy, and join the session's
 background threads, in order. **Idempotent** - a second call, or a call with a
 stale handle, is a no-op. Returns nothing.
 - **Usage:** command - `btStopSession sSession` (typically in `closeStack`).
-- This is the mandatory teardown (plan section 4.2). A session leaked at quit is the
- documented failure mode if the app forgets to call it.
+- This is the mandatory teardown (getting-started section 2); a session leaked at quit
+ is what happens without it.
 
 ### `btLastError() returns String`
 The module-static last-error string, or `""` when there is no pending error.
@@ -123,7 +125,7 @@ MSE / protocol-encryption (PE) policy, mapped straight to libtorrent's
 
 ## Session operations
 
-### `btSessionPause(in pSession as Integer) returns Integer` · `btSessionResume(in pSession as Integer) returns Integer`
+### `btSessionPause(in pSession as Integer) returns Integer` / `btSessionResume(in pSession as Integer) returns Integer`
 Pause / resume the **whole session** - every torrent at once. Distinct from the
 per-torrent `btPause` / `btResume`.
 - **Usage:** command - `btSessionPause sSession`.
@@ -231,8 +233,8 @@ Remove a torrent from the session. If `pDeleteFiles` is `true`, the downloaded
 files are deleted too. Returns `0` / negative.
 - **Usage:** command - `btRemoveTorrent sSession, tH, false`.
 
-### `btAddMagnetEx(in pSession as Integer, in pURI as String, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer` · `btAddTorrentFileEx(in pSession as Integer, in pData as Data, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer`
-Like `btAddMagnet` / `btAddTorrentFile`, but apply **add-time `torrent_flags`** —
+### `btAddMagnetEx(in pSession as Integer, in pURI as String, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer` / `btAddTorrentFileEx(in pSession as Integer, in pData as Data, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer`
+Like `btAddMagnet` / `btAddTorrentFile`, but apply **add-time `torrent_flags`**:
 set the bits named in `pFlags`, touching only the bits named in `pMask` (decimal
 strings; combine the `kFlag*` constants). The classic use is **adding paused**
 (`kFlagPaused`) so you can set file priorities *before* it starts downloading, or
@@ -367,7 +369,7 @@ The torrent's 0-based position in the download queue, or `-1` if it is not queue
 because `0` is itself a real position - the one getter in the API that does so.
 - **Usage:** function - `put btQueuePosition(tH) into tPos`.
 
-### `btQueueUp(in pTorrent as Integer) returns Integer` · `btQueueDown(...)` · `btQueueTop(...)` · `btQueueBottom(...)`
+### `btQueueUp(in pTorrent as Integer) returns Integer` / `btQueueDown(...)` / `btQueueTop(...)` / `btQueueBottom(...)`
 Move the torrent one step up / down, or all the way to the top / bottom of the
 download queue. (Only meaningful for auto-managed torrents.)
 - **Usage:** command - `btQueueTop tH`.
@@ -455,8 +457,8 @@ The torrent's HTTP (URL / web) seeds as a `List` of URL `String`s. Empty `List`
 on a bad handle.
 - **Usage:** function - `put btWebSeeds(tH) into tSeeds`.
 
-### `btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer` · `btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer`
-Add or remove an HTTP (URL / web) seed (BEP 19) — a plain web server that can
+### `btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer` / `btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer`
+Add or remove an HTTP (URL / web) seed (BEP 19): a plain web server that can
 serve the torrent's data alongside peers.
 - **Usage:** command - `btAddWebSeed tH, "https://mirror.example/path/"`.
 
@@ -475,6 +477,15 @@ a `List` of `Array`s. Each array carries:
 
 The drain never drops a record: an oversized one is stashed by the shim and
 emitted next call. Returns the **empty list** when nothing is pending.
+
+**Overflow upstream of the drain.** libtorrent's alert queue holds `alert_queue_size`
+alerts (1000 by default; raise it with `btSetInt`) and discards the excess when it fills
+between two drains: a lost DHT item, put confirmation or tracker reply. When that
+happened, `btPoll` leaves in `btLastError()`: `alerts: libtorrent dropped alerts of N
+type(s) since the last drain - its queue filled; poll more often or raise
+alert_queue_size` (N counts dropped alert TYPES, which is what libtorrent reports). An
+alert code replaces this at ABI 12. (In the binaries committed 2026-09-12; verified
+statically; needs an OXT pass.)
 - **Usage:** function - `put btPoll(sSession) into tEvents`, then loop. In
  practice you do **not** call this yourself: `start using stack
  "torrentHelpers"` and call `btStartPolling`, which runs `btPoll` on a timer
@@ -494,7 +505,7 @@ Add a DHT bootstrap node (host + UDP port) to seed the routing table.
 A snapshot of DHT health as an `Array` keyed `nodes`, `nodeCache`, `globalNodes`,
 `torrents`. Empty array only on a bad/dead session handle (when DHT is simply
 idle the counts read `0`).
-- **Note:** `nodes` is the live routing-table node count — it climbs from `0` as
+- **Note:** `nodes` is the live routing-table node count; it climbs from `0` as
  the DHT bootstraps after the first add. All four come from libtorrent's
  `session_stats` counters, which the shim refreshes once per `btPoll`; a counter
  a given libtorrent build does not expose stays `0`.
@@ -577,15 +588,15 @@ silently vanishing on the network. Confirms via a `dhtPut` event.
 ## rp1 (custom BEP10 peer-wire extension)
 
 `rp1` is a custom **BEP10** extension that moves **opaque bytes** between peers on
-the peer wire — TorrentXT neither frames nor interprets the payload (the caller
+the peer wire; TorrentXT neither frames nor interprets the payload (the caller
 owns any sub-typing). With `btAddInfohash` (a phantom swarm) and `btDhtGetPeers`
 (rendezvous), two peers can meet on a bare id and talk with **no tracker, no
 server, and no content**. It is opt-in per session and off by default.
 
 Inbound events (peer up/down, handshake, message) are drained by `btRp1Poll` in
 the same shape as `btPoll`; outbound messages are queued by `btRp1Send` and sent
-on libtorrent's next per-peer tick (a **&le;1 s** latency, which is also what
-flushes them — no peer-connection method is ever touched off the network thread).
+on libtorrent's next per-peer tick (a **<= 1 s** latency, which is also what
+flushes them; no peer-connection method is ever touched off the network thread).
 
 ### `btRp1Enable(in pSession as Integer) returns Integer`
 Turn the `rp1` extension on for this session (installs the peer-wire plugin).
@@ -611,9 +622,16 @@ negative.
 
 ### `btRp1Poll(in pSession as Integer) returns List`
 Drain queued `rp1` events. Returns a `List` of event `Array`s in the SAME shape as
-`btPoll` — each carries a `name`, a `code`, a `peer` id, the swarm `infoHashV1`,
+`btPoll`: each carries a `name`, a `code`, a `peer` id, the swarm `infoHashV1`,
 and event-specific keys (`btPeerId` / `endpoint` / `supportsRp1` / `token` on a
-handshake, `payload` on a message). Call it each poll tick alongside `btPoll`.
+handshake, `payload` on a message). Call it each poll tick alongside `btPoll` (the
+helper stack's `btStartPolling` does).
+
+**The inbound queue is bounded.** Each call drains at most 65536 bytes (about 262 KB/s
+at 250 ms). Past 65536 queued events or 32 MiB the NEWEST events are shed, and the next
+`btRp1Poll` leaves in `btLastError()`: `rp1: N inbound event(s) shed - the queue cap was
+reached; poll more often or read less slowly`. An alert code replaces this at ABI 12.
+(In the binaries committed 2026-09-12; verified statically; needs an OXT pass.)
 - **Usage:** function - `put btRp1Poll(sSession) into tEvents`.
 
 ## Create (seeding side)
@@ -635,20 +653,21 @@ torrent); each non-empty line becomes its own tracker tier, in order. Empty
 These are **not** part of the `library` - they live in the helper stack you put
 on the message path (`start using stack "torrentHelpers"`). They drive the poll
 loop and provide formatting sugar. Listed here because the API is incomplete
-without them.
+without them. Their runtime behaviour is "verified statically; needs an OXT pass" (no
+harness calls them).
 
 | Helper | Kind | Signature | What it does |
 |---|---|---|---|
 | `btStartPolling` | command | `btStartPolling pSession, pTarget, pIntervalMs` | Arm the drain timer for `pSession`; dispatch each event to `pTarget` (default: the current card) every `pIntervalMs` ms (default `250`). Reschedules itself. |
 | `btStopPolling` | command | `btStopPolling` | Disarm the timer. Safe when not polling. |
-| `btTorrentPollOnce` | command | (internal) | One drain pass: `btPoll`, `dispatch` per event (plus a catch-all `torrentEvent`), reschedule. You normally do not call this directly. |
+| `btTorrentPollOnce` | command | (internal) | One drain pass: `btPoll` then `btRp1Poll`, `dispatch` per event (plus a catch-all `torrentEvent`), reschedule. You normally do not call this directly. It does not read `btLastError()` after the drains; an app that must notice a queue overflow reads it itself. |
 | `btFormatBytes` | function | `btFormatBytes(pBytes)` | Humanise a byte count to `B`/`KiB`/`MiB`/`GiB`/`TiB`, one decimal. |
 | `btStateName` | function | `btStateName(pState)` | Map a `state` int to a label (see the state table below). |
 
-The interval is a **latency/CPU knob**: throughput and event integrity are
-independent of cadence (libtorrent buffers between drains); only worst-case event
-latency scales with it. 250 ms suits a UI; tighten only for a very smooth live
-dashboard.
+The interval is a **latency/CPU knob within the queue caps**: libtorrent buffers
+between drains, so at a normal cadence only worst-case event latency scales with it,
+but a queue that fills between two drains drops (see `btPoll` and `btRp1Poll`).
+250 ms suits a UI; tighten for a busy session or a very smooth live dashboard.
 
 ---
 

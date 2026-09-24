@@ -7,13 +7,12 @@ that makes the engine safe on a single-threaded runtime. For the call-by-call
 contract see `docs/api-reference.md`; for the *why* of the design see
 `docs/architecture.md`.
 
-> **Honesty note.** OXT cannot compile or run `.lcb`/`.livecodescript` headlessly,
-> so the snippets here are "verified statically; needs an OXT pass." They mirror
-> the runnable examples — `examples/torrent-client.livecodescript` (the full
-> self-building client), `examples/torrent-dht-channels.livecodescript` (the
-> decentralized DHT demo), and `examples/torrent-helpers.livecodescript` (the
-> poll dispatcher this guide builds on); when something does not behave, trust the
-> running engine and `btLastError()` over this page.
+> **Honesty note.** Every `bt*` handler of the library (`src/torrent.lcb`) used here has run
+> on a real engine (101/101 on Windows, last counted 2026-08-24; ledger in `../CLAUDE.md`);
+> the helper-stack handlers (`btStartPolling`, `btStopPolling`, `btFormatBytes`,
+> `btStateName`) and the snippets as written are "verified statically; needs an OXT pass". They mirror `examples/torrent-client`,
+> `examples/torrent-dht-channels` and `examples/torrent-helpers` (the poll dispatcher
+> this guide builds on). When something misbehaves, trust the engine and `btLastError()`.
 
 ---
 
@@ -62,11 +61,11 @@ closeStack  ->  btStopPolling        (disarm the timer first)
 **Why the shutdown is mandatory, not optional:** `btStopSession` is the only thing
 that pauses the session, gives libtorrent a moment to write resume data, destroys
 it, and joins its background threads. Skip it and you leak a session and its
-threads at quit - the documented failure mode (plan section 4.2). `btStopSession` is
+threads at quit - the documented failure mode. `btStopSession` is
 **idempotent** and a stale handle is a no-op, so calling it defensively is always
 safe. Only one session may be live at a time; `btStartSession` refuses a second.
 
-Here is that skeleton — the minimal shape every TorrentXT app shares (the
+Here is that skeleton, the minimal shape every TorrentXT app shares (the
 flagship examples wrap the same lifecycle around a richer UI):
 
 ```
@@ -139,8 +138,8 @@ wait for events.
 
 ### Handle the events that matter
 
-The dispatcher `send`s a semantic message per engine event. Write handlers for the
-ones you care about; their parameter is the event `Array` (keys in
+The dispatcher `dispatch`es a semantic message per engine event. Write handlers for
+the ones you care about; their ONE parameter is the event `Array` (keys in
 api-reference.md):
 
 ```
@@ -203,7 +202,8 @@ You almost never call `btPoll` yourself. The flow is:
  which is unsafe.
 2. `btStartPolling SESSION, TARGET, INTERVALMS` arms a timer. Each tick it calls
  `btPoll(SESSION)` once, which drains **all** pending events in a single FFI
- round-trip and returns them as a `List` of `Array`s.
+ round-trip and returns them as a `List` of `Array`s, then `btRp1Poll(SESSION)`
+ for the rp1 stream (empty unless rp1 is enabled).
 3. For each event the dispatcher `dispatch`es a message named by the event's
  `name` key to `TARGET`, with the event array as the parameter - and also fires
  a catch-all `torrentEvent` so one handler can observe the whole stream.
@@ -223,12 +223,17 @@ api-reference.md. The headline ones:
 | `resumeDataReady` | `resumeData` (bytes) | resume data you requested is ready to save |
 | `scrapeReply` | `numPeers` (+ swarm counts) | a scrape returned swarm seeder/leecher counts |
 
-**The poll interval is a latency/CPU knob, not a correctness knob.** Throughput
-and event integrity are independent of cadence - libtorrent buffers between
-drains, and the drain never drops a record - so only worst-case event latency
-scales with the interval. 250 ms suits a UI; 1000 ms is fine for a background
-sync; tighten only for a very smooth live dashboard. The cost of a tighter loop is
-CPU spent on drains, nothing else.
+**The poll interval is a latency/CPU knob, within the queue caps.** libtorrent
+buffers events between drains and the drain itself never drops a record, so at a
+normal cadence only worst-case event latency scales with the interval. The buffers
+are bounded, though: libtorrent's alert queue holds `alert_queue_size` alerts (1000
+by default) and drops the excess, and the rp1 inbound queue sheds its newest events
+past 65536 events / 32 MiB. Either overflow is reported through `btLastError()`
+after the next drain ("alerts: libtorrent dropped alerts of N type(s) ..." or "rp1:
+N inbound event(s) shed ..."; in the binaries committed 2026-09-12, verified
+statically; needs an OXT pass): if you see one, poll more often or raise
+`alert_queue_size` with `btSetInt`. 250 ms suits a UI; 1000 ms is fine for
+a quiet background sync; tighten for a busy session or a very smooth dashboard.
 
 > The gigabytes never touch your script. Payload moves engine <-> disk on
 > libtorrent's threads; `btPoll` and `btTorrentStatus` only ever move small event
