@@ -96,7 +96,8 @@ script "dhtChannelsApp"
 --
 -- HONESTY (the suite convention): the torrent + BEP44 surface this demo drives
 -- is engine-proven through the member harness (tests/torrent-selftest.livecodescript,
--- 101/101 on Windows 2026-08-17, 08-20 and 08-24) and riptide's two-machine BEP44
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24, 106/106 on 2026-09-24 with the
+-- 996-byte BEP44 boundary) and riptide's two-machine BEP44
 -- runs (2026-08-13), both in the ledger in torrentxt/CLAUDE.md; no dated engine
 -- pass of THIS demo is recorded there, and its UI was unified onto the suite kit
 -- 2026-08-14 - the rebuilt chrome and layout are verified statically; needs an

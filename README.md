@@ -225,15 +225,18 @@ and the per-platform notes.
 85 public `bt*` handlers at ABI 11: essentially the full practical libtorrent surface, plus
 BEP44 signed mutable items, NAT port mapping and the rp1 transport. The member harness
 (`tests/torrent-selftest.livecodescript`, folded into the suite self-test) ran **101/101 on a
-real engine** on Windows on 2026-08-17, 2026-08-20 and 2026-08-24 (first full run 96/96 on
-2026-08-10; the session lifecycle and the signed-put refusal first observed 2026-08-08), so
-every public handler has executed on an engine. The two-machine rp1/DHT transport is
-evidenced through riptide (2026-08-13, 2026-08-15), and rp1 chat was reported working
-across two machines on one LAN on 2026-08-27. Still owed: a first
-engine load of the binaries committed 2026-09-12 (which add the rp1 queue cap, the 996-byte
-BEP44 cap and the dropped-alert report) and of libtorrent 2.1 on Windows; any Linux, 32-bit
-Windows or macOS engine; and the demos' kit-unified UIs, Tor paths and remaining two-machine
-runs, which are "verified statically; needs an OXT pass". The dated ledger is in
+real engine** on Windows on 2026-08-17, 2026-08-20 and 2026-08-24, and **106/106** on
+2026-09-24 with its new BEP44 size-boundary rows (first full run 96/96 on 2026-08-10; the
+session lifecycle and the signed-put refusal first observed 2026-08-08), so every public
+handler has executed on an engine. The two-machine rp1/DHT transport is evidenced through
+riptide (2026-08-13, 2026-08-15), and rp1 chat was reported working across two machines on
+one LAN on 2026-08-27. The 2026-09-24 run loaded the binaries committed 2026-09-12 (the
+maintainer's account, and its 997-byte refusals pass on no build older than 2026-09-08):
+their first engine load, so the 996-byte BEP44 cap and libtorrent 2.1 have run on Windows;
+its bitness was not recorded. Still owed: those binaries' rp1 queue cap and dropped-alert
+report under a real overflow; the Windows DLL of the other bitness; any Linux or macOS
+engine; and the demos' kit-unified UIs, Tor paths and remaining two-machine runs, which are
+"verified statically; needs an OXT pass". The dated ledger is in
 [CLAUDE.md](CLAUDE.md). The visual dashboard widget was **decided out of v1 scope on
 2026-08-13**: a recorded decision, not a maturity gap.
 

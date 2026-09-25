@@ -42,8 +42,8 @@ script "torrentClient"
 --
 -- HONESTY (the suite convention): the torrent surface this client drives is
 -- engine-proven through the member harness (tests/torrent-selftest.livecodescript,
--- 101/101 on Windows 2026-08-17, 08-20 and 08-24; the ledger is in
--- torrentxt/CLAUDE.md), but no dated engine pass of THIS client is recorded
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24, 106/106 on 2026-09-24; the
+-- ledger is in torrentxt/CLAUDE.md), but no dated engine pass of THIS client is recorded
 -- there, and its UI was unified onto the suite kit 2026-08-14 - the rebuilt
 -- chrome and layout are verified statically; needs an OXT re-pass. (This
 -- paragraph used to cite "demo passes recorded in torrentxt/CLAUDE.md"; the

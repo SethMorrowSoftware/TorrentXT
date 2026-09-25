@@ -9,9 +9,9 @@ script "torrentSelfTest"
 --
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI, starts a
--- TorrentXT session, runs its checks (the summary line counts them: 101 on the
--- engine, last counted 2026-08-24; 106 expected since the 2026-09-24 BEP44
--- size-boundary rows below, verified statically; needs an OXT pass), and shows
+-- TorrentXT session, runs its checks (the summary line counts them: 106 on the
+-- engine, last counted 2026-09-24 on Windows, the five BEP44 size-boundary rows
+-- below included; 101 before those rows landed), and shows
 -- a green/red list. Needs the loaded
 -- org.openxtalk.library.torrent (v8+; the current ABI is v11). Run it STANDALONE -
 -- only one TorrentXT session may be live per OXT process, so close any client/demo
@@ -44,10 +44,12 @@ script "torrentSelfTest"
 -- remove it; add tracker -> list it; info-hash -> find-by-hash; pause -> is-paused;
 -- keypair determinism; immutable put -> target hash). It does NOT assert async DHT
 -- / tracker results (those return later as events) and it SKIPS the two genuinely
--- destructive handlers (btMoveStorage, btRemoveTorrent-with-delete) - those are
--- noted for a manual pass. A green run means the whole binding surface is wired.
+-- destructive paths: a real btMoveStorage move (only its stale-id refusal leg is
+-- checked, since 2026-08-17) and btRemoveTorrent-with-delete (noted for a manual
+-- pass). A green run means the whole binding surface is wired.
 
--- STATUS: last run GREEN in the 2026-08-17 engine pass (Windows x86_64, NT 10.0, OXT 9.6.3) - 101/101, folded into
+-- STATUS: last run GREEN in the 2026-09-24 engine pass (Windows: the engine reported Win32, a 2026-09-12 DLL
+-- by the maintainer's account; OXT version, OS build and bitness unrecorded) - 106/106, folded into
 -- tests/suite-selftest.livecodescript. One torrent session per process
 -- (runbook trap 5.1): close other torrent stacks before running it.
 constant kStTitle = "TorrentXT - API Self-Test"
@@ -224,7 +226,7 @@ command stShow
    -- has always rendered. This handler is ALSO called from an async pump, on a
    -- `send ... in` tick, where they are not: with another window in front the
    -- write would throw "Chunk: error in object expression", and in the suite
-   -- core that throw lands in stPump, which is where the timer re-arms.
+   -- core that throw lands in suPump, which is where the timer re-arms.
    -- PRECAUTIONARY, NOT DIAGNOSED. It was written on 2026-08-20 while chasing
    -- two engine reports that ended mid-CROSS-section, and that was the wrong
    -- cause: the third run, same build, completed 1981/0/1 through both

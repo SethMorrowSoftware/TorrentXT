@@ -26,10 +26,13 @@ library org.openxtalk.library.torrent
 -- ASCII (an LCB number is a double, so a 64-bit int would lose precision) - we
 -- keep them as their decoded String, which is lossless for display.
 --
--- Runtime behaviour needs an OXT pass to confirm (OXT cannot compile/run .lcb
--- headlessly); the static gate tools/check-livecodescript.py is run on every
--- edit. If `textDecode`/byte-chunk operators fail to resolve in a given OXT
--- build, add `use com.livecode.byte` alongside the foreign import below.
+-- Runtime behaviour is confirmed only by an OXT pass (OXT cannot compile/run .lcb
+-- headlessly): every public handler has run on an engine through
+-- tests/torrent-selftest.livecodescript, last on 2026-09-24 (the ledger is in
+-- torrentxt/CLAUDE.md), and an edit here is "verified statically; needs an OXT
+-- pass" until the next one. The static gate tools/check-livecodescript.py is run
+-- on every edit. If `textDecode`/byte-chunk operators fail to resolve in a given
+-- OXT build, add `use com.livecode.byte` alongside the foreign import below.
 
 use com.livecode.foreign
 

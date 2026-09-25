@@ -175,7 +175,9 @@ to exactly 40 characters (ONIONXT-INTEGRATION-PLAN register #17). The fix is a h
 The 2026-09-24 native rows in gotchas 6 and 7 and this finding are native results: gcc
 ASan/UBSan on Linux x86_64 against apt libtorrent 2.0.10, all four ctests green, each fix's
 rows mutation-checked against a deliberately broken shim that was then restored. None is an
-engine result; the harness's 996/997 rows are verified statically; needs an OXT pass.
+engine result. The harness's five 996/997 rows ran green on Windows in the 2026-09-24 suite
+paste (ledger): the first engine run of gotcha 7's raw cap. The 1000/1001 rows and gotcha
+6's overflow reports remain native only.
 
 Script layer:
 
@@ -231,7 +233,11 @@ does not reach the other, so weigh every nocloud fix for this demo, and every fi
 nocloud. nocloud's 2026-08-17 HEAD fixes (`qsRouteLookupKey`; no body on a HEAD text reply)
 were ported here 2026-09-24, verified statically; needs an OXT pass. The port found one more
 HEAD body in the single-file Tor web path (`qsOnionHttpText`), fixed here and still present
-in nocloud's copy.
+in nocloud's copy. The capability gate in `qsCwServe` was fixed in BOTH copies on 2026-09-25:
+it compares `("t" & tTok)` with `("t" & sCwToken)`, because bare `is` compares two
+number-like texts as numbers and a hex token shaped digits-`e`-digits overflows to +inf, as
+`1e999` in a request does (the suite's engine note 2.11, from the engine source; verified
+statically; needs an OXT pass).
 
 ## Engine evidence ledger
 
@@ -249,6 +255,7 @@ in nocloud's copy.
 | 2026-08-24 | Windows x86_64, OXT 9.6.3 | suite paste, 2,373 passed / 0 failed / 3 skipped | torrentxt 101/101 on the committed pre-2026-08-27 DLLs (the old parse path, not `load_torrent_buffer`) |
 | 2026-08-27 | not recorded | suite paste, 2440 passed / 2 failed / 3 skipped | every folded member green, torrentxt included; the 2 failures were the live loopbacks stalling on blocked loopback UDP (environment). Which torrentxt binaries were loaded is not recorded |
 | 2026-08-27 | two machines, one LAN (maintainer report, live) | rp1 chat; the DHT-signalled WebRTC chat (datachannelxt over this member's DHT) | both reported WORKING; no PASS lines were captured |
+| 2026-09-24 | Windows (the engine reports Win32), a 2026-09-12 DLL by the maintainer's account (its first engine load); OXT version, OS build and bitness not recorded | the D-23 suite paste (built from 9aa62c8; this harness as at 6401e43), 2620 passed / 5 failed / 3 skipped | torrentxt 118/0/0 (sampler 11, harness 106, the merge line): every section, incl. gotcha 7's five 996/997 rows, the v9-v11 surface and the three refusal legs; both CROSS sections green (one seed one identity; the SodiumXT-signed put and its other-seq refusal); `btStopSession` released THE session; deleteFiles=true stays manual. None of the 5 failures is torrentxt's. No pre-2026-09-08 shim passes the 997 rows, which agrees with that account. libtorrent 2.1.1's first RECORDED Windows engine run (the Windows DLLs have carried it since 2026-08-27, and that day's paste recorded neither platform nor binaries). The day's second run (8:41 PM) read the same for torrentxt, line for line |
 
 Apart from that rp1 chat report, the demos have no dated engine record in this tree; this
 ledger holds harness and transport rows only, and since 2026-09-24 the three demo headers
@@ -258,19 +265,27 @@ carries "UI unified 2026-08-14; needs an OXT re-pass".
 ## Status
 
 Engine-proven: every public `bt*` handler in `src/torrent.lcb` has executed on a real engine
-through the folded harness (suite coverage 85/85), last counted 2026-08-24 and green again
-2026-08-27; `btMoveStorage` on its stale-id refusal leg only (2026-08-17); `btRemoveTorrent`
-only with deleteFiles=false (its delete path is manual-only and has never run). The
-script-side helpers (`btStartPolling`, `btStopPolling`, `btTorrentPollOnce`, `btFormatBytes`,
-`btStateName`) are "verified statically; needs an OXT pass". Static only:
-the binaries committed 2026-09-12 (`421bab3`, release run 34657390798 from `0f17ab5`), which
-carry gotchas 6 and 7 and are compile- and ASan/UBSan-smoke-tested, and with them libtorrent
-2.1 and `load_torrent_buffer` (ctest runs them in the Windows CI lanes; the committed Windows
-DLLs have carried libtorrent 2.1.1 since 2026-08-27); every Linux, x86-win32 and
-universal-mac engine; the demo UIs; the Tor paths (Quick Share Model C, Channels #31-#33:
+through the folded harness (suite coverage 85/85), last counted 2026-09-24 (106/106 on
+Windows, gotcha 7's 996/997 rows included); `btMoveStorage` on its stale-id refusal leg only
+(2026-08-17, again 2026-09-24); `btRemoveTorrent` only with deleteFiles=false (its delete
+path is manual-only and has never run). The script-side helpers (`btStartPolling`,
+`btStopPolling`, `btTorrentPollOnce`, `btFormatBytes`, `btStateName`) are "verified
+statically; needs an OXT pass". The binaries committed 2026-09-12 (`421bab3`, release run
+34657390798 from `0f17ab5`) carry gotchas 6 and 7 and are compile- and
+ASan/UBSan-smoke-tested (ctest runs them in the Windows CI lanes; the committed Windows DLLs
+have carried libtorrent 2.1.1 since 2026-08-27). The 2026-09-24 paste loaded one of the two
+2026-09-12 Windows DLLs (the maintainer's account, and its 997 refusals pass on no shim older
+than 2026-09-08): their first engine load, and libtorrent 2.1.1's first RECORDED run on
+Windows (the Windows DLLs have carried it since 2026-08-27, whose paste recorded neither
+platform nor binaries). So gotcha 7's cap and `load_torrent_buffer` (every shim since
+2026-08-23 parses through it, and the harness adds a torrent from bytes) have a dated engine
+record. Its bitness was not recorded.
+Static only: gotcha 6's caps and reports under overflow (no engine has filled either queue);
+the Windows DLL of the other bitness; every Linux and universal-mac engine; the demo UIs;
+the Tor paths (Quick Share Model C, Channels #31-#33:
 "verified statically; needs an OXT pass + live-Tor pass"); and the two-machine Channels,
-seed/leech and resume runs (rp1 chat has only the 2026-08-27 LAN report). Open work is tracked
-in the suite's docs/WORK-PLAN.md.
+seed/leech and resume runs (rp1 chat has only the 2026-08-27 LAN report). Open work is
+tracked in the suite's docs/WORK-PLAN.md.
 
 ## Build and gates
 

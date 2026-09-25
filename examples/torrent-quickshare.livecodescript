@@ -38,8 +38,8 @@ script "quickShareApp"
 --
 -- HONESTY (the suite convention): the torrent surface this demo drives is
 -- engine-proven through the member harness (tests/torrent-selftest.livecodescript,
--- 101/101 on Windows 2026-08-17, 08-20 and 08-24; the ledger is in
--- torrentxt/CLAUDE.md), but no dated engine pass of THIS demo is recorded
+-- 101/101 on Windows 2026-08-17, 08-20 and 08-24, 106/106 on 2026-09-24; the
+-- ledger is in torrentxt/CLAUDE.md), but no dated engine pass of THIS demo is recorded
 -- there, and its UI was unified onto the suite kit 2026-08-14 - the rebuilt
 -- chrome is verified statically; needs an OXT re-pass. (This paragraph used
 -- to cite "demo passes recorded in torrentxt/CLAUDE.md"; the ledger holds
@@ -4182,7 +4182,15 @@ command qsCwServe pSocketID
       put "/" into tRest
    end if
    set the itemDelimiter to tSavedID
-   if tTok is not sCwToken then
+   -- The token is compared as TEXT: a letter on each side keeps `is` off its
+   -- number path. Bare `is` turns both operands into numbers when both parse
+   -- (C strtod, no range check; suite engine note 2.11, from the engine
+   -- source, not yet observed), and a hex token that is digits-e-digits
+   -- overflows to +inf, as do "1e999" and "inf" in a request: on about one
+   -- share in 1.2 million, `/1e999/` would have passed this gate
+   -- (2026-09-25). Case still folds, which admits only this token in
+   -- another case.
+   if ("t" & tTok) is not ("t" & sCwToken) then
       qsCwSendText pSocketID, "404 Not Found", "text/plain; charset=utf-8", "Not found."
       exit qsCwServe
    end if

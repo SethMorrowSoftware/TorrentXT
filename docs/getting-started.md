@@ -8,7 +8,7 @@ contract see `docs/api-reference.md`; for the *why* of the design see
 `docs/architecture.md`.
 
 > **Honesty note.** Every `bt*` handler of the library (`src/torrent.lcb`) used here has run
-> on a real engine (101/101 on Windows, last counted 2026-08-24; ledger in `../CLAUDE.md`);
+> on a real engine (106/106 on Windows, last counted 2026-09-24; ledger in `../CLAUDE.md`);
 > the helper-stack handlers (`btStartPolling`, `btStopPolling`, `btFormatBytes`,
 > `btStateName`) and the snippets as written are "verified statically; needs an OXT pass". They mirror `examples/torrent-client`,
 > `examples/torrent-dht-channels` and `examples/torrent-helpers` (the poll dispatcher
