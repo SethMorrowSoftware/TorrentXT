@@ -10,8 +10,9 @@ script "torrentSelfTest"
 -- HOW TO USE: open OXT, make a one-card stack, paste THIS into the STACK script
 -- (Object > Stack Script), then close+reopen. It builds its own UI, starts a
 -- TorrentXT session, runs its checks (the summary line counts them: 106 on the
--- engine, last counted 2026-09-24 on Windows, the five BEP44 size-boundary rows
--- below included; 101 before those rows landed), and shows
+-- engine, last counted 2026-09-25 on Linux x86_64 and on Windows x86_64,
+-- the five BEP44 size-boundary rows below included; 101 before those rows
+-- landed), and shows
 -- a green/red list. Needs the loaded
 -- org.openxtalk.library.torrent (v8+; the current ABI is v11). Run it STANDALONE -
 -- only one TorrentXT session may be live per OXT process, so close any client/demo
@@ -48,10 +49,14 @@ script "torrentSelfTest"
 -- checked, since 2026-08-17) and btRemoveTorrent-with-delete (noted for a manual
 -- pass). A green run means the whole binding surface is wired.
 
--- STATUS: last run GREEN in the 2026-09-24 engine pass (Windows: the engine reported Win32, a 2026-09-12 DLL
--- by the maintainer's account; OXT version, OS build and bitness unrecorded) - 106/106, folded into
--- tests/suite-selftest.livecodescript. One torrent session per process
--- (runbook trap 5.1): close other torrent stacks before running it.
+-- STATUS: last run GREEN in the 2026-09-25 engine passes - Linux (64-bit Kubuntu 24.04,
+-- the committed 2026-09-12 x86_64-linux library and the latest OXT, by the maintainer's
+-- account) and Windows (the engine reported Win32; 64-bit OXT by the maintainer's
+-- account, so the x86_64-win32 DLL; OXT version unrecorded) - 106/106 each, folded into
+-- tests/suite-selftest.livecodescript, as in the 2026-09-24 pass on that Windows machine
+-- (a 2026-09-12 DLL by the maintainer's account; OXT version and OS build unrecorded).
+-- One torrent session per process (runbook trap 5.1): close other torrent stacks
+-- before running it.
 constant kStTitle = "TorrentXT - API Self-Test"
 constant kStWidth = 660
 constant kStHeight = 620

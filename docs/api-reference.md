@@ -7,17 +7,20 @@ truth); the reference tables at the end are transcribed from that file's
 `docs/architecture.md` for the *shape* of the stack and `docs/getting-started.md`
 for the lifecycle you must follow; this file is the call-by-call contract.
 
-> **Honesty note.** Every public `bt*` handler in `src/torrent.lcb` has executed on a
-> real engine (the member harness: 96/96 on 2026-08-10, 101/101 on Windows on 2026-08-17,
-> -20 and -24, 106/106 on Windows on 2026-09-24; `btMoveStorage` on its stale-id refusal
-> leg only (2026-08-17); `btRemoveTorrent` only with deleteFiles=false - its delete path is
-> manual-only and has never run). The "Script-side helpers" section below is "verified
-> statically; needs an OXT pass". The 2026-09-24 run held the 996/997-byte boundary of
-> `btDhtPutImmutable` and `btDhtPutMutable`, which no build older than 2026-09-08 passes,
-> on a DLL committed 2026-09-12 (the maintainer's account; its bitness not recorded). The
-> overflow reporting under `btPoll` and `btRp1Poll` has not fired on an engine: "verified
-> statically; needs an OXT pass". Every field id in `src/btx_record.h` is written by the
-> shim (audited 2026-08-15). The dated ledger is in `../CLAUDE.md`.
+> **Honesty note.** Every public `bt*` handler in `src/torrent.lcb` has executed on a real
+> engine (the member harness: 96/96 on 2026-08-10, 101/101 on Windows on 2026-08-17, -20
+> and -24, 106/106 on Windows on 2026-09-24 and on Linux x86_64 and Windows on 2026-09-25;
+> `btMoveStorage` on its stale-id refusal leg only (2026-08-17); `btRemoveTorrent` only
+> with deleteFiles=false - its delete path is manual-only and has never run). The
+> "Script-side helpers" section below is "verified statically; needs an OXT pass". The
+> 2026-09-24 run held the 996/997-byte boundary of `btDhtPutImmutable` and
+> `btDhtPutMutable`, which no build older than 2026-09-08 passes, on the `x86_64-win32` DLL
+> committed 2026-09-12 (the maintainer's account, which named the bitness 64-bit on
+> 2026-09-26), and the 2026-09-25 runs held it on that release's `x86_64-linux` library
+> (the maintainer's account) and on Windows x86_64 again. The overflow reporting under
+> `btPoll` and `btRp1Poll` has not fired on an engine: "verified statically; needs an OXT
+> pass". Every field id in `src/btx_record.h` is written by the shim (audited 2026-08-15).
+> The dated ledger is in `../CLAUDE.md`.
 
 ---
 
