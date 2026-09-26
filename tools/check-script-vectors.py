@@ -39,6 +39,15 @@ work plan's Model C test row (docs/WORK-PLAN.md, torrentxt coding row 9):
      twice to two subscribers: one push fans ONE value out, and the second
      push re-seals rather than resending the first (design 6.4: "every push
      RE-SEALS through chFeedValue, never a cached nonce").
+  5. THE ROUTE TABLE (2026-09-25, WORK-PLAN torrentxt #18). torrent-quickshare's
+     qsHexKey, qsRouteKey and qsRouteLookupKey against tests/fileserver_golden.py's
+     mirrors, on that golden's own rows: the table is filled through the demo's
+     own qsHttpRoute and READ by the demo's qsRouteLookupKey, so the subscript the
+     engine folds (engine note 2.7) is the interpreter's folded one. A HEAD finds
+     its GET route, a declared HEAD wins, and GET /_EDIT is not the /_edit route.
+     The golden's built-in table is held to the demo's own qsStart registrations,
+     so the rows cannot drift from the routes the demo declares. This is the only
+     part of fileserver_golden.py a gate holds to the demo (its docstring says why).
 
 WHAT IT IS NOT. An approximation of the engine, not the engine: riptide's
 runner over the family interpreter. Nothing here promotes any label past
@@ -136,6 +145,7 @@ def sibling_missing(name, path):
 QS_DEMO = os.path.join(MEMBER, "examples", "torrent-quickshare.livecodescript")
 CH_DEMO = os.path.join(MEMBER, "examples", "torrent-dht-channels.livecodescript")
 GOLDEN = os.path.join(MEMBER, "tests", "onion_frame_golden.py")
+FS_GOLDEN = os.path.join(MEMBER, "tests", "fileserver_golden.py")
 RUNNER = os.path.join(sibling("riptide"), "tools", "check-demo-boot.py")
 SODIUM_SO = os.path.join(sibling("sodiumxt"), "src", "code", "x86_64-linux",
                          "sodiumxt.so")
@@ -149,6 +159,7 @@ if not os.path.isfile(RUNNER):
 # a loop that no longer iterates), and the run must fail, not print OK. Keyed
 # by the section's first word; measured 2026-09-24.
 FLOORS = {"qsOnionRecvData": 105, "chOnionRecvData": 105, "pins": 6,
+          "qsRouteLookupKey": 45,
           "qsKeyOpensVerifier": 11, "qsReceiveOnion": 177, "M9": 18,
           "qsDiskGuard": 16, "chDiskGuard": 16}
 
@@ -163,6 +174,7 @@ def _load(name, path):
 DB = _load("tx_demo_boot", RUNNER)
 LCS = DB.LCS
 G = _load("tx_onion_golden", GOLDEN)
+FS = _load("tx_fileserver_golden", FS_GOLDEN)
 Thrown = LCS.Thrown
 
 
@@ -397,6 +409,40 @@ class Checker:
         """Sections that ran fewer rows than their floor."""
         return ["%s ran %d rows (floor %d)" % (k, n, FLOORS[k])
                 for k, n in sorted(self.counts.items()) if n < FLOORS[k]]
+
+
+# --------------------------------------------------------------------------
+# 5. the route table (run first in main: tier 1, and cheap)
+
+def check_routes(c, ip, source):
+    """torrent-quickshare's case-exact route keys and HEAD lookup, against
+    tests/fileserver_golden.py on its own rows. The table is filled by the demo's
+    qsHttpRoute and read by the demo's qsRouteLookupKey: no key shape is typed here."""
+    c.section("qsRouteLookupKey", "torrent-quickshare's route table: case-exact keys, "
+              "HEAD -> GET, against fileserver_golden.py")
+    # the golden's built-in table IS the demo's: every qsHttpRoute qsStart makes
+    declared = sorted("%s %s" % (m.upper(), pth) for m, pth in re.findall(
+        r'^\s*qsHttpRoute\s+"([A-Za-z]+)"\s*,\s*"([^"]+)"\s*,', source, re.M))
+    c.ck("qsRouteLookupKey: the golden's LK_BUILTIN is the demo's qsStart route set",
+         declared, sorted(FS.LK_BUILTIN))
+    for text, _ in FS.HEX_ROWS:
+        c.ck("qsHexKey(%r)" % text, ip.call("qsHexKey", [text]), FS.hex_key(text))
+    for method, path in FS.KEY_ROWS:
+        c.ck("qsRouteKey(%r,%r)" % (method, path), ip.call("qsRouteKey", [method, path]),
+             FS.route_key(method, path))
+    for label, method, path, keys, want in FS.lookup_rows():
+        ip.globals["shttproutes"] = ""
+        for k in keys:
+            m, pth = k.split(" ", 1)
+            ip.call("qsHttpRoute", [m, pth, "qsInfoRoute"])
+        tbl = ip.globals["shttproutes"] if keys else ""
+        c.ck("qsRouteLookupKey: " + label, ip.call("qsRouteLookupKey", [method, path, tbl]),
+             want)
+        if want:
+            # and what it dispatches to is the handler the demo registered
+            c.ck("qsRouteLookupKey: %s dispatches to the registered handler" % label,
+                 LCS._arr_get(tbl, want), "qsInfoRoute")
+    ip.globals["shttproutes"] = ""
 
 
 # --------------------------------------------------------------------------
@@ -896,6 +942,9 @@ def main(argv):
     try:
         qs = load_demo(qs_path, "qs", sandbox) if only != "ch" else None
         ch = load_demo(ch_path, "ch", sandbox) if only != "qs" else None
+        if qs is not None:
+            with open(qs_path, "r", encoding="utf-8") as fh:
+                check_routes(c, qs, fh.read())
         for ip in (qs, ch):
             if ip is not None:
                 check_receiver(c, ip, sandbox)

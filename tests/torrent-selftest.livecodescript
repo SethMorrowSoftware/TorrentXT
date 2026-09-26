@@ -490,7 +490,9 @@ command stRun
    stAssert "btDhtKeypair secretKey is 128 hex", (the number of chars of tKey["secretKey"] is 128)
    stAssert "btDhtKeypair seed is 64 hex", (the number of chars of tKey["seed"] is 64)
    put btDhtKeypair(tKey["seed"]) into tKey2
-   stAssert "btDhtKeypair is deterministic from a seed", (tKey2["publicKey"] is tKey["publicKey"])
+   -- hex against hex compares as TEXT, a letter on each side (suite engine
+   -- note 2.11: bare `is` reads two number-like texts as numbers)
+   stAssert "btDhtKeypair is deterministic from a seed", (("h" & tKey2["publicKey"]) is ("h" & tKey["publicKey"]))
    local tTarget
    put btDhtPutImmutable(sSession, textEncode("TorrentXT self-test value", "UTF-8")) into tTarget
    stAssert "btDhtPutImmutable returns a 40-hex target", (the number of chars of tTarget is 40)

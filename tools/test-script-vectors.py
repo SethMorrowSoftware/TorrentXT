@@ -123,6 +123,14 @@ FIXTURES = [
      "      if tShort is not empty then\n         qsOnionRecvAbort pStream, tShort\n",
      "      if tShort is not empty and false then\n         qsOnionRecvAbort pStream, tShort\n",
      "qsDiskGuard: one byte short of a 300-byte file"),
+    # The case-exact route table (WORK-PLAN torrentxt #18 and nocloud #6, 2026-09-25):
+    # route keys built from the raw "METHOD /path" text again, which the engine's array
+    # subscript folds (engine note 2.7) and so, since 2026-09-24, does the model's. The
+    # gate's fold rows must name it: GET /_EDIT would dispatch to the /_edit route.
+    ("the folding lookup: route keys built from the raw METHOD /path text", "qs", 1,
+     "   return qsHexKey(toUpper(pMethod) & space & pPath)\n",
+     "   return toUpper(pMethod) & space & pPath\n",
+     "qsRouteLookupKey: GET /_EDIT (fold)"),
 ]
 
 

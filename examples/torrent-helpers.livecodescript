@@ -158,13 +158,16 @@ function btFormatBytes pBytes
    -- counted under whatever delimiter was in force rather than the one this
    -- data is written in - and under any delimiter but comma that string is a
    -- ONE-item list, so the loop never runs and a gigabyte reports itself in
-   -- bytes. Set once before the FIRST read; restore before returning, since a
-   -- humaniser has no business changing its caller's delimiter (the family's
-   -- LCS gotcha: itemDelimiter is global mutable state - set it immediately
-   -- before use, and put back what you found). Not a precaution: holde-em's
-   -- v0.15 audit found three real leaks of exactly this shape - heStackFolder
-   -- returning with the delimiter left at a slash, heSwapExt at a dot - and
-   -- answered all three with save-and-restore.
+   -- bytes. Set once before the FIRST read; restore before returning (the
+   -- family's LCS gotcha: set it immediately before use, and put back what
+   -- you found). This was written when the family took the itemDelimiter for
+   -- global state that a caller could hand in and a humaniser could hand
+   -- back, and holde-em's v0.15 audit fixed three handlers of this shape on
+   -- that reading - heStackFolder returning with the delimiter left at a
+   -- slash, heSwapExt at a dot. Engine note 2.3 has since OBSERVED it
+   -- handler-LOCAL on Windows and Linux (both directions; no Mac run), so
+   -- there a call starts at comma and cannot change its caller's. The rule
+   -- still holds for the rest of THIS handler, and the restore costs nothing.
    put the itemDelimiter into tSavedDelim
    set the itemDelimiter to comma
    repeat while tVal >= 1024 and tI < the number of items of tUnits

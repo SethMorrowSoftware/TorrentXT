@@ -2130,7 +2130,10 @@ end oxStripLineEnd
 private function oxFieldAfter pText, pMarker
    -- The whitespace-delimited token immediately following pMarker in pText, or
    -- empty. Used for METHODS=, PROGRESS=, ServiceID=, version=, SERVERHASH=, etc.
-   -- itemDelimiter is global mutable state, so save and restore it (gotcha 7).
+   -- Save and restore the itemDelimiter (gotcha 7). It is handler-local on
+   -- Windows and Linux (engine note 2.3), so this cannot reach a caller
+   -- there; the restore is the family's rule, costs nothing, and holds on
+   -- macOS, which has not run the probe.
    local tPos, tRest, tSaved, tOut
    put offset(pMarker, pText) into tPos
    if tPos is 0 then
@@ -4310,7 +4313,9 @@ command chFollow
       chLog "Paste a 64-character channel address (public key), or a 'Name | key' card, to follow."
       exit chFollow
    end if
-   if tKey is sPub then
+   -- as TEXT, a letter on each side (suite engine note 2.11): a pasted key
+   -- shaped digits-e-digits must not read as a number equal to ours
+   if ("h" & tKey) is ("h" & sPub) then
       chLog "That is your own channel."
       exit chFollow
    end if
@@ -4403,7 +4408,7 @@ command chUnfollow
    end if
    put empty into tLeft
    repeat for each line tLine in sFollows
-      if tLine is not empty and tLine is not tKey then
+      if tLine is not empty and ("h" & tLine) is not ("h" & tKey) then
          if tLeft is empty then
             put tLine into tLeft
          else
@@ -5486,7 +5491,10 @@ function chVerifyOnionIdentity
       put tKp["publicKey"] into tBtPub
       -- the real cross-impl check: btDhtKeypair vs sxSignKeypairFromSeed, byte-equal
       sxSignKeypairFromSeed sxHex2Bin(textEncode(tSeed, "ASCII")), tSxPub, tSxSec
-      if sxHex2Bin(textEncode(tBtPub, "ASCII")) is not tSxPub then
+      -- byte-exact through SodiumXT's own compare: bare `is` folds case on
+      -- bytes and reads number-like operands as numbers (engine notes 2.7,
+      -- 2.11), neither of which a key comparison may do
+      if not sxMemEqual(sxHex2Bin(textEncode(tBtPub, "ASCII")), tSxPub) then
          return false
       end if
       -- and the address codec is self-consistent for that key
@@ -5662,7 +5670,8 @@ function chChannelIndexForPub pPubHex
    local tI, tKp
    repeat with tI = 1 to chChannelCount()
       put btDhtKeypair(sChannels[tI]["seed"]) into tKp
-      if toLower(tKp["publicKey"]) is toLower(pPubHex) then
+      -- hex against hex as TEXT, a letter on each side (engine note 2.11)
+      if ("h" & toLower(tKp["publicKey"])) is ("h" & toLower(pPubHex)) then
          return tI
       end if
    end repeat
@@ -5677,7 +5686,9 @@ function chFindTorrentByHash pHash
       put btTorrentHandleAt(sSession, tI) into tH
       if tH is not 0 then
          put btTorrentStatus(tH) into tS
-         if toLower(tS["infoHashV1"]) is pHash or toLower(tS["infoHashV2"]) is pHash then
+         -- hex against hex as TEXT, a letter on each side (engine note 2.11)
+         if ("h" & toLower(tS["infoHashV1"])) is ("h" & pHash) or \
+               ("h" & toLower(tS["infoHashV2"])) is ("h" & pHash) then
             return tH
          end if
       end if
@@ -7189,7 +7200,7 @@ end chDefaultSave
 
 function chSelectedLine
    local tNum
-   set the itemDelimiter to comma   -- the hilitedLines is comma-delimited; itemDelimiter is global
+   set the itemDelimiter to comma   -- the hilitedLines is comma-delimited; set it, never assume it
    put item 1 of (the hilitedLines of field "chSubs") into tNum
    if tNum is empty or tNum is not a number then
       return 0
@@ -7252,9 +7263,12 @@ function chFmtBytes pBytes
    put "B,KiB,MiB,GiB,TiB" into tUnits
    put pBytes into tVal
    put 1 into tI
-   -- Save and restore the itemDelimiter around the one span that reads items: it is
-   -- engine-global (engine note 2.3), so the bare `set ... to comma` this function had
-   -- until 2026-09-24 clobbered any caller mid-parse with another delimiter.
+   -- Save and restore the itemDelimiter around the one span that reads items. The
+   -- bare `set ... to comma` this function had until 2026-09-24 was read then as
+   -- clobbering any caller mid-parse, on the premise that the delimiter is
+   -- engine-global; engine note 2.3 has since OBSERVED it handler-local on Windows
+   -- and Linux (both directions; no Mac run), so there it reached no caller. The
+   -- restore keeps the rest of this handler on what it found and costs nothing.
    put the itemDelimiter into tOldDelim
    set the itemDelimiter to comma
    repeat while tVal >= 1024 and tI < the number of items of tUnits

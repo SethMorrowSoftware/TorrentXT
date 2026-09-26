@@ -115,11 +115,13 @@ local sFsTxName         -- array: stream -> the file's leaf name (for the log)
 local sFsTxDeadline     -- array: stream -> the milliseconds of the last activity (watchdog)
 local sFsMethod         -- array: stream -> the current request's method (HEAD must send no body)
 -- Dynamic routes (the light xTalk backend). A hosted web app can call back into
--- this stack: sHttpRoutes maps "METHOD /path" -> the name of an xTalk handler that
+-- this stack: sHttpRoutes maps METHOD + path to the name of an xTalk handler that
 -- answers the request (see qsHttpRoute / qsHttpReply below). Works over BOTH
 -- transports; on the direct web link a route sits under the token, e.g.
--- http://<ip>:<port>/<token>/_qs/info.
-local sHttpRoutes       -- array: "METHOD /path" -> handler name in this script
+-- http://<ip>:<port>/<token>/_qs/info. Keyed by qsRouteKey, case-exact since
+-- 2026-09-25: a table keyed by the path text answered GET /_EDIT out of the /_edit
+-- route on the engine, which folds array keys (qsRouteKey says why).
+local sHttpRoutes       -- array: qsRouteKey(method, path) -> handler name in this script
 -- The optional live WEB EDITOR (Phase C). Turns the served folder read-WRITE from a
 -- browser, so it is deliberately locked down: OFF by default; a SodiumXT (Argon2id)
 -- edit password; a random per-login session token; and - the hard rule - editing is
@@ -1522,9 +1524,12 @@ function qsBytes pBytes
    put "B,KiB,MiB,GiB,TiB" into tUnits
    put pBytes into tVal
    put 1 into tI
-   -- Save and restore the itemDelimiter around the one span that reads items: it is
-   -- engine-global (engine note 2.3), so the bare `set ... to comma` this function had
-   -- until 2026-09-24 clobbered any caller mid-parse with another delimiter.
+   -- Save and restore the itemDelimiter around the one span that reads items. The
+   -- bare `set ... to comma` this function had until 2026-09-24 was read then as
+   -- clobbering any caller mid-parse, on the premise that the delimiter is
+   -- engine-global; engine note 2.3 has since OBSERVED it handler-local on Windows
+   -- and Linux (both directions; no Mac run), so there it reached no caller. The
+   -- restore keeps the rest of this handler on what it found and costs nothing.
    put the itemDelimiter into tOldDelim
    set the itemDelimiter to comma
    repeat while tVal >= 1024 and tI < the number of items of tUnits
@@ -2802,39 +2807,81 @@ end qsHttpParse
 
 -- Register a dynamic route: pHandler is a command in THIS script, called as
 -- pHandler pConn, pRequest (pRequest is the parsed array; reply with qsHttpReply).
+-- Keyed by qsRouteKey (case-exact). The value stays the bare handler name: nothing in
+-- this demo walks the table (nocloud's does, for Allow, so its entries carry their
+-- method and path as well).
 command qsHttpRoute pMethod, pPath, pHandler
-   put pHandler into sHttpRoutes[toUpper(pMethod) & space & pPath]
+   put pHandler into sHttpRoutes[qsRouteKey(pMethod, pPath)]
 end qsHttpRoute
 
--- The route-table key a request should LOOK UP - the other half of qsHttpRoute's key,
--- and the one place HEAD is turned back into GET (ported 2026-09-24 from nocloud's
--- 2026-08-17 qsRouteLookupKey). Every method looks up its own "METHOD /path" key; a
--- HEAD looks up its own when the table declares a HEAD route (an explicit one wins -
--- it may want to answer differently) and otherwise the GET key, because HEAD is
--- GET-without-a-body. Until the port both serve paths built the key from the literal
--- method, so a HEAD missed the table and fell through to the static pipeline, where a
--- route path has no file and no "." in its leaf: qsSiteSpaTarget handed back
--- index.html, so on a shared folder with one, HEAD /_qs/info answered 200 text/html
--- while GET /_qs/info answered JSON. The body is suppressed downstream (qsFsSendText /
--- qsCwSendText), so the fallback reply carries the GET's headers and no bytes. Pure
--- over pTable; nocloud mirrors it as route_lookup_key() in its golden, and this demo's
--- tests/fileserver_golden.py does not yet. Verified statically; needs an OXT pass.
+-- ---- route-table keys: CASE-EXACT, on purpose (2026-09-25; nocloud's, ported the
+-- same day, as its qsRouteLookupKey was on 2026-09-24) ----------------------------------
+-- HTTP paths are case-sensitive (RFC 3986 6.2.2.1: only the scheme and host fold). The
+-- table was keyed by the TEXT "METHOD /path", and the engine folds array KEYS unless the
+-- caseSensitive (a handler-local property) is true - tA["A"] and tA["a"] are ONE element
+-- (the suite's engine note 2.7, OBSERVED 2026-09-15) - so GET /_EDIT reached the
+-- /_edit route and a HEAD to /_QS/INFO fell back to /_qs/info. Nothing failed OPEN (the
+-- editor's handlers gate themselves on qsEditReachable, whatever the path's case), but a
+-- path the server never declared was answered by a route. This demo has no reserved-path
+-- guard (nocloud's qsHttpReservedPath, 2026-08-17, was never ported), so a mixed-case
+-- /_Edit now falls to the static pipeline like any other undeclared path.
+
+-- The lowercase hex of pText's UTF-8 bytes: an array key no case fold can merge with
+-- another, because its only letters are a-f and always lower case. A pure-script loop
+-- rather than binaryDecode("H*"): tools/check-script-vectors.py runs this handler through
+-- an interpreter that models no binaryDecode, and a route key is a few dozen bytes.
+-- Pure; tests/fileserver_golden.py mirrors it as hex_key() (nocloud's golden too).
+function qsHexKey pText
+   local tBytes, tDigits, tHex, tI, tN
+   put "0123456789abcdef" into tDigits
+   put textEncode(pText, "UTF-8") into tBytes
+   put empty into tHex
+   repeat with tI = 1 to the number of bytes of tBytes
+      put byteToNum(byte tI of tBytes) into tN
+      put (char (tN div 16 + 1) of tDigits) & (char (tN mod 16 + 1) of tDigits) after tHex
+   end repeat
+   return tHex
+end qsHexKey
+
+-- The route-table key for pMethod + pPath: the hex (qsHexKey) of "METHOD /path", the method
+-- upper-cased first. Methods fold ON PURPOSE (a "get" has always matched GET here, and the
+-- serve paths' method tests fold too); paths do not. Pure; golden: route_key().
+function qsRouteKey pMethod, pPath
+   return qsHexKey(toUpper(pMethod) & space & pPath)
+end qsRouteKey
+
+-- The route-table key a request DISPATCHES to, or empty when pTable has no route for it -
+-- the one place HEAD is turned back into GET (ported 2026-09-24 from nocloud's
+-- 2026-08-17 qsRouteLookupKey). Every method looks up its own key; a HEAD that finds no
+-- HEAD route of its own (an explicit one wins - it may want to answer differently) falls
+-- back to the GET key, because HEAD is GET-without-a-body. Until the port both serve
+-- paths built the key from the literal method, so a HEAD missed the table and fell
+-- through to the static pipeline, where a route path has no file and no "." in its leaf:
+-- qsSiteSpaTarget handed back index.html, so on a shared folder with one, HEAD /_qs/info
+-- answered 200 text/html while GET /_qs/info answered JSON. The body is suppressed
+-- downstream (qsFsSendText / qsCwSendText), so the fallback reply carries the GET's
+-- headers and no bytes. Since 2026-09-25 the keys are case-exact (qsRouteKey) and this
+-- READS the table itself, so tools/check-script-vectors.py drives the read the engine
+-- folds against tests/fileserver_golden.py's route_lookup_key(). Verified statically;
+-- needs an OXT pass.
 function qsRouteLookupKey pMethod, pPath, pTable
    local tMethod, tKey
-   put toUpper(pMethod) into tMethod
-   put tMethod & space & pPath into tKey
-   if tMethod is not "HEAD" then
-      return tKey
-   end if
-   -- an empty table (sHttpRoutes before qsStart registers the first route) declares no
-   -- HEAD route: the answer the lookup below would give, without indexing a non-array
+   -- an empty table (sHttpRoutes before qsStart registers the first route) routes nothing
    if pTable is not an array then
-      return "GET" & space & pPath
+      return empty
    end if
+   put toUpper(pMethod) into tMethod
+   put qsRouteKey(tMethod, pPath) into tKey
    if pTable[tKey] is not empty then
       return tKey
    end if
-   return "GET" & space & pPath
+   if tMethod is "HEAD" then
+      put qsRouteKey("GET", pPath) into tKey
+      if pTable[tKey] is not empty then
+         return tKey
+      end if
+   end if
+   return empty
 end qsRouteLookupKey
 
 -- Call a route handler; a throw or a missing handler becomes a clean 500 (so a buggy
@@ -3038,7 +3085,13 @@ function qsEditAuthed pConn, pRequest
    if sEditSession is empty then
       return false
    end if
-   return (pRequest["x-edit-token"] is sEditSession)
+   -- As TEXT, a letter on each side, exactly as qsCwServe's capability gate:
+   -- bare `is` compares two number-like texts as NUMBERS (suite engine note
+   -- 2.11), so on a session whose hex token reads as digits-e-digits and
+   -- overflows, an `x-edit-token: 1e999` header would have passed this WRITE
+   -- gate. Found by the family checker's check 23 (2026-09-25), which the
+   -- capability-gate sweep had missed; nocloud's twin took the same fix.
+   return (("t" & pRequest["x-edit-token"]) is ("t" & sEditSession))
 end qsEditAuthed
 
 -- Enable the editor with a login password. Derives an Argon2id key from the password +
@@ -3401,9 +3454,10 @@ command qsFsServePath pStream, pHeaders
    end if
    -- a registered dynamic route answers FIRST (any method, so a POST works); only
    -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
-   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey).
+   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey), which
+   -- answers the key that dispatches, or empty; the path matches case-exactly.
    put qsRouteLookupKey(tMethod, tPath, sHttpRoutes) into tRouteKey
-   if sHttpRoutes[tRouteKey] is not empty then
+   if tRouteKey is not empty then
       put tPath into pHeaders["__path"]
       qsHttpDispatch ("ox:" & pStream), sHttpRoutes[tRouteKey], pHeaders
       exit qsFsServePath
@@ -4196,9 +4250,10 @@ command qsCwServe pSocketID
    end if
    -- a registered dynamic route (under the token) answers FIRST, any method. Give the
    -- handler the app-relative path (token stripped) so a route is transport-neutral.
-   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey).
+   -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey), which
+   -- answers the key that dispatches, or empty; the path matches case-exactly.
    put qsRouteLookupKey(tMethod, tRest, sHttpRoutes) into tRouteKey
-   if sHttpRoutes[tRouteKey] is not empty then
+   if tRouteKey is not empty then
       put tRest into tHeaders["__path"]
       qsHttpDispatch ("cw:" & pSocketID), sHttpRoutes[tRouteKey], tHeaders
       exit qsCwServe

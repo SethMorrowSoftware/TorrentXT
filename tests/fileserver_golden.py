@@ -24,6 +24,22 @@ Mirrors these LiveCodeScript handlers:
   qsEditSafePath  -> edit_safe_path()   (web-editor WRITE-path confinement - linchpin)
   qsEditIsLocal   -> edit_is_local()    (web-editor LAN-first gate - the other linchpin)
   qsQueryParam    -> query_param()      (editor read/write ?path= extraction)
+  qsHexKey        -> hex_key()          (lowercase hex of the UTF-8 bytes: a key no case
+                                         fold can merge; 2026-09-25)
+  qsRouteKey      -> route_key()        (the case-exact route-table key: the hex of
+                                         "METHOD /path", the method upper-cased)
+  qsRouteLookupKey -> route_lookup_key() (the key a request DISPATCHES to, or "": a HEAD
+                                         falls back to the GET route; GET /_EDIT is not the
+                                         /_edit route. WORK-PLAN torrentxt #18, 2026-09-25)
+
+The last three are the only mirrors here that a gate holds to the SHIPPED demo:
+tools/check-script-vectors.py (section "qsRouteLookupKey") fills the demo's route table
+through its own qsHttpRoute and drives qsHexKey, qsRouteKey and qsRouteLookupKey through
+the family interpreter, whose array keys fold as the engine's do, against these mirrors
+on these rows. The rest of this file restates the demo and is checked against nothing:
+it was copied from nocloud's golden, and five of its mirrors (has_dot_segment,
+http_req_length, file_size_probe, safe_filename, rate_short / eta_short) name handlers
+this demo does not have (2026-09-25).
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
@@ -411,6 +427,126 @@ def spa_is_route(rel_path):
     return "." not in leaf
 
 
+# ---- route-table keys: case-exact (2026-09-25; nocloud's, ported the same day) ----
+# HTTP paths are case-sensitive, and until 2026-09-25 this demo's were not: sHttpRoutes
+# was keyed by the TEXT "METHOD /path", and the engine folds array keys (the suite's
+# engine note 2.7), so GET /_EDIT reached the /_edit route. The demo now keys by the hex
+# of that text (qsRouteKey), and qsRouteLookupKey reads the table itself, answering the
+# key that dispatches or "". The mirrors take a table as readable "METHOD /path" strings.
+
+def hex_key(text):
+    """Mirror qsHexKey: the lowercase hex of the text's UTF-8 bytes. Its only letters are
+    a-f, always lower case, so key.lower() == key: no case fold merges two of them."""
+    return text.encode("utf-8").hex()
+
+
+def route_key(method, path):
+    """Mirror qsRouteKey: the hex of "METHOD /path", the method upper-cased (methods fold
+    on purpose; paths do not)."""
+    return hex_key(method.upper() + " " + path)
+
+
+def rk(readable):
+    """A readable "METHOD /path" table entry -> its route_key (vector shorthand)."""
+    method, path = readable.split(" ", 1)
+    return route_key(method, path)
+
+
+def table(readables):
+    """The key set of a table holding these readable "METHOD /path" routes."""
+    return set(rk(x) for x in readables)
+
+
+def engine_folds_onto(readables, key):
+    """The ENGINE's subscript over raw-text keys (engine note 2.7, ASCII): does `key` reach
+    a stored key when case folds?"""
+    return any(k.lower() == key.lower() for k in readables)
+
+
+def old_raw_lookup_hits(method, path, readables):
+    """Would the PRE-2026-09-25 lookup have dispatched this request on the engine? It keyed
+    by the raw "METHOD /path" text, a HEAD falling back to GET, and the subscript folded.
+    Not a mirror of anything shipped: the fold rows' witness."""
+    m = method.upper()
+    if engine_folds_onto(readables, m + " " + path):
+        return True
+    return m == "HEAD" and engine_folds_onto(readables, "GET " + path)
+
+
+def route_lookup_key(method, path, keys):
+    """Mirror qsRouteLookupKey: the route-table key a request DISPATCHES to, or "" when the
+    table has no route for it. Every method looks up its own key; a HEAD with no HEAD route
+    of its own (an explicit one wins) falls back to the GET key, because HEAD is
+    GET-without-a-body (the 2026-09-24 port of nocloud's 2026-08-17 fix: until then a HEAD
+    missed the table and the SPA fallback answered HEAD /_qs/info with index.html). `keys`
+    is the key set of the table (table()); an empty one routes nothing."""
+    method = method.upper()
+    key = route_key(method, path)
+    if key in keys:
+        return key
+    if method == "HEAD" and route_key("GET", path) in keys:
+        return route_key("GET", path)
+    return ""
+
+
+# The rows the execution gate drives against the demo, and main() below against the
+# mirror: (method, path, table, the readable route that dispatches, or "" for none).
+# The table is the demo's own built-in set (qsStart), plus a user-style one with a
+# declared HEAD route, as nocloud's golden has. FOLD rows are the ones the pre-fix raw
+# keys merged onto a declared route (main() re-proves each through old_raw_lookup_hits,
+# so a fold row that never exercised the fold fails here, not silently).
+LK_BUILTIN = ["GET /_qs/info", "GET /_edit", "POST /_edit/login", "GET /_edit/api/list",
+              "GET /_edit/api/read", "PUT /_edit/api/write"]
+LK_USER = ["GET /api/hello", "HEAD /probe", "GET /probe", "POST /api/submit"]
+LK_ODD = ["GET /caf\u00e9", "GET /v/1"]
+LOOKUP_ROWS = [
+    ("HEAD", "/_qs/info", LK_BUILTIN, "GET /_qs/info"),    # the built-in route answers
+    ("GET", "/_qs/info", LK_BUILTIN, "GET /_qs/info"),
+    ("HEAD", "/api/hello", LK_USER, "GET /api/hello"),     # a HEAD finds its GET route
+    ("HEAD", "/probe", LK_USER, "HEAD /probe"),            # a DECLARED HEAD route wins
+    ("GET", "/probe", LK_USER, "GET /probe"),              # ... and GET keeps its own
+    ("GET", "/nope", LK_USER, ""),                         # a miss dispatches nothing
+    ("POST", "/api/submit", LK_USER, "POST /api/submit"),  # no fallback for other verbs
+    ("POST", "/probe", LK_USER, ""),                       # ... even where GET exists
+    ("HEAD", "/nope", LK_USER, ""),                        # falls back, then misses
+    ("head", "/api/hello", LK_USER, "GET /api/hello"),     # method upper-cased first
+    ("HEAD", "/api/hello", [], ""),                        # an EMPTY table routes nothing
+    ("GET", "/api/hello", [], ""),
+]
+FOLD_ROWS = [                                              # each must dispatch NOTHING
+    ("GET", "/_EDIT", LK_BUILTIN),                         # GET /_EDIT is not /_edit
+    ("PUT", "/_Edit/Api/Write", LK_BUILTIN),
+    ("HEAD", "/_QS/INFO", LK_BUILTIN),                     # nor through HEAD -> GET
+    ("GET", "/API/hello", LK_USER),
+    ("HEAD", "/API/HELLO", LK_USER),
+    ("HEAD", "/PROBE", LK_USER),                           # nor onto a declared HEAD route
+    ("POST", "/API/submit", LK_USER),
+]
+ODD_ROWS = [                                               # bytes, no fold, no numeric alias
+    ("GET", "/caf\u00e9", LK_ODD, "GET /caf\u00e9"),
+    ("GET", "/CAF\u00c9", LK_ODD, ""),
+    ("GET", "/v/1", LK_ODD, "GET /v/1"),
+    ("GET", "/v/01", LK_ODD, ""),
+    ("GET", "/v/1.0", LK_ODD, ""),
+]
+HEX_ROWS = [("", ""), ("GET /api/x", "474554202f6170692f78"), ("/caf\u00e9", "2f636166c3a9"),
+            ("A", "41"), ("a", "61"), ("\x00\x7f", "007f")]
+KEY_ROWS = [("GET", "/api/x"), ("get", "/api/x"), ("GET", "/API/x"), ("POST", "/caf\u00e9"),
+            ("HEAD", "/")]
+
+
+def lookup_rows():
+    """Every lookup row as (label, method, path, table, the key the mirror dispatches to)."""
+    out = []
+    for method, path, keys, _ in LOOKUP_ROWS + ODD_ROWS:
+        out.append(("%s %s" % (method, path), method, path, keys,
+                    route_lookup_key(method, path, table(keys))))
+    for method, path, keys in FOLD_ROWS:
+        out.append(("%s %s (fold)" % (method, path), method, path, keys,
+                    route_lookup_key(method, path, table(keys))))
+    return out
+
+
 # ---- qsCwServe: the clearweb /<token>/ capability gate ----------------------
 # The first path segment must equal the share's random token, else 404 (an open
 # port must not be an open directory). The rest of the path is folder-relative.
@@ -709,13 +845,33 @@ def main():
     ]:
         check("query_param(%r,%r)" % (query, name), query_param(query, name), want)
 
+    # -- the case-exact route keys (2026-09-25) and the lookup --
+    for text, want in HEX_ROWS:
+        check("hex_key(%r)" % text, hex_key(text), want)
+    for text in ("GET /api/x", "/caf\u00e9", "PUT /_EDIT/API", "\x00\xff"):
+        check("hex_key(%r) has no case left to fold" % text,
+              hex_key(text) == hex_key(text).lower() and all(c in "0123456789abcdef"
+                                                            for c in hex_key(text)), True)
+    check("route_key upper-cases the method", route_key("get", "/api/x"), "474554202f6170692f78")
+    check("route_key keeps the path's case",
+          route_key("GET", "/_EDIT") != route_key("GET", "/_edit"), True)
+    for method, path, keys, want in LOOKUP_ROWS + ODD_ROWS:
+        check("route_lookup_key(%r,%r)" % (method, path),
+              route_lookup_key(method, path, table(keys)), rk(want) if want else "")
+    for method, path, keys in FOLD_ROWS:
+        check("fold witness: %s %s collided under the old raw key" % (method, path),
+              old_raw_lookup_hits(method, path, keys), True)
+        check("route_lookup_key(%r,%r) folds nothing" % (method, path),
+              route_lookup_key(method, path, table(keys)), "")
+
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
     print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
           "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
           "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
-          "probe, filename sanitise, rate + ETA format all match)")
+          "probe, filename sanitise, rate + ETA format, case-exact route keys + HEAD "
+          "route lookup + fold rows all match)")
     return 0
 
 

@@ -150,6 +150,11 @@ command myEcho pConn, pRequest                  -- pRequest has __method/__path/
 end myEcho
 ```
 
+A route matches its path **exactly, letter case included**: `/api/echo` is not
+`/API/echo` (the method matches in any case; `get` is `GET`). A `HEAD` reaches the `GET`
+route unless a `HEAD` route is registered for the path. *(Case-exact since 2026-09-25;
+verified statically; needs an OXT pass.)*
+
 A handler **must call `qsHttpReply` exactly once** - that sends the response and closes
 the connection; a route that returns without replying leaves the request hanging until
 the browser gives up. Routes run on the one UI thread, so keep a handler **light**

@@ -1333,7 +1333,9 @@ function tcFindByHash pHash
    put btTorrentCount(sSession) into tCount
    repeat with tI = 0 to (tCount - 1)
       put btTorrentHandleAt(sSession, tI) into tH
-      if tH is not 0 and toLower(btInfoHash(tH)) is toLower(pHash) then
+      -- the info-hashes compare as TEXT, a letter on each side (suite engine
+      -- note 2.11: bare `is` reads two number-like texts as numbers)
+      if tH is not 0 and ("h" & toLower(btInfoHash(tH))) is ("h" & toLower(pHash)) then
          return tH
       end if
    end repeat
