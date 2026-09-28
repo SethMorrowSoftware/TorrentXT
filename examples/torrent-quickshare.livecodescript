@@ -2642,7 +2642,10 @@ end qsHtmlEncrypted
 -- per-stream state, and the pump opens/seeks/reads/closes the file within a single
 -- tick (no yield between), so two browsers can pull the SAME file without sharing a
 -- cursor (LiveCode keys a file handle by path and no-ops a second open). Read-only
--- (GET/HEAD); ".." is refused after URL-decoding; file names are HTML-escaped. This
+-- (GET/HEAD); ".." is refused after URL-decoding; file names are HTML-escaped; a
+-- dot-leading segment does not exist (404, and never listed) and neither does a
+-- reserved /_qs or /_edit path no route answered (2026-09-27, qsHasDotSegment and
+-- qsHttpReservedPath; verified statically; needs an OXT + live-Tor pass). This
 -- is the standalone Onion File Server folded into Quick Share. Verified STATICALLY +
 -- by tests/fileserver_golden.py; the one unproven primitive is `seek to N in file`
 -- in qsFsPump (flagged VERIFY), used for every download so any base error is a loud,
@@ -2822,9 +2825,10 @@ end qsHttpRoute
 -- (the suite's engine note 2.7, OBSERVED 2026-09-15) - so GET /_EDIT reached the
 -- /_edit route and a HEAD to /_QS/INFO fell back to /_qs/info. Nothing failed OPEN (the
 -- editor's handlers gate themselves on qsEditReachable, whatever the path's case), but a
--- path the server never declared was answered by a route. This demo has no reserved-path
--- guard (nocloud's qsHttpReservedPath, 2026-08-17, was never ported), so a mixed-case
--- /_Edit now falls to the static pipeline like any other undeclared path.
+-- path the server never declared was answered by a route. A mixed-case /_Edit now
+-- misses the table and falls to the static pipeline, whose reserved-namespace guard
+-- (qsHttpReservedPath, nocloud's of 2026-08-17, ported here 2026-09-27) answers it a
+-- 404; until that port it was served like any other undeclared path.
 
 -- The lowercase hex of pText's UTF-8 bytes: an array key no case fold can merge with
 -- another, because its only letters are a-f and always lower case. A pure-script loop
@@ -3278,7 +3282,7 @@ end qsEditReadRoute
 -- Auth required; qsEditSafePath confines the target to the served root. The body is
 -- already bounded by kFsMaxReq at the transport, and we re-check the editor cap.
 command qsEditWriteRoute pConn, pRequest
-   local tRel, tDisk, tBody, tErr
+   local tRel, tSegs, tDisk, tBody, tErr
    if not qsEditAuthed(pConn, pRequest) then
       qsEditDeny pConn
       exit qsEditWriteRoute
@@ -3287,6 +3291,23 @@ command qsEditWriteRoute pConn, pRequest
    put qsEditSafePath(qsEditServedRoot(), tRel) into tDisk
    if tDisk is empty then
       qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Bad path."
+      exit qsEditWriteRoute
+   end if
+   -- refuse writing a hidden (dot-leading) file or folder (2026-09-27, nocloud's
+   -- round-5 editor rule): the listing never shows one and the serve paths 404 it, so a
+   -- save there is a file nobody can see, and this also refuses a trailing "." segment.
+   -- Reading one (qsEditReadRoute) is unchanged: the editor is LAN-only and
+   -- password-gated, and keeps its own rules (qsEditSafePath).
+   -- The check reads the path with qsEditSafePath's separators: that handler turns
+   -- every "\" into "/", so "\.env" or "sub\.hidden\x.txt" WRITES a dot path, and
+   -- qsHasDotSegment splits on "/" alone - read raw, it saw one segment starting "\"
+   -- and let both through (nocloud's copy too; found by the same day's review, pinned
+   -- by the editor rows of tools/check-script-vectors.py; verified statically; needs
+   -- an OXT pass).
+   put tRel into tSegs
+   replace "\" with "/" in tSegs
+   if qsHasDotSegment(tSegs) then
+      qsHttpReply pConn, 400, "text/plain; charset=utf-8", "Hidden (dot) paths cannot be written through the editor."
       exit qsEditWriteRoute
    end if
    if there is a folder tDisk then
@@ -3435,8 +3456,68 @@ function qsEditHtml
       "})();</script></body></html>")
 end qsEditHtml
 
+-- ---- the static pipeline's two refusals (ported 2026-09-27 from nocloud) ----------
+-- This demo and nocloud share QuickShare's server code but, until 2026-09-27, not
+-- these two guards (torrentxt/CLAUDE.md, "The Quick Share lineage"): the folder server
+-- answered /.git/config and /.env over Tor and the web link, and its listing showed
+-- dot-folders, against the shared folder's privacy promise; and a mixed-case /_Edit that
+-- named no route fell to the static pipeline, which looked for a real "_Edit" folder in
+-- the share and, failing that, answered the SPA fallback's index.html at 200 for a path
+-- this server reserves. Both handlers are nocloud's, byte for byte in their code.
+
+-- Round-5 hardening (nocloud's): does any "/"-separated SEGMENT of a decoded path
+-- start with a dot? The static pipelines (listing + serving, BOTH transports) treat
+-- such paths as nonexistent - sharing a website folder must never leak .git, .env,
+-- editor droppings and friends over an anonymous link (the classic static-host
+-- mistake). 404, never 403: hidden means "does not exist". The LAN-gated,
+-- password-gated editor keeps its own rules (qsEditSafePath): it may list and read a
+-- dotfile, and refuses only to WRITE one (qsEditWriteRoute). Pure; mirrored by
+-- has_dot_segment() in tests/fileserver_golden.py, and driven against it by
+-- tools/check-script-vectors.py.
+function qsHasDotSegment pPath
+   local tSeg, tSavedID
+   put the itemDelimiter into tSavedID
+   set the itemDelimiter to "/"
+   repeat for each item tSeg in pPath
+      if tSeg is not empty and char 1 of tSeg is "." then
+         set the itemDelimiter to tSavedID
+         return true
+      end if
+   end repeat
+   set the itemDelimiter to tSavedID
+   return false
+end qsHasDotSegment
+
+-- Is pPath inside a RESERVED server namespace? /_qs (the observability endpoint) and
+-- /_edit (the LAN editor) belong to the ROUTE layer alone: the static pipeline must never
+-- resolve one off disk or through the SPA fallback, so qsFsServePath and qsCwServe answer
+-- a request there that named no route (a method the table does not declare, a typo, a
+-- path in another case) with a 404, never a real "_qs" folder in somebody's share nor
+-- index.html. Prefix-exact on purpose: "/_qsx" and "/_editor" are ordinary paths.
+-- CASE-FOLDED on purpose: "/_QS/info" and "/_Edit" are reserved too. The route table is
+-- case-exact (qsRouteKey), so this guard is STRICTER than the table: it refuses a
+-- mixed-case prefix no route answers, which is the safe side, and toLower makes the fold
+-- the same on the engine (whose `is` and `begins with` fold anyway) as in the golden and
+-- the execution gate's interpreter (which compare exactly). This demo has no user routes,
+-- so nocloud's other two callers (qsUserPathValid, qsRouteMatch) have no twin here.
+-- Pure; golden: reserved_path().
+function qsHttpReservedPath pPath
+   local tLow
+   put toLower(pPath) into tLow
+   if tLow is "/_qs" or tLow begins with "/_qs/" then
+      return true
+   end if
+   if tLow is "/_edit" or tLow begins with "/_edit/" then
+      return true
+   end if
+   return false
+end qsHttpReservedPath
+
 -- Route: a folder (listing or its index.html, with a trailing-slash redirect), a
--- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused.
+-- file (streamed, Range-aware), else 404. Only GET/HEAD; ".." refused. The static
+-- half answers a 404 for a reserved namespace (qsHttpReservedPath) above the 503,
+-- and a 404 for any dot-leading segment (qsHasDotSegment) below it, in nocloud's
+-- order (its qsHttpServeStatic); qsCwServe's folder branch makes the same two refusals.
 command qsFsServePath pStream, pHeaders
    local tRaw, tPath, tDisk, tIndex, tMethod, tRoot, tSpa, tRouteKey
    put pHeaders["__method"] into tMethod
@@ -3452,6 +3533,18 @@ command qsFsServePath pStream, pHeaders
       qsFsSendText pStream, "403 Forbidden", "text/plain; charset=utf-8", "Forbidden."
       exit qsFsServePath
    end if
+   -- ANCHORED at the share root (2026-09-27): the disk path below is tRoot & tPath, and
+   -- tRoot carries no trailing slash, so a request line whose target does not start
+   -- with "/" (Tor Browser never sends one; a raw client can: `GET -old/x HTTP/1.1`)
+   -- named a SIBLING folder whose name begins with the share's - "/home/u/Site" &
+   -- "-old/x" - and served its files and its listing, no ".." needed. Every path is
+   -- read from the share's root, as tests/fileserver_golden.py's serve_static always
+   -- modelled it. Found by the review of the dotfile port, pinned by
+   -- tools/check-script-vectors.py's serve rows over a real sibling folder; verified
+   -- statically; needs an OXT + live-Tor pass.
+   if char 1 of tPath is not "/" then
+      put "/" before tPath
+   end if
    -- a registered dynamic route answers FIRST (any method, so a POST works); only
    -- then does the static GET/HEAD pipeline apply. Hand the handler the decoded path.
    -- A HEAD finds the GET route unless a HEAD one is declared (qsRouteLookupKey), which
@@ -3466,9 +3559,20 @@ command qsFsServePath pStream, pHeaders
       qsFsSendText pStream, "405 Method Not Allowed", "text/plain; charset=utf-8", "Only GET and HEAD are supported."
       exit qsFsServePath
    end if
+   -- the reserved namespaces are the route layer's alone (qsHttpReservedPath has
+   -- why); above the 503, so the answer does not change with whether a folder is shared
+   if qsHttpReservedPath(tPath) then
+      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
+      exit qsFsServePath
+   end if
    put sActiveShare["root"] into tRoot
    if tRoot is empty then
       qsFsSendText pStream, "503 Service Unavailable", "text/plain; charset=utf-8", "No folder is being shared."
+      exit qsFsServePath
+   end if
+   -- dotfiles do not exist to a visitor (qsHasDotSegment has why): 404, never 403
+   if qsHasDotSegment(tPath) then
+      qsFsSendText pStream, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tPath)
       exit qsFsServePath
    end if
    put tRoot & tPath into tDisk
@@ -3678,7 +3782,9 @@ end qsFsWatchdog
 -- type-coloured icon, and a brand footer. Per-file sizes are omitted on purpose (OXT
 -- has no cheap size call - sizing every file would read each one just to draw a page);
 -- each file's size is in its Content-Length. Rows are built first so the header can
--- show the final count.
+-- show the final count. A dot-leading name (a file or a folder) is never listed: the
+-- serve paths 404 it (qsHasDotSegment), and a row a visitor cannot open would still
+-- name what the share holds (2026-09-27, nocloud's round-5 rule).
 function qsFsListing pDiskFolder, pUrlPath
    local tSaved, tFiles, tFolders, tName, tRows, tOut, tCount, tHeading
    put the defaultFolder into tSaved
@@ -3695,6 +3801,9 @@ function qsFsListing pDiskFolder, pUrlPath
       if tName is "." or tName is ".." or tName is empty then
          next repeat
       end if
+      if char 1 of tName is "." then
+         next repeat      -- hidden entries stay hidden (matches the 404 guard)
+      end if
       put "<li class='dir t-dir'><a href='" & qsFsPathEncode(tName) & "/'>" & \
          "<svg class='ic'><use href='#i-dir'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
       add 1 to tCount
@@ -3702,6 +3811,9 @@ function qsFsListing pDiskFolder, pUrlPath
    repeat for each line tName in tFiles
       if tName is empty then
          next repeat
+      end if
+      if char 1 of tName is "." then
+         next repeat      -- hidden entries stay hidden (matches the 404 guard)
       end if
       put "<li class='file t-" & qsFsIcon(tName, false) & "'><a href='" & qsFsPathEncode(tName) & "'>" & \
          "<svg class='ic'><use href='#i-" & qsFsIcon(tName, false) & "'/></svg><span class='nm'>" & qsFsHtmlEscape(tName) & "</span></a></li>" after tRows
@@ -4230,12 +4342,25 @@ command qsCwServe pSocketID
    put the itemDelimiter into tSavedID
    set the itemDelimiter to "/"
    put item 2 of tPath into tTok            -- /<token>/... ; item 1 is "" (leading /)
-   if the number of items of tPath >= 3 then
-      put "/" & (item 3 to -1 of tPath) into tRest
-   else
+   -- The rest is the TEXT after the token's item, never items joined back up
+   -- (2026-09-27): the engine ignores ONE trailing delimiter when it counts items (the
+   -- suite's engine note 2.2, OBSERVED), so `item 3 to -1` of "/<token>/docs/" is
+   -- "docs" and the folder's trailing slash was lost - every clearweb subfolder
+   -- answered a redirect to ".../docs//", and its "Up a level" link redirected back
+   -- there. Found by tools/check-script-vectors.py's serve rows, the day they first
+   -- held this handler to the golden's capability_route, which always said "/docs/".
+   -- The offset counts item 1 as well as the token: a request target need not start
+   -- with "/" (a raw client's `GET X/<token>/f HTTP/1.1`), and an offset from the
+   -- token's length alone then began the rest INSIDE the token, "<its last char>/f",
+   -- which sCwRoot & tRest (no trailing slash) turned into a sibling folder named like
+   -- the share (the same day's review). So the rest starts at the "/" after the token,
+   -- or is empty. Verified statically; needs an OXT pass.
+   put char ((the number of chars of item 1 of tPath) + (the number of chars of tTok) + 2) \
+      to -1 of tPath into tRest
+   set the itemDelimiter to tSavedID
+   if tRest is empty then
       put "/" into tRest
    end if
-   set the itemDelimiter to tSavedID
    -- The token is compared as TEXT: a letter on each side keeps `is` off its
    -- number path. Bare `is` turns both operands into numbers when both parse
    -- (C strtod, no range check; suite engine note 2.11, from the engine
@@ -4271,7 +4396,16 @@ command qsCwServe pSocketID
       end if
       exit qsCwServe
    end if
-   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath)
+   -- folder share: route tRest within sCwRoot (mirrors qsFsServePath, its two
+   -- refusals included: a reserved namespace, then a dot-leading segment, each a 404)
+   if qsHttpReservedPath(tRest) then
+      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+      exit qsCwServe
+   end if
+   if qsHasDotSegment(tRest) then
+      qsCwSendText pSocketID, "404 Not Found", "text/html; charset=utf-8", qsFsNotFound(tRest)
+      exit qsCwServe
+   end if
    put sCwRoot & tRest into tDisk
    if there is a folder tDisk then
       if the last char of tRest is not "/" then

@@ -46,8 +46,26 @@ work plan's Model C test row (docs/WORK-PLAN.md, torrentxt coding row 9):
      engine folds (engine note 2.7) is the interpreter's folded one. A HEAD finds
      its GET route, a declared HEAD wins, and GET /_EDIT is not the /_edit route.
      The golden's built-in table is held to the demo's own qsStart registrations,
-     so the rows cannot drift from the routes the demo declares. This is the only
-     part of fileserver_golden.py a gate holds to the demo (its docstring says why).
+     so the rows cannot drift from the routes the demo declares.
+  6. THE FOLDER SERVER (2026-09-27, WORK-PLAN torrentxt #21). Every other mirror in
+     tests/fileserver_golden.py, each on its own rows, against the demo's handler:
+     the range parse, the dotfile guard qsHasDotSegment and the reserved-namespace
+     guard qsHttpReservedPath (both ported that day from nocloud), MIME, the icon,
+     HTML and JSON escaping, the SPA heuristic over a real folder, the request
+     framing, the editor's confinement, LAN gate and query parse. Then the demo's
+     real qsFsServePath (Tor) and qsCwServe (the clearweb link) run over a real folder
+     built from SERVE_TREE - a website carrying .env, .git/config and folders named
+     like the reserved namespaces - and every request's outcome (the reply the
+     script chose: its text status, its redirect, the file it serves, the route it
+     dispatches) must equal serve_static(); the traversal and capability rows go the
+     same way. qsFsListing must list exactly listing_visible() of each folder, and
+     the editor's qsEditWriteRoute, authorised, must refuse exactly what
+     edit_write_decision() refuses (a hidden path among them) and write what it saves.
+     The same day's review added the anchor rows (a request target with no leading
+     "/", read from the share root on both transports, with OUTSIDE_TREE's sibling
+     folders built BESIDE the root so the old join serves a real file from outside
+     it) and the editor's backslash rows (a backslash is a separator to
+     qsEditSafePath, so a backslash then ".env" is a dot path to refuse).
 
 WHAT IT IS NOT. An approximation of the engine, not the engine: riptide's
 runner over the family interpreter. Nothing here promotes any label past
@@ -83,6 +101,17 @@ THE MODEL EXTENSIONS AND STAND-INS, declared rather than discovered:
   - The golden's u64-maximum totalLen row is not driven: the interpreter
     REFUSES integers past 2^53 by design (its header), where the engine
     computes 2^64 - 1 as a double that still exceeds kOnionMaxTotal.
+  - The folder server (section 6): `the files` and `the folders` list the model's
+    current defaultFolder on the real disk (names only, one per line; the folders
+    carry "..", as the engine's do), and urlEncode is the engine's DOCUMENTED rule
+    (letters and digits kept, a space "+", every other byte %XX; the dictionary's
+    return-to-%0D%0A is not modelled, and no row's name holds one). While a section-6
+    row runs, the replies are RECORDED at statement level instead of sent:
+    qsFsSendText / qsCwSendText (the status), qsFsServeFile / qsCwServeFile (the
+    disk path and the MIME name), qsFsSendRedirect / qsCwSendRedirect (the
+    location), qsHttpDispatch (the handler) and qsHttpReply (the status and body);
+    `delete file` is recorded, never done. Each argument is still EVALUATED first,
+    so the listing and the 404 page are built by the script's own handlers.
 
 THE SIBLINGS, AND HOW THEY ARE FOUND (docs/MEMBER-REPO-SPLIT.md): riptide
 for the runner (which loads nostrxt's interpreter and oracle at import, so
@@ -109,6 +138,7 @@ import os
 import re
 import sys
 import tempfile
+from urllib.parse import quote, unquote_plus
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MEMBER = os.path.dirname(HERE)
@@ -157,11 +187,14 @@ if not os.path.isfile(RUNNER):
 # Per-section ratchets, not targets: a section that ran fewer rows than its
 # floor silently stopped executing part of itself (a case list that went empty,
 # a loop that no longer iterates), and the run must fail, not print OK. Keyed
-# by the section's first word; measured 2026-09-24.
+# by the section's first word; measured 2026-09-24 (the four folder-server sections
+# 2026-09-27, serve and editor re-measured the same day for the review's anchor and
+# backslash rows).
 FLOORS = {"qsOnionRecvData": 105, "chOnionRecvData": 105, "pins": 6,
           "qsRouteLookupKey": 45,
           "qsKeyOpensVerifier": 11, "qsReceiveOnion": 177, "M9": 18,
-          "qsDiskGuard": 16, "chDiskGuard": 16}
+          "qsDiskGuard": 16, "chDiskGuard": 16,
+          "fileserver": 164, "serve": 81, "listing": 8, "editor": 26}
 
 
 def _load(name, path):
@@ -203,6 +236,18 @@ class TxExpr(DB.DemoExpr):
         if m:
             self.i += m.end()
             return self.ip.default_folder
+        # `the files` / `the folders` (qsFsListing): the model's current folder, names
+        # only, one per line, sorted (the engine's order is the OS's; the listing
+        # section compares sets). The folders carry "..", as the engine's list does.
+        m = DB._rxi(r'the\s+(files|folders)\b').match(self.s[self.i:])
+        if m:
+            self.i += m.end()
+            here = self.ip.default_folder
+            names = sorted(os.listdir(here))
+            if m.group(1).lower() == "files":
+                return "\n".join(n for n in names if os.path.isfile(os.path.join(here, n)))
+            return "\n".join([".."] + [n for n in names
+                                        if os.path.isdir(os.path.join(here, n))])
         return super().p_atom()
 
     def p_not(self):
@@ -235,6 +280,8 @@ class TxInterp(DB.DemoInterp):
         self.default_folder = world_sandbox(world)
         self.disk_free = 1 << 50  # plentiful; a disk-guard row lowers it
         self.disk_queries = []   # the defaultFolder at each diskSpace() call
+        self.served = None       # section 6: the replies recorded, or None (not recording)
+        self.deleted = []        # section 6: the paths `delete file` named
         super().__init__(src, world)
 
     def disk_space(self, args):
@@ -265,6 +312,19 @@ class TxInterp(DB.DemoInterp):
     def _exec_stmt(self, body, i, env):
         line = body[i].strip()
         world = self.world
+        if self.served is not None:
+            m = re.match(r'(qsFsSendText|qsCwSendText|qsFsServeFile|qsCwServeFile|'
+                         r'qsFsSendRedirect|qsCwSendRedirect|qsHttpDispatch|qsHttpReply)'
+                         r'\s+(.+)$', line, re.I)
+            if m:
+                a = [LCS._disp(x) if not isinstance(x, dict) else x
+                     for x in self.args(m.group(2), env)]
+                self.served.append((m.group(1).lower(), a))
+                return i + 1
+            m = re.match(r'delete\s+file\s+(.+)$', line, re.I)
+            if m:
+                self.deleted.append(str(LCS._disp(self.eval_expr(m.group(1), env))))
+                return i + 1
         m = re.match(r'open\s+file\s+(.+?)\s+for\s+binary\s+write$', line, re.I)
         if m:
             self.files[str(LCS._disp(self.eval_expr(m.group(1), env)))] = bytearray()
@@ -356,6 +416,21 @@ def _binary_encode(a):
     return to_str(out)
 
 
+def _url_encode(a):
+    """urlEncode by the engine's DOCUMENTED rule (LiveCode dictionary): letters and
+    digits unchanged, a space becomes "+", every other byte "%" and two hex digits. The
+    value is the interpreter's latin-1 string, one byte per character."""
+    out = []
+    for ch in str(LCS._disp(a[0])):
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch == " ":
+            out.append("+")
+        else:
+            out.append("%%%02X" % (ord(ch) & 0xFF))
+    return "".join(out)
+
+
 def load_demo(path, prefix, sandbox):
     with open(path, "r", encoding="utf-8") as fh:
         src = fh.read()
@@ -364,6 +439,7 @@ def load_demo(path, prefix, sandbox):
     DB.install_engine_functions(world)
     LCS.HASHES["specialfolderpath"] = lambda a: world.special_folder(LCS._disp(a[0]))
     LCS.HASHES["binaryencode"] = _binary_encode
+    LCS.HASHES["urlencode"] = _url_encode
     ip = TxInterp(src, world, prefix)
     return ip
 
@@ -443,6 +519,221 @@ def check_routes(c, ip, source):
             c.ck("qsRouteLookupKey: %s dispatches to the registered handler" % label,
                  LCS._arr_get(tbl, want), "qsInfoRoute")
     ip.globals["shttproutes"] = ""
+
+
+# --------------------------------------------------------------------------
+# 6. the folder server (2026-09-27, WORK-PLAN torrentxt #21)
+
+REFUSED = "REFUSED by the family interpreter (LCS.Indistinct)"
+
+
+def named_call(c, ip, label, name, args):
+    """ip.call, bar two things: a comparison the interpreter REFUSES (the engine answers
+    it differently from the model: engine notes 2.10, 2.11) fails a row of its own,
+    named, and a handler the demo does not have fails a row too, so a rename cannot turn
+    a row into a no-op. Either answers REFUSED and the run goes on."""
+    try:
+        return ip.call(name, args)
+    except LCS.Indistinct as exc:
+        c.ck("%s: a comparison REFUSED by the family interpreter" % label,
+             "%s: %s" % (REFUSED, str(exc)[:200]), "an answer")
+    except NameError as exc:
+        c.ck("%s: the demo's %s" % (label, name), "missing (%s)" % exc, "present")
+    return REFUSED
+
+
+def build_tree(root, tree):
+    """SERVE_TREE on disk under `root`: a trailing "/" names a folder; a file holds its
+    own path, so nothing here depends on its bytes."""
+    for t in tree:
+        full = os.path.join(root, t)
+        if t.endswith("/"):
+            os.makedirs(full, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(t)
+
+
+def outcome(ip, root, handlers):
+    """The one reply a serve row recorded, in the golden's serve_static() shape; a row
+    that sent none, or more than one, answers what it did, so the mismatch is named."""
+    if len(ip.served) != 1:
+        return ("replies", [h for h, _ in ip.served])
+    h, a = ip.served[0]
+    if h in ("qsfssendtext", "qscwsendtext"):
+        return ("text", str(a[1])[:3])
+    if h in ("qsfsservefile", "qscwservefile"):
+        rel = os.path.relpath(os.path.normpath(str(a[1])), root).replace(os.sep, "/")
+        return ("file", rel, str(a[2]))
+    if h in ("qsfssendredirect", "qscwsendredirect"):
+        return ("redirect", str(a[1]))
+    if h == "qshttpdispatch":
+        return ("route", handlers.get(str(a[1]), "unregistered " + str(a[1])))
+    return (h, a)
+
+
+def serve_tor(c, ip, root, method, raw, shared, label):
+    setg(ip, "sActiveShare", "root", root if shared else "")
+    ip.served = []
+    named_call(c, ip, label, "qsFsServePath", ["s1", {"__method": method, "__path": raw}])
+
+
+def serve_cw(c, ip, method, raw, label):
+    setg(ip, "sCwReq", "k1", "%s %s HTTP/1.1\r\nHost: x\r\n\r\n" % (method, raw))
+    ip.served = []
+    named_call(c, ip, label, "qsCwServe", ["k1"])
+
+
+def check_fileserver(c, ip, source, sandbox):
+    """tests/fileserver_golden.py's every mirror against the demo, then the two serve
+    paths, the listing and the editor's write route over a real folder."""
+    call = lambda label, name, args: named_call(c, ip, label, name, args)
+    c.section("fileserver", "torrent-quickshare's folder-server helpers against "
+              "fileserver_golden.py, on its rows")
+    for rng, _ in FS.RANGE_ROWS:
+        lab = "qsFsParseRange(%r)" % rng
+        c.ck(lab, call(lab, "qsFsParseRange", [rng, 1000]), FS.parse_range(rng, 1000))
+    for rng in ("", "bytes=0-"):
+        lab = "qsFsParseRange(%r) on an empty file" % rng
+        c.ck(lab, call(lab, "qsFsParseRange", [rng, 0]), FS.parse_range(rng, 0))
+    for path, _ in FS.DOT_ROWS:
+        lab = "qsHasDotSegment(%r)" % path
+        c.ck(lab, boolish(call(lab, "qsHasDotSegment", [path])), FS.has_dot_segment(path))
+    for path, _ in FS.RESERVED_ROWS:
+        lab = "qsHttpReservedPath(%r)" % path
+        c.ck(lab, boolish(call(lab, "qsHttpReservedPath", [path])), FS.reserved_path(path))
+    for path, _ in FS.MIME_ROWS:
+        lab = "qsFsMime(%r)" % path
+        c.ck(lab, call(lab, "qsFsMime", [path]), FS.mime(path))
+    for name, is_dir, _ in FS.ICON_ROWS:
+        lab = "qsFsIcon(%r)" % name
+        c.ck(lab, call(lab, "qsFsIcon", [name, is_dir]), FS.fs_icon(name, is_dir))
+    for text, _ in FS.HTML_ROWS:
+        lab = "qsFsHtmlEscape(%r)" % text
+        c.ck(lab, call(lab, "qsFsHtmlEscape", [text]), FS.html_escape(text))
+    for text, _ in FS.JSON_ROWS:
+        lab = "qsJsonEscape(%r)" % text
+        c.ck(lab, call(lab, "qsJsonEscape", [text]), FS.json_escape(text))
+    # the SPA heuristic: the script asks the disk for the root index.html first
+    site = os.path.join(sandbox, "spa-site")
+    os.makedirs(site, exist_ok=True)
+    with open(os.path.join(site, "index.html"), "w") as fh:
+        fh.write("<html>")
+    for path, _ in FS.SPA_ROWS:
+        lab = "qsSiteSpaTarget(%r)" % path
+        got = str(call(lab, "qsSiteSpaTarget", [site, path]))
+        c.ck(lab + " is a route", got != "", FS.spa_is_route(path))
+        if FS.spa_is_route(path):
+            c.ck(lab + " names the index", got, site + "/index.html")
+    empty = os.path.join(sandbox, "spa-empty")
+    os.makedirs(empty, exist_ok=True)
+    c.ck("qsSiteSpaTarget with no index.html falls back to nothing",
+         call("qsSiteSpaTarget(no index)", "qsSiteSpaTarget", [empty, "/dashboard"]), "")
+    for data in (FS._GET_FULL, b"GET / HTTP/1.1\r\nHost: x\r\n"):
+        lab = "qsHttpHeaderEnd(%r)" % data[:24]
+        c.ck(lab, call(lab, "qsHttpHeaderEnd", [to_str(data)]), FS.http_header_end(data))
+    for label, data, _ in FS.FRAMING_ROWS:
+        lab = "qsHttpReqComplete " + label
+        c.ck(lab, boolish(call(lab, "qsHttpReqComplete", [to_str(data)])),
+             FS.http_req_complete(data))
+    for rel, _ in FS.EDIT_SAFE_ROWS:
+        lab = "qsEditSafePath(%r)" % rel
+        c.ck(lab, call(lab, "qsEditSafePath", ["/srv", rel]), FS.edit_safe_path("/srv", rel))
+    for conn, _ in FS.LAN_ROWS:
+        lab = "qsEditIsLocal(%r)" % conn
+        c.ck(lab, boolish(call(lab, "qsEditIsLocal", [conn])), FS.edit_is_local(conn))
+    for query, name, _ in FS.QUERY_ROWS:
+        lab = "qsQueryParam(%r,%r)" % (query, name)
+        c.ck(lab, call(lab, "qsQueryParam", [query, name]), FS.query_param(query, name))
+
+    # -- the two serve paths over a real folder --
+    c.section("serve", "qsFsServePath and qsCwServe over SERVE_TREE, against "
+              "serve_static()")
+    declared = dict(("%s %s" % (m.upper(), pth), h) for m, pth, h in re.findall(
+        r'^\s*qsHttpRoute\s+"([A-Za-z]+)"\s*,\s*"([^"]+)"\s*,\s*"([A-Za-z0-9_]+)"',
+        source, re.M))
+    c.ck("serve: the golden's SERVE_ROUTES are the demo's qsStart registrations",
+         declared, FS.SERVE_ROUTES)
+    root = os.path.join(sandbox, "share")
+    build_tree(root, FS.SERVE_TREE)
+    # the siblings an unanchored path once reached: the root's name & each path, BESIDE
+    # it, so the anchor rows fail on the old code by serving a real file from outside
+    build_tree(os.path.dirname(root),
+               [os.path.basename(root) + t for t in FS.OUTSIDE_TREE])
+    ip.globals["shttproutes"] = ""
+    for key, handler in sorted(FS.SERVE_ROUTES.items()):
+        m, pth = key.split(" ", 1)
+        ip.call("qsHttpRoute", [m, pth, handler])
+    handlers = dict((h, k) for k, h in FS.SERVE_ROUTES.items())
+    for method, raw, shared, _ in FS.SERVE_ROWS:
+        lab = "serve: Tor %s %s%s" % (method, raw, "" if shared else " (nothing shared)")
+        serve_tor(c, ip, root, method, raw, shared, lab)
+        c.ck(lab, outcome(ip, root, handlers),
+             FS.serve_static(method, raw, FS.SERVE_TREE, FS.SERVE_ROUTES, shared))
+    # the traversal rows: serve_static's Tor front IS traversal_ok()
+    for raw, _ in FS.TRAVERSAL_ROWS:
+        lab = "serve: Tor GET %s (the traversal guard)" % raw
+        serve_tor(c, ip, root, "GET", raw, True, lab)
+        c.ck(lab, outcome(ip, root, handlers),
+             FS.serve_static("GET", raw, FS.SERVE_TREE, FS.SERVE_ROUTES, True))
+    ip.globals["scwtoken"] = FS.CW_TOKEN
+    ip.globals["scwkind"] = "folder"
+    ip.globals["scwroot"] = root
+    for method, raw, _ in FS.CW_ROWS:
+        lab = "serve: clearweb %s %s" % (method, raw)
+        serve_cw(c, ip, method, raw, lab)
+        c.ck(lab, outcome(ip, root, handlers),
+             FS.serve_static(method, raw, FS.SERVE_TREE, FS.SERVE_ROUTES, True, FS.CW_TOKEN))
+    # the capability rows: serve_static's clearweb front IS capability_route()
+    for path, _ in FS.CAPABILITY_ROWS:
+        if not path:
+            continue                    # no request line carries an empty path
+        lab = "serve: clearweb GET %s (the capability gate)" % path
+        serve_cw(c, ip, "GET", path, lab)
+        c.ck(lab, outcome(ip, root, handlers),
+             FS.serve_static("GET", path, FS.SERVE_TREE, FS.SERVE_ROUTES, True, FS.CW_TOKEN))
+
+    # -- the listing --
+    c.section("listing", "qsFsListing over SERVE_TREE's folders, against listing_visible()")
+    for folder in FS.LISTING_FOLDERS:
+        disk = os.path.join(root, folder) + "/" if folder else root + "/"
+        url = "/" + folder + "/" if folder else "/"
+        lab = "qsFsListing(%r)" % url
+        page = str(call(lab, "qsFsListing", [disk, url]))
+        hrefs = re.findall(r"<a href='([^']*)'", page)
+        names = sorted(unquote_plus(h.rstrip("/")) for h in hrefs if h != "../")
+        c.ck(lab + ": the names listed", names,
+             FS.listing_visible(FS.listing_names(folder)))
+        c.ck(lab + ": no dot-leading name anywhere in the page",
+             [n for n in FS.listing_names(folder) if n.startswith(".") and n != ".."
+              and (">" + n + "<") in page], [])
+
+    # -- the editor's write route, authorised --
+    c.section("editor", "qsEditWriteRoute, authorised, against edit_write_decision()")
+    for name, value in (("sEditOn", "true"), ("sCanEncrypt", "true"), ("sCwActive", "true"),
+                        ("sCwKind", "folder"), ("sCwRoot", root), ("sEditSession", "tok9")):
+        ip.globals[name.lower()] = value
+    for rel, _ in FS.EDIT_WRITE_ROWS:
+        lab = "qsEditWriteRoute(%r)" % rel
+        ip.served, ip.deleted, ip.files = [], [], {}
+        body = "saved by " + rel
+        call(lab, "qsEditWriteRoute", ["cw:192.168.1.5:5000",
+                                       {"__query": "path=" + quote(rel, safe="/"),
+                                        "__body": body, "x-edit-token": "tok9"}])
+        replies = [(int(LCS._n(a[1])), str(a[3])) for h, a in ip.served if h == "qshttpreply"]
+        want = FS.edit_write_decision(rel, FS.SERVE_TREE)
+        c.ck(lab, replies, [want])
+        written = dict((os.path.relpath(k, root).replace(os.sep, "/"), bytes(v))
+                       for k, v in ip.files.items())
+        # a backslash is a separator to qsEditSafePath, so the saved path has "/" there
+        c.ck(lab + ": what reached the disk", written,
+             {os.path.normpath(rel.replace("\\", "/")).replace(os.sep, "/"):
+              body.encode("latin-1")} if want[0] == 200 else {})
+    ip.served = None
+    for name in ("sEditOn", "sCanEncrypt", "sCwActive", "sCwKind", "sCwRoot", "sEditSession",
+                 "sCwToken", "sHttpRoutes"):
+        ip.globals[name.lower()] = ""
 
 
 # --------------------------------------------------------------------------
@@ -944,7 +1235,9 @@ def main(argv):
         ch = load_demo(ch_path, "ch", sandbox) if only != "qs" else None
         if qs is not None:
             with open(qs_path, "r", encoding="utf-8") as fh:
-                check_routes(c, qs, fh.read())
+                qs_source = fh.read()
+            check_routes(c, qs, qs_source)
+            check_fileserver(c, qs, qs_source, sandbox)
         for ip in (qs, ch):
             if ip is not None:
                 check_receiver(c, ip, sandbox)

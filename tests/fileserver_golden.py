@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """fileserver_golden.py - pure-Python reference for the security- and
 correctness-critical logic of Quick Share's FOLDER web server (the browsable
-directory page served over the onion when a folder is shared with Tor on), in
-examples/torrent-quickshare.livecodescript.
+directory page served over the onion when a folder is shared with Tor on, and
+over the clearweb link), in examples/torrent-quickshare.livecodescript.
 
 OXT cannot compile/run .livecodescript headlessly, so - exactly like
 onion_frame_golden.py and record_golden_test.py - this PINS the parts of the
 folder server that are verifiable off-engine: the HTTP byte-range parser, the
-path-traversal decision, the MIME mapping, and the HTML escaper. If this and the
-.livecodescript ever disagree, one of them is wrong.
+path-traversal decision, the dotfile and reserved-namespace refusals, the
+static pipeline's whole decision, the listing, the MIME mapping, and the HTML
+escaper. If this and the .livecodescript ever disagree, one of them is wrong.
 
 Mirrors these LiveCodeScript handlers:
   qsFsParseRange  -> parse_range()      (RFC 7233 single-range; 416 on out-of-range)
   qsFsServePath   -> traversal_ok()     (".." refused after urlDecode + \\ -> /)
+  qsHasDotSegment -> has_dot_segment()  (a dot-leading segment does not exist; nocloud's
+                                         round-5 guard, ported 2026-09-27)
+  qsHttpReservedPath -> reserved_path() (/_qs and /_edit are the route layer's; folded on
+                                         purpose; nocloud's, ported 2026-09-27)
+  qsFsServePath + qsCwServe -> serve_static() (the whole static decision over a tree: the
+                                         route, 405, reserved 404, 503, dotfile 404, folder
+                                         redirect / index / listing, file, SPA, 404)
+  qsFsListing     -> listing_visible()  (the names a listing shows: no dot-leading entry)
+  qsEditWriteRoute -> edit_write_decision() (the editor's WRITE refusals, in order:
+                                         confinement, a hidden path, a folder)
   qsFsMime        -> mime()
   qsFsIcon        -> fs_icon()          (directory-listing icon/colour type token)
   qsFsHtmlEscape  -> html_escape()
@@ -32,14 +43,16 @@ Mirrors these LiveCodeScript handlers:
                                          falls back to the GET route; GET /_EDIT is not the
                                          /_edit route. WORK-PLAN torrentxt #18, 2026-09-25)
 
-The last three are the only mirrors here that a gate holds to the SHIPPED demo:
-tools/check-script-vectors.py (section "qsRouteLookupKey") fills the demo's route table
-through its own qsHttpRoute and drives qsHexKey, qsRouteKey and qsRouteLookupKey through
-the family interpreter, whose array keys fold as the engine's do, against these mirrors
-on these rows. The rest of this file restates the demo and is checked against nothing:
-it was copied from nocloud's golden, and five of its mirrors (has_dot_segment,
-http_req_length, file_size_probe, safe_filename, rate_short / eta_short) name handlers
-this demo does not have (2026-09-25).
+EVERY mirror here names a handler the demo has, and tools/check-script-vectors.py holds
+each to the SHIPPED demo through the family interpreter, on these rows (since
+2026-09-27; until then only the route section was driven, and five mirrors copied
+from nocloud's golden named nocloud handlers this demo never had: has_dot_segment,
+which now has its handler, and http_req_length, file_size_probe, safe_filename and
+rate_short / eta_short, which were deleted here and stay pinned in nocloud's golden,
+against nocloud's script). The route section fills the demo's table through its own
+qsHttpRoute, so the subscript the engine folds is the interpreter's folded one; the
+serve rows run the demo's real qsFsServePath and qsCwServe over a real folder built
+from SERVE_TREE.
 
     python3 tests/fileserver_golden.py     # exit 0 = OK, 1 = mismatch
 """
@@ -133,6 +146,20 @@ def has_dot_segment(path):
     return any(seg.startswith(".") for seg in path.split("/") if seg)
 
 
+# ---- qsHttpReservedPath: the route layer's namespaces (nocloud's, 2026-08-17) ----
+# /_qs (the observability endpoint) and /_edit (the LAN editor) belong to the ROUTE
+# layer: a request there that named no route is a 404 from the static pipeline, never
+# a real "_qs" folder in the share nor the SPA fallback's index.html. Prefix-exact
+# ("/_qsx" is an ordinary path); CASE-FOLDED on purpose, stricter than the case-exact
+# route table (the engine's `is` and `begins with` fold anyway). Mirrors
+# qsHttpReservedPath.
+
+def reserved_path(path):
+    low = path.lower()
+    return (low in ("/_qs", "/_edit")
+            or low.startswith("/_qs/") or low.startswith("/_edit/"))
+
+
 # ---- fsMime -----------------------------------------------------------------
 
 _MIME = {
@@ -189,80 +216,6 @@ def fs_icon(name, is_dir):
     return "file"
 
 
-# ---- qsFileSizeSeek: O(log n) file-size probe (newquickshare) ----------------
-# Instead of reading a whole file to size it (a UI-freezing, disk-doubling full read),
-# find EOF by exponential-then-binary search over `seek to N; read 1`. readable(N) means
-# "a byte exists at 0-based offset N" (N < size); the size is the smallest non-readable
-# offset. Returns None (-> fall back to the linear count) if it exceeds the 8 GiB serve
-# cap. This mirrors qsFileSizeSeek's control flow EXACTLY so the algorithm is pinned; the
-# only on-engine unknown (seek-past-EOF returning empty) is guarded by the fallback.
-
-def file_size_probe(size, cap=8589934592):
-    def readable(n):
-        return n < size
-    if not readable(0):
-        return 0                                  # empty file
-    lo, hi = 0, 1
-    while True:
-        if hi > cap:
-            return None                           # too big / no EOF: caller falls back
-        if not readable(hi):
-            break                                 # hi is an upper bound (not readable)
-        lo, hi = hi, hi * 2
-    while (hi - lo) > 1:
-        mid = (lo + hi) // 2
-        if readable(mid):
-            lo = mid
-        else:
-            hi = mid
-    return hi
-
-
-# ---- qsSafeFilename: Content-Disposition filename sanitiser ------------------
-# Printable ASCII only, minus quote and backslash, so the name is safe inside a
-# quoted-string without RFC 5987 encoding. Empty -> "download". Mirrors qsSafeFilename.
-
-def safe_filename(name):
-    out = "".join(c for c in name if 32 <= ord(c) <= 126 and c not in '"\\')
-    return out if out else "download"
-
-
-# ---- qsRateShort / qsEtaShort: compact Transfers-row stats -------------------
-# Compact data-rate ("1.2M/s") and ETA ("1h2m") strings that fit the narrow progress
-# column. Mirror qsRateShort / qsEtaShort. _round1 reproduces LiveCode's
-# `the round of (v*10)/10` (round half away from zero, number formatted with no .0).
-
-def _round1(v):
-    import math
-    x = v * 10.0
-    r = (math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)) / 10.0
-    return "%g" % r
-
-
-def rate_short(bps):
-    if isinstance(bps, bool) or not isinstance(bps, (int, float)) or bps <= 0:
-        return "0B/s"
-    units = ["B", "K", "M", "G", "T"]
-    v, u = float(bps), 0
-    while v >= 1024 and u < len(units) - 1:
-        v /= 1024
-        u += 1
-    return _round1(v) + units[u] + "/s"
-
-
-def eta_short(secs):
-    if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs < 0:
-        return ""
-    s = int(secs)                                  # trunc toward zero (LiveCode trunc)
-    if s < 60:
-        return "%ds" % s
-    if s < 3600:
-        return "%dm" % (s // 60)
-    if s < 86400:
-        return "%dh%dm" % (s // 3600, (s % 3600) // 60)
-    return ">1d"
-
-
 # ---- fsHtmlEscape: & first, then the rest -----------------------------------
 
 def html_escape(text):
@@ -310,19 +263,6 @@ def http_req_complete(data):
     body_start = he + 4                           # 1-based, just past CRLFCRLF
     have = len(data) - body_start + 1
     return have >= cl
-
-
-def http_req_length(data):
-    """Mirror qsHttpReqLength: exact byte length of ONE complete request at the front of
-    `data` = head-with-CRLFCRLF (headEnd + 3 bytes) + Content-Length body. 0 if the head
-    is not yet complete. Keep-alive trims this many bytes to leave any pipelined bytes."""
-    he = http_header_end(data)
-    if he == 0:
-        return 0
-    cl = _content_length(data[:he - 1])
-    if cl is None or cl < 0:
-        cl = 0
-    return he + 3 + cl
 
 
 def json_escape(s):
@@ -555,7 +495,10 @@ def capability_route(decoded_path, token):
     """Returns 'forbidden' (.. present), or (matches, rest) where matches is
     whether the token segment equals `token` and rest is the folder-relative path
     (leading '/'). Mirrors qsCwServe: replace \\ -> /, refuse '..', then split on
-    '/' with item 2 the token and item 3..-1 the rest."""
+    '/' with item 2 the token and the rest the TEXT after it (python's split keeps a
+    trailing empty item, so "/".join(items[2:]) is that text, a folder's trailing
+    slash included; the script takes it by a char offset that counts item 1 too,
+    so a target with no leading "/" still yields a rest anchored at "/")."""
     p = decoded_path.replace("\\", "/")
     if ".." in p:
         return "forbidden"
@@ -565,29 +508,464 @@ def capability_route(decoded_path, token):
     return (tok == token, rest)
 
 
+
+# ---- the static pipeline's whole decision (qsFsServePath, qsCwServe's folder branch) ----
+# One outcome per request, in the shape the gate records from the demo's own calls:
+#   ("text", "<3-digit status>")       a one-shot text reply (qsFsSendText / qsCwSendText);
+#                                      "200" is the listing, the only 200 text reply here
+#   ("redirect", "<location>")         the trailing-slash redirect (the RAW path + "/")
+#   ("file", "<rel disk path>", "<name the MIME is read from>")   a served file
+#   ("route", "<METHOD /path>")        a dispatched route, by its readable key
+# `tree` is a set of relative paths, a trailing "/" naming a folder (SERVE_TREE); `routes`
+# maps a readable "METHOD /path" to its handler, as the demo's qsStart registers them.
+# The order is the demo's, which is nocloud's qsHttpServeStatic's: traversal 403, the
+# route layer, 405, the RESERVED namespace (above the 503, so the answer does not change
+# with whether a folder is shared), 503, a DOT segment, a folder (redirect / index.html /
+# the listing), a file, the SPA fallback, 404. The clearweb twin (token given) checks the
+# capability token first and has no 503 (a folder share always has its root).
+
+def _tree_sets(tree):
+    dirs = set([""])
+    files = set()
+    for t in tree:
+        if t.endswith("/"):
+            dirs.add(t.rstrip("/"))
+        else:
+            files.add(t)
+    return dirs, files
+
+
+def serve_static(method, raw, tree, routes, shared=True, token=None):
+    """The front of each serve path is the mirror above it: traversal_ok() over Tor,
+    capability_route() over the clearweb link, so this holds both to the demo too."""
+    dirs, files = _tree_sets(tree)
+    path = unquote_plus(raw)                  # LiveCode's urlDecode: '+' is a space too
+    if token is None:
+        if not traversal_ok(raw):
+            return ("text", "403")
+        path = (path or "/").replace("\\", "/")
+        if not path.startswith("/"):
+            path = "/" + path                 # anchored at the share root (2026-09-27)
+    else:
+        cap = capability_route(path, token)
+        if cap == "forbidden":
+            return ("text", "403")
+        matches, path = cap
+        if not matches:
+            return ("text", "404")
+    redirect_base = raw
+    key = route_lookup_key(method, path, table(routes))
+    if key:
+        return ("route", [r for r in routes if rk(r) == key][0])
+    if method.upper() not in ("GET", "HEAD"):
+        return ("text", "405")
+    if reserved_path(path):
+        return ("text", "404")
+    if not shared:
+        return ("text", "503")
+    if has_dot_segment(path):
+        return ("text", "404")
+    rel = path.strip("/")
+    if rel in dirs:
+        if not path.endswith("/"):
+            return ("redirect", redirect_base + "/")
+        index = (rel + "/index.html") if rel else "index.html"
+        if index in files:
+            return ("file", index, "index.html")
+        return ("text", "200")
+    if not path.endswith("/") and rel in files:
+        return ("file", rel, path)
+    if "index.html" in files and spa_is_route(path):
+        return ("file", "index.html", "index.html")
+    return ("text", "404")
+
+
+def listing_visible(names):
+    """Mirror qsFsListing's row filter: the names (files and folders alike) a listing
+    shows, sorted. "." and ".." and an empty line never; a dot-leading name never (the
+    serve paths 404 it: qsHasDotSegment)."""
+    return sorted(n for n in names if n not in ("", ".", "..") and not n.startswith("."))
+
+
+def edit_write_decision(rel, tree):
+    """Mirror qsEditWriteRoute's refusals for an AUTHORISED request, in its order: the
+    confinement (qsEditSafePath) 400, a hidden (dot) path 400, a folder 409; else the save
+    (200). Returns the (status, body) the demo replies with. The dot check reads the
+    path with edit_safe_path's separators, a backslash as a "/" (2026-09-27: read raw,
+    "\\.env" slipped past it and was written as .env)."""
+    dirs, _ = _tree_sets(tree)
+    disk = edit_safe_path("/srv", rel)
+    if disk == "":
+        return (400, "Bad path.")
+    if has_dot_segment(rel.replace("\\", "/")):
+        return (400, "Hidden (dot) paths cannot be written through the editor.")
+    if disk[len("/srv/"):] in dirs:
+        return (409, "That path is a folder.")
+    return (200, "Saved.")
+
+
+# The folder the serve rows run over (the gate builds it on disk). A website: index.html
+# at its root, so the SPA fallback is live; the dotfiles a shared web folder carries;
+# real folders named like the reserved namespaces.
+SERVE_TREE = ["index.html", "public.txt", "docs/", "docs/readme.md", "docs/.secret.txt",
+              ".env", ".git/", ".git/config", ".well-known/", ".well-known/security.txt",
+              "notes.d/", "notes.d/file.txt", "_qs/", "_qs/data.json", "_Edit/",
+              "_Edit/index.html", "sub/", "sub/a.txt", "sub/.hidden/", "sub/.hidden/x.txt",
+              "sub/.dotfile", "site/", "site/index.html"]
+# The demo's qsStart registrations (the gate holds this table to the source's).
+SERVE_ROUTES = {"GET /_qs/info": "qsInfoRoute", "GET /_edit": "qsEditPageRoute",
+                "POST /_edit/login": "qsEditLoginRoute", "GET /_edit/api/list": "qsEditListRoute",
+                "GET /_edit/api/read": "qsEditReadRoute", "PUT /_edit/api/write": "qsEditWriteRoute"}
+# (method, raw path, the folder shared?, the pinned outcome) - over Tor (qsFsServePath)
+SERVE_ROWS = [
+    ("GET", "/", True, ("file", "index.html", "index.html")),
+    ("GET", "/public.txt", True, ("file", "public.txt", "/public.txt")),
+    ("HEAD", "/public.txt", True, ("file", "public.txt", "/public.txt")),
+    ("GET", "/docs", True, ("redirect", "/docs/")),
+    ("GET", "/docs/", True, ("text", "200")),                   # the listing
+    ("GET", "/docs/readme.md", True, ("file", "docs/readme.md", "/docs/readme.md")),
+    ("GET", "/site/", True, ("file", "site/index.html", "index.html")),
+    ("GET", "/notes.d/file.txt", True, ("file", "notes.d/file.txt", "/notes.d/file.txt")),
+    ("GET", "/dashboard", True, ("file", "index.html", "index.html")),   # the SPA fallback
+    ("GET", "/missing.js", True, ("text", "404")),
+    # THE DOTFILE ROWS: each exists on disk, and each was served before 2026-09-27
+    ("GET", "/.env", True, ("text", "404")),
+    ("HEAD", "/.env", True, ("text", "404")),
+    ("GET", "/.git/config", True, ("text", "404")),
+    ("GET", "/.git/", True, ("text", "404")),                   # was its listing
+    ("GET", "/.git", True, ("text", "404")),                    # was its redirect
+    ("GET", "/docs/.secret.txt", True, ("text", "404")),
+    ("GET", "/%2eenv", True, ("text", "404")),                  # decoded first
+    ("GET", "/.well-known/security.txt", True, ("text", "404")),   # hidden is hidden
+    ("GET", "/sub/.hidden/x.txt", True, ("text", "404")),
+    ("GET", "/.cache/app", True, ("text", "404")),              # was the SPA's index.html
+    # THE RESERVED ROWS: a route answers its own path; anything else there is a 404
+    ("GET", "/_qs/info", True, ("route", "GET /_qs/info")),
+    ("HEAD", "/_qs/info", True, ("route", "GET /_qs/info")),
+    ("GET", "/_edit", True, ("route", "GET /_edit")),
+    ("POST", "/_edit/login", True, ("route", "POST /_edit/login")),
+    ("GET", "/_qs/data.json", True, ("text", "404")),           # was the real file
+    ("GET", "/_qs/other", True, ("text", "404")),               # was the SPA's index.html
+    ("GET", "/_QS/info", True, ("text", "404")),                # folded: was the SPA
+    ("GET", "/_Edit/", True, ("text", "404")),                  # was _Edit/index.html
+    ("GET", "/_edit/nope", True, ("text", "404")),
+    ("GET", "/_qsx", True, ("file", "index.html", "index.html")),   # prefix-exact: SPA
+    ("GET", "/_editor", True, ("file", "index.html", "index.html")),
+    # the rest of the order
+    ("PUT", "/public.txt", True, ("text", "405")),
+    ("GET", "/../etc/passwd", True, ("text", "403")),
+    ("GET", "/public.txt", False, ("text", "503")),
+    ("GET", "/_QS/x", False, ("text", "404")),                  # reserved sits above the 503
+    ("GET", "/.env", False, ("text", "503")),                   # the dot check below it
+    # THE ANCHOR ROWS (2026-09-27, the review of the port): a request target with no
+    # leading "/" is read from the share ROOT. Before, the disk path was the root's text
+    # & the target, so these named OUTSIDE_TREE's sibling folder (main() re-proves it)
+    ("GET", "-backup/secret.txt", True, ("text", "404")),       # was the sibling's file
+    ("GET", "-backup/", True, ("file", "index.html", "index.html")),   # was its listing
+    ("GET", "public.txt", True, ("file", "public.txt", "/public.txt")),   # was a 404
+    ("GET", "docs", True, ("redirect", "docs/")),
+    ("GET", ".env", True, ("text", "404")),
+]
+CW_TOKEN = "abc123"
+# (method, raw path, the pinned outcome) - over the clearweb link (qsCwServe), folder share
+CW_ROWS = [
+    ("GET", "/abc123/public.txt", ("file", "public.txt", "/public.txt")),
+    ("GET", "/abc123/docs", ("redirect", "/abc123/docs/")),
+    ("GET", "/abc123/docs/", ("text", "200")),                  # was a redirect to docs//
+    ("GET", "/abc123/docs/readme.md", ("file", "docs/readme.md", "/docs/readme.md")),
+    ("GET", "/abc123/site/", ("file", "site/index.html", "index.html")),
+    ("GET", "/abc123/", ("file", "index.html", "index.html")),
+    ("GET", "/abc123/.env", ("text", "404")),
+    ("GET", "/abc123/.git/config", ("text", "404")),
+    ("GET", "/abc123/.git/", ("text", "404")),
+    ("GET", "/abc123/docs/.secret.txt", ("text", "404")),
+    ("GET", "/abc123/%2egit/config", ("text", "404")),
+    ("GET", "/abc123/_qs/info", ("route", "GET /_qs/info")),
+    ("GET", "/abc123/_qs/data.json", ("text", "404")),
+    ("GET", "/abc123/_QS/info", ("text", "404")),
+    ("GET", "/abc123/_Edit/", ("text", "404")),
+    ("GET", "/abc123/_qsx", ("file", "index.html", "index.html")),
+    ("GET", "/wrong/.env", ("text", "404")),                    # the token first
+    ("PUT", "/abc123/.env", ("text", "405")),
+    # a target with no leading "/": the rest still starts at the "/" after the token
+    # (2026-09-27, the review: an offset from the token's length alone began it inside
+    # the token, "3/public.txt", OUTSIDE_TREE's sibling; main() re-proves it)
+    ("GET", "X/abc123/public.txt", ("file", "public.txt", "/public.txt")),
+    ("GET", "X/abc123/docs/", ("text", "200")),
+]
+# Paths that exist at the share root's TEXT & the path, no separator between: folders
+# BESIDE the root whose names begin with its name (the gate builds each as the root's
+# basename & the path, next to the root). "-backup" is any such sibling; "3" is the one
+# the clearweb rows' old offset reached, the last char of CW_TOKEN. Nothing here is
+# servable: each exists only so the anchor rows above can fail on the old code.
+OUTSIDE_TREE = ["-backup/secret.txt", "3/public.txt"]
+
+
+def unanchored_disk_rel(raw):
+    """What the pre-2026-09-27 Tor path joined to the root's text: the decoded target,
+    unanchored. Not a mirror of anything shipped: the anchor rows' witness."""
+    return unquote_plus(raw).replace("\\", "/")
+
+
+def offset_rest(path, token):
+    """The rest the first 2026-09-27 qsCwServe took, char (len(token) + 2) to -1 (1-based),
+    which is right only when the target starts with "/". The anchor rows' witness."""
+    return path[len(token) + 1:]
+# (folder, the names on disk there) for the listing rows: SERVE_TREE's own folders
+LISTING_FOLDERS = ["", "docs", "sub", ".git"]
+# (rel path the editor is asked to write, the pinned (status, body))
+EDIT_WRITE_ROWS = [
+    ("notes.txt", (200, "Saved.")),
+    ("docs/new.md", (200, "Saved.")),
+    (".env", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    (".git/config", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("sub/.hidden/x.txt", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("docs/./new.md", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("docs", (409, "That path is a folder.")),
+    ("../x.txt", (400, "Bad path.")),
+    ("", (400, "Bad path.")),
+    # a backslash is a separator to qsEditSafePath, so the dot check reads it as one
+    # (2026-09-27, the review: read raw, each of these three was written)
+    ("\\.env", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("sub\\.hidden\\x.txt", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("docs\\.secret.txt", (400, "Hidden (dot) paths cannot be written through the editor.")),
+    ("docs\\new2.md", (200, "Saved.")),       # ... and refuses nothing by being one
+]
+RESERVED_ROWS = [
+    ("/_qs", True), ("/_qs/info", True), ("/_qs/", True),
+    ("/_edit", True), ("/_edit/api/write", True),
+    ("/_qsx", False),                       # a longer first segment is a normal path
+    ("/_editor", False),
+    ("/a/_qs", False),                      # reserved only at the ROOT of the app path
+    ("/_q", False), ("/", False), ("", False),
+    # folded ON PURPOSE, stricter than the case-exact route table
+    ("/_QS", True), ("/_QS/info", True), ("/_Qs/", True),
+    ("/_EDIT", True), ("/_Edit/api/write", True),
+    ("/_QSX", False), ("/_EDITOR", False),
+]
+
+
+def listing_names(folder, tree=None):
+    """The names `the files` and `the folders` answer for `folder` of SERVE_TREE (the
+    engine lists ".." among the folders; the gate's model does too)."""
+    tree = SERVE_TREE if tree is None else tree
+    prefix = (folder + "/") if folder else ""
+    names = set([".."])
+    for t in tree:
+        if not t.startswith(prefix):
+            continue
+        rest = t[len(prefix):]
+        head = rest.split("/")[0]
+        if head:
+            names.add(head)
+    return sorted(names)
+
+
+# The rows main() pins and tools/check-script-vectors.py drives against the demo:
+# listed ONCE here, so the gate never types an input twice.
+RANGE_ROWS = [
+    ("", ""),                               # no Range header -> whole file
+    ("bytes=0-499", "0,499"),               # a normal first-chunk range
+    ("bytes=500-999", "500,999"),
+    ("bytes=500-", "500,999"),              # open-ended -> to EOF
+    ("bytes=0-", "0,999"),
+    ("bytes=999-", "999,999"),              # last byte
+    ("bytes=-500", "500,999"),              # suffix: last 500 bytes
+    ("bytes=-5000", "0,999"),               # suffix bigger than file -> whole
+    ("bytes=0-100000", "0,999"),            # end past EOF -> clamped
+    ("bytes=1000-", "unsatisfiable"),       # start == total -> 416
+    ("bytes=1500-2000", "unsatisfiable"),   # wholly past EOF -> 416
+    ("bytes=5-3", "unsatisfiable"),         # start > end -> 416
+    ("bytes=abc-10", "unsatisfiable"),      # non-numeric start -> 416
+    ("bytes=10-xyz", "unsatisfiable"),      # non-numeric end -> 416
+    ("bytes=-", "unsatisfiable"),           # empty suffix -> 416
+    ("bytes=0-499,600-799", ""),            # multi-range -> serve whole file
+    ("chunks=0-1", ""),                     # not a bytes range -> whole file
+    ("bytes=0-0", "0,0"),                   # single first byte
+]
+
+TRAVERSAL_ROWS = [
+    ("/", True),
+    ("/file.txt", True),
+    ("/sub/dir/a.png", True),
+    ("/a%20b.txt", True),                   # a space, decoded, is fine
+    ("/../etc/passwd", False),              # literal ..
+    ("/%2e%2e/secret", False),              # encoded ..
+    ("/a/..%2f..%2fb", False),              # encoded ../.. mid-path
+    ("/..%5c..%5cwindows", False),          # encoded ..\ (backslash) -> ..
+    ("/deep/../../x", False),
+    ("/weird..name.txt", False),            # intentionally strict (matches OnionXT)
+]
+
+DOT_ROWS = [
+    ("/", False),
+    ("", False),
+    ("/file.txt", False),                   # dot INSIDE a name is fine
+    ("/notes.d/file", False),               # ...and inside a folder name
+    ("/a/b.txt", False),
+    ("/.git/config", True),
+    ("/a/.env", True),
+    ("/dir/.hidden/", True),
+    ("/.", True),
+    ("/.well-known/x", True),               # wholesale policy: hidden is hidden
+]
+
+MIME_ROWS = [
+    ("index.html", "text/html; charset=utf-8"),
+    ("a.PNG", "image/png"),
+    ("movie.mp4", "video/mp4"),
+    ("song.MP3", "audio/mpeg"),
+    ("doc.pdf", "application/pdf"),
+    ("archive.zip", "application/zip"),
+    ("data.bin", "application/octet-stream"),
+    ("noextension", "application/octet-stream"),
+    ("a.tar.gz", "application/octet-stream"),   # only the final ext is looked up
+    ("app.wasm", "application/wasm"),           # web-app essentials
+    ("module.mjs", "application/javascript; charset=utf-8"),
+    ("feed.xml", "application/xml; charset=utf-8"),
+    ("bundle.js.map", "application/json; charset=utf-8"),
+    ("site.webmanifest", "application/manifest+json"),
+    ("f.woff", "font/woff"),
+    ("font.WOFF2", "font/woff2"),
+    ("f.ttf", "font/ttf"),
+    ("f.otf", "font/otf"),
+    ("f.eot", "application/vnd.ms-fontobject"),
+    ("pic.avif", "image/avif"),
+    ("data.csv", "text/csv; charset=utf-8"),
+]
+
+CAPABILITY_ROWS = [
+    ("/abc123/", (True, "/")),                 # folder root
+    ("/abc123", (True, "/")),                  # no trailing slash -> root
+    ("/abc123/sub/", (True, "/sub/")),         # a subfolder
+    ("/abc123/a/b.txt", (True, "/a/b.txt")),   # a nested file
+    ("/abc123/photo.jpg", (True, "/photo.jpg")),
+    ("X/abc123/sub/", (True, "/sub/")),        # no leading "/": the rest still anchored
+    ("/wrongtoken/", (False, "/")),            # bad token -> 404
+    ("/", (False, "/")),                       # bare root, no token -> 404
+    ("", (False, "/")),                        # empty -> 404
+    ("/abc123/../etc", "forbidden"),           # traversal refused first
+]
+
+SPA_ROWS = [
+    ("/dashboard", True),                      # a route -> index.html
+    ("/users/42", True),
+    ("/deep/route/here", True),
+    ("/", True),                               # empty leaf -> route (resolves anyway)
+    ("/a.b/c", True),                          # dot is in a PARENT segment, not the leaf
+    ("/app.js", False),                        # a missing asset -> real 404
+    ("/assets/logo.png", False),
+    ("/favicon.ico", False),
+    ("/a/b.min.js", False),
+    ("/style.css", False),
+]
+
+EDIT_SAFE_ROWS = [
+    ("index.html", "/srv/index.html"),        # allowed: a plain file
+    ("css/app.css", "/srv/css/app.css"),
+    ("/css/app.css", "/srv/css/app.css"),     # leading slash is fine
+    ("a//b.txt", "/srv/a/b.txt"),             # empty segment collapses
+    ("./a.txt", "/srv/a.txt"),                # "." segment dropped
+    ("a/./b.txt", "/srv/a/b.txt"),
+    (".env", "/srv/.env"),                    # a dotfile UNDER root is fine
+    ("../etc/passwd", ""),                    # REJECT: traversal
+    ("a/../b", ""),
+    ("..", ""),
+    ("...", ""),                              # REJECT: contains ".." (over-cautious)
+    ("my..file.txt", ""),                     # REJECT: contains ".." (over-cautious)
+    ("C:/Windows/win.ini", ""),               # REJECT: drive colon
+    ("http://evil/x", ""),                    # REJECT: scheme colon
+    ("", ""),                                 # REJECT: names nothing
+    ("/", ""),
+    ("\\..\\..\\x", ""),                      # REJECT: backslashes -> ".."
+    ("a\x00b.txt", ""),                       # REJECT: NUL / control char
+    ("a\tb.txt", ""),                         # REJECT: control char (tab)
+]
+
+ICON_ROWS = [
+    ("photos", True, "dir"),                  # a folder
+    ("index.html", False, "code"),            # web source -> code icon
+    ("app.min.js", False, "code"),            # last ext only
+    ("styles.css", False, "code"),
+    ("logo.PNG", False, "img"),               # case-insensitive
+    ("clip.mp4", False, "vid"),
+    ("song.flac", False, "aud"),
+    ("notes.txt", False, "doc"),
+    ("readme.md", False, "doc"),
+    ("data.csv", False, "doc"),
+    ("archive.tar.gz", False, "zip"),         # final ext gz -> zip
+    ("manual.pdf", False, "pdf"),
+    ("photo.heic", False, "img"),
+    ("blob.bin", False, "file"),              # unknown -> generic
+    ("Makefile", False, "file"),              # no extension -> generic
+]
+
+LAN_ROWS = [
+    ("cw:192.168.1.5:52000", True),           # home LAN
+    ("cw:10.0.0.9:1234", True),               # RFC-1918 10/8
+    ("cw:127.0.0.1:5000", True),              # loopback
+    ("cw:172.16.4.4:80", True),               # 172.16/12 lower edge
+    ("cw:172.31.9.9:80", True),               # 172.16/12 upper edge
+    ("cw:172.32.0.1:80", False),              # just outside 172.16-31 -> public
+    ("cw:100.64.0.1:80", False),              # carrier-NAT: ISP-shared, NOT the LAN
+    ("cw:169.254.1.1:80", True),              # link-local
+    ("cw:::1:5000", True),                    # IPv6 loopback
+    ("cw:8.8.8.8:443", False),                # public
+    ("cw:203.0.113.7:12345", False),          # public (TEST-NET-3)
+    ("cw:192.168.0.1:80|2", True),            # private with a |n socket suffix
+    ("cw:1.2.3.4:80|3", False),               # public with a |n socket suffix
+    ("ox:streamhandle42", False),             # Tor: ALWAYS remote
+    ("ox:anything", False),
+]
+
+HTML_ROWS = [
+    ("<script>alert('x')</script>", "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
+    ("a & <b>", "a &amp; &lt;b&gt;"),         # & first, so no entity is mangled twice
+    ('say "hi"', "say &quot;hi&quot;"),
+]
+
+_GET_FULL = b"GET /_qs/info HTTP/1.1\r\nHost: x\r\n\r\n"
+_POST_HDR = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\n"
+FRAMING_ROWS = [                              # (label, request bytes, complete?)
+    ("GET (no body)", _GET_FULL, True),
+    ("incomplete head", b"GET / HTTP/1.1\r\nHost: x\r\n", False),
+    ("post no body yet", _POST_HDR, False),
+    ("post partial body", _POST_HDR + b"hel", False),
+    ("post full body", _POST_HDR + b"hello", True),
+    ("post over-long body still complete", _POST_HDR + b"helloEXTRA", True),
+    ("post non-integer CL -> no body",
+     b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n", True),
+]
+
+JSON_ROWS = [
+    ("hello", "hello"),
+    ('a"b', 'a\\"b'),
+    ("c:\\path", "c:\\\\path"),
+    ("a\r\nb", "a\\r\\nb"),
+    ("x\ty", "x\\ty"),
+    ('\\"', '\\\\\\"'),                   # backslash before quote: order matters
+]
+
+QUERY_ROWS = [
+    ("path=css/app.css", "path", "css/app.css"),
+    ("path=a%2Fb.txt", "path", "a/b.txt"),    # %2F decoded to /
+    ("path=a%20b.txt", "path", "a b.txt"),    # %20 decoded to a space
+    ("path=a+b.txt", "path", "a b.txt"),      # LiveCode urlDecode: '+' -> space
+    ("path=a%2Bb.txt", "path", "a+b.txt"),    # %2B -> a literal '+' (what the JS sends)
+    ("x=1&path=main.js", "path", "main.js"),  # second param
+    ("path=main.js&x=1", "path", "main.js"),  # first param
+    ("path=x=y", "path", "x=y"),              # value may contain '='
+    ("path=", "path", ""),                    # present but empty
+    ("q=hello", "path", ""),                  # absent -> empty
+    ("", "path", ""),                         # no query -> empty
+    ("foo=bar&foo=baz", "foo", "bar"),        # first match wins
+]
+
+
 def main():
     total = 1000
     # -- byte-range parsing --
-    for rng, want in [
-        ("", ""),                               # no Range header -> whole file
-        ("bytes=0-499", "0,499"),               # a normal first-chunk range
-        ("bytes=500-999", "500,999"),
-        ("bytes=500-", "500,999"),              # open-ended -> to EOF
-        ("bytes=0-", "0,999"),
-        ("bytes=999-", "999,999"),              # last byte
-        ("bytes=-500", "500,999"),              # suffix: last 500 bytes
-        ("bytes=-5000", "0,999"),               # suffix bigger than file -> whole
-        ("bytes=0-100000", "0,999"),            # end past EOF -> clamped
-        ("bytes=1000-", "unsatisfiable"),       # start == total -> 416
-        ("bytes=1500-2000", "unsatisfiable"),   # wholly past EOF -> 416
-        ("bytes=5-3", "unsatisfiable"),         # start > end -> 416
-        ("bytes=abc-10", "unsatisfiable"),      # non-numeric start -> 416
-        ("bytes=10-xyz", "unsatisfiable"),      # non-numeric end -> 416
-        ("bytes=-", "unsatisfiable"),           # empty suffix -> 416
-        ("bytes=0-499,600-799", ""),            # multi-range -> serve whole file
-        ("chunks=0-1", ""),                     # not a bytes range -> whole file
-        ("bytes=0-0", "0,0"),                   # single first byte
-    ]:
+    for rng, want in RANGE_ROWS:
         check("parse_range(%r)" % rng, parse_range(rng, total), want)
 
     # empty file (total 0): any concrete range is unsatisfiable; no range -> ""
@@ -595,254 +973,111 @@ def main():
     check("parse_range empty-file 0-", parse_range("bytes=0-", 0), "unsatisfiable")
 
     # -- path-traversal decision --
-    for raw, ok in [
-        ("/", True),
-        ("/file.txt", True),
-        ("/sub/dir/a.png", True),
-        ("/a%20b.txt", True),                   # a space, decoded, is fine
-        ("/../etc/passwd", False),              # literal ..
-        ("/%2e%2e/secret", False),              # encoded ..
-        ("/a/..%2f..%2fb", False),              # encoded ../.. mid-path
-        ("/..%5c..%5cwindows", False),          # encoded ..\ (backslash) -> ..
-        ("/deep/../../x", False),
-        ("/weird..name.txt", False),            # intentionally strict (matches OnionXT)
-    ]:
+    for raw, ok in TRAVERSAL_ROWS:
         check("traversal_ok(%r)" % raw, traversal_ok(raw), ok)
 
     # -- dotfile guard: dot-leading segments are invisible to the static paths --
-    for path, want in [
-        ("/", False),
-        ("", False),
-        ("/file.txt", False),                   # dot INSIDE a name is fine
-        ("/notes.d/file", False),               # ...and inside a folder name
-        ("/a/b.txt", False),
-        ("/.git/config", True),
-        ("/a/.env", True),
-        ("/dir/.hidden/", True),
-        ("/.", True),
-        ("/.well-known/x", True),               # wholesale policy: hidden is hidden
-    ]:
+    for path, want in DOT_ROWS:
         check("has_dot_segment(%r)" % path, has_dot_segment(path), want)
 
+    # -- the reserved namespaces (nocloud's rows, ported with the guard 2026-09-27) --
+    for path, want in RESERVED_ROWS:
+        check("reserved_path(%r)" % path, reserved_path(path), want)
+
+    # -- the static pipeline's whole decision, both transports, over SERVE_TREE --
+    for method, raw, shared, want in SERVE_ROWS:
+        check("serve_static(%s %s%s)" % (method, raw, "" if shared else ", nothing shared"),
+              serve_static(method, raw, SERVE_TREE, SERVE_ROUTES, shared), want)
+    for method, raw, want in CW_ROWS:
+        check("serve_static(cw %s %s)" % (method, raw),
+              serve_static(method, raw, SERVE_TREE, SERVE_ROUTES, True, CW_TOKEN), want)
+    # the refusal rows are refusal rows: without its guard each would be answered from
+    # disk or by the SPA fallback (a row the old pipeline 404ed too would prove nothing)
+    dirs, files = _tree_sets(SERVE_TREE)
+    for method, raw, shared, want in SERVE_ROWS:
+        path = unquote_plus(raw)
+        if shared and want == ("text", "404") and (has_dot_segment(path)
+                                                    or reserved_path(path)):
+            check("witness: %s %s is on disk or would reach the SPA" % (method, raw),
+                  path.strip("/") in dirs | files or spa_is_route(path), True)
+    # the anchor rows are escape rows: the old join of the root's text and the target
+    # named a real path OUTSIDE the share, and a row that named nothing would prove nothing
+    outside = set(OUTSIDE_TREE) | set(t.rsplit("/", 1)[0] + "/" for t in OUTSIDE_TREE)
+    anchored = [r for r in SERVE_ROWS if not r[1].startswith("/") and r[2]]
+    check("the Tor anchor rows exist", len(anchored) >= 4, True)
+    check("witness: some Tor anchor row once reached OUTSIDE_TREE",
+          any(unanchored_disk_rel(raw) in outside for _, raw, _, _ in anchored), True)
+    for method, raw, _, want in anchored:
+        if unanchored_disk_rel(raw) in outside:
+            check("witness: %s %s is not served from outside" % (method, raw),
+                  want[0] != "file" or want[1] != unanchored_disk_rel(raw), True)
+    cw_anchored = [r for r in CW_ROWS if not r[1].startswith("/")]
+    check("witness: some clearweb anchor row's old offset reached OUTSIDE_TREE",
+          any(offset_rest(raw, CW_TOKEN) in outside for _, raw, _ in cw_anchored), True)
+    for _, raw, _ in cw_anchored:
+        check("capability_route(%r) anchors the rest at '/'" % raw,
+              capability_route(raw, CW_TOKEN)[1].startswith("/"), True)
+
+    # -- the listing hides every dot-leading name --
+    check("listing_visible(root)", listing_visible(listing_names("")),
+          ["_Edit", "_qs", "docs", "index.html", "notes.d", "public.txt", "site", "sub"])
+    check("listing_visible(sub)", listing_visible(listing_names("sub")), ["a.txt"])
+    check("listing_visible(.git)", listing_visible(listing_names(".git")), ["config"])
+
+    # -- the editor's write refusals --
+    for rel, want in EDIT_WRITE_ROWS:
+        check("edit_write_decision(%r)" % rel, edit_write_decision(rel, SERVE_TREE), want)
+    # the backslash rows are bypass rows: a raw read of each misses the dot, and the
+    # confinement still WRITES a dot path (so each can fail on the raw check)
+    slashed = [(rel, want) for rel, want in EDIT_WRITE_ROWS if "\\" in rel and want[0] == 400]
+    check("the editor's backslash dot rows exist", len(slashed) >= 3, True)
+    for rel, _ in slashed:
+        check("witness: %r slips past a raw dot check into a dot path" % rel,
+              (has_dot_segment(rel), has_dot_segment(edit_safe_path("/srv", rel)[5:])),
+              (False, True))
+
     # -- MIME mapping (extension is case-insensitive; unknown -> octet-stream) --
-    for path, want in [
-        ("index.html", "text/html; charset=utf-8"),
-        ("a.PNG", "image/png"),
-        ("movie.mp4", "video/mp4"),
-        ("song.MP3", "audio/mpeg"),
-        ("doc.pdf", "application/pdf"),
-        ("archive.zip", "application/zip"),
-        ("data.bin", "application/octet-stream"),
-        ("noextension", "application/octet-stream"),
-        ("a.tar.gz", "application/octet-stream"),   # only the final ext is looked up
-        ("app.wasm", "application/wasm"),           # web-app essentials
-        ("module.mjs", "application/javascript; charset=utf-8"),
-        ("feed.xml", "application/xml; charset=utf-8"),
-        ("bundle.js.map", "application/json; charset=utf-8"),
-        ("site.webmanifest", "application/manifest+json"),
-        ("f.woff", "font/woff"),
-        ("font.WOFF2", "font/woff2"),
-        ("f.ttf", "font/ttf"),
-        ("f.otf", "font/otf"),
-        ("f.eot", "application/vnd.ms-fontobject"),
-        ("pic.avif", "image/avif"),
-        ("data.csv", "text/csv; charset=utf-8"),
-    ]:
+    for path, want in MIME_ROWS:
         check("mime(%r)" % path, mime(path), want)
 
     # -- HTML escaping (& first so an existing entity is not double-mangled wrong) --
-    check("html_escape script",
-          html_escape("<script>alert('x')</script>"),
-          "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;")
-    check("html_escape amp-first", html_escape("a & <b>"), "a &amp; &lt;b&gt;")
-    check("html_escape quote", html_escape('say "hi"'), "say &quot;hi&quot;")
+    for text, want in HTML_ROWS:
+        check("html_escape(%r)" % text, html_escape(text), want)
 
     # -- clearweb capability gate (the /<token>/ prefix) --
     tok = "abc123"
-    for path, want in [
-        ("/abc123/", (True, "/")),                 # folder root
-        ("/abc123", (True, "/")),                  # no trailing slash -> root
-        ("/abc123/sub/", (True, "/sub/")),         # a subfolder
-        ("/abc123/a/b.txt", (True, "/a/b.txt")),   # a nested file
-        ("/abc123/photo.jpg", (True, "/photo.jpg")),
-        ("/wrongtoken/", (False, "/")),            # bad token -> 404
-        ("/", (False, "/")),                       # bare root, no token -> 404
-        ("", (False, "/")),                        # empty -> 404
-        ("/abc123/../etc", "forbidden"),           # traversal refused first
-    ]:
+    for path, want in CAPABILITY_ROWS:
         check("capability_route(%r)" % path, capability_route(path, tok), want)
 
     # -- SPA fallback: is an unresolved path a client-side route or a missing asset? --
-    for path, want in [
-        ("/dashboard", True),                      # a route -> index.html
-        ("/users/42", True),
-        ("/deep/route/here", True),
-        ("/", True),                               # empty leaf -> route (resolves anyway)
-        ("/a.b/c", True),                          # dot is in a PARENT segment, not the leaf
-        ("/app.js", False),                        # a missing asset -> real 404
-        ("/assets/logo.png", False),
-        ("/favicon.ico", False),
-        ("/a/b.min.js", False),
-        ("/style.css", False),
-    ]:
+    for path, want in SPA_ROWS:
         check("spa_is_route(%r)" % path, spa_is_route(path), want)
 
     # -- HTTP request framing (head terminator + Content-Length body) --
-    get_full = b"GET /_qs/info HTTP/1.1\r\nHost: x\r\n\r\n"
-    check("header_end GET", http_header_end(get_full), get_full.find(b"\r\n\r\n") + 1)
-    check("complete GET (no body)", http_req_complete(get_full), True)
-    check("incomplete head", http_req_complete(b"GET / HTTP/1.1\r\nHost: x\r\n"), False)
-    post_hdr = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\n"
-    check("post no body yet", http_req_complete(post_hdr), False)
-    check("post partial body", http_req_complete(post_hdr + b"hel"), False)
-    check("post full body", http_req_complete(post_hdr + b"hello"), True)
-    check("post over-long body still complete", http_req_complete(post_hdr + b"helloEXTRA"), True)
-    check("post non-integer CL -> no body", http_req_complete(
-        b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"), True)
-
-    # -- keep-alive framing: qsHttpReqLength trims exactly one request, leaving pipelined
-    #    bytes intact and complete for the next round (headEnd + 3 + Content-Length) --
-    check("reqlen GET exact", http_req_length(get_full), len(get_full))
-    check("reqlen GET incomplete head", http_req_length(b"GET / HTTP/1.1\r\nHost: x\r\n"), 0)
-    check("reqlen POST with body", http_req_length(post_hdr + b"hello"), len(post_hdr) + 5)
-    # a pipelined pair: trimming the first length leaves EXACTLY the second request
-    pair = get_full + post_hdr + b"hello"
-    n = http_req_length(pair)
-    check("reqlen pipelined GET length", n, len(get_full))
-    check("reqlen pipelined remainder intact", pair[n:], post_hdr + b"hello")
-    check("reqlen pipelined remainder complete", http_req_complete(pair[n:]), True)
-    # trimming a POST(+body) leaves the trailing pipelined GET
-    pair2 = post_hdr + b"hello" + get_full
-    n2 = http_req_length(pair2)
-    check("reqlen POST length includes body", n2, len(post_hdr) + 5)
-    check("reqlen POST remainder is next GET", pair2[n2:], get_full)
-    # non-integer Content-Length frames as no body (matches http_req_complete)
-    check("reqlen non-integer CL -> head only", http_req_length(
-        b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n"),
-        http_header_end(b"POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n") + 3)
+    check("header_end GET", http_header_end(_GET_FULL), _GET_FULL.find(b"\r\n\r\n") + 1)
+    check("header_end incomplete head", http_header_end(b"GET / HTTP/1.1\r\nHost: x\r\n"), 0)
+    for label, data, want in FRAMING_ROWS:
+        check("http_req_complete " + label, http_req_complete(data), want)
 
     # -- JSON value escaping (for the /_qs/info route) --
-    check("json plain", json_escape("hello"), "hello")
-    check("json quote", json_escape('a"b'), 'a\\"b')
-    check("json backslash", json_escape("c:\\path"), "c:\\\\path")
-    check("json crlf", json_escape("a\r\nb"), "a\\r\\nb")
-    check("json tab", json_escape("x\ty"), "x\\ty")
-    check("json backslash-before-quote order", json_escape('\\"'), '\\\\\\"')
+    for text, want in JSON_ROWS:
+        check("json_escape(%r)" % text, json_escape(text), want)
 
     # -- editor write-path confinement (THE security linchpin) --
     R = "/srv"
-    for rel, want in [
-        ("index.html", "/srv/index.html"),        # allowed: a plain file
-        ("css/app.css", "/srv/css/app.css"),
-        ("/css/app.css", "/srv/css/app.css"),     # leading slash is fine
-        ("a//b.txt", "/srv/a/b.txt"),             # empty segment collapses
-        ("./a.txt", "/srv/a.txt"),                # "." segment dropped
-        ("a/./b.txt", "/srv/a/b.txt"),
-        (".env", "/srv/.env"),                    # a dotfile UNDER root is fine
-        ("../etc/passwd", ""),                    # REJECT: traversal
-        ("a/../b", ""),
-        ("..", ""),
-        ("...", ""),                              # REJECT: contains ".." (over-cautious)
-        ("my..file.txt", ""),                     # REJECT: contains ".." (over-cautious)
-        ("C:/Windows/win.ini", ""),               # REJECT: drive colon
-        ("http://evil/x", ""),                    # REJECT: scheme colon
-        ("", ""),                                 # REJECT: names nothing
-        ("/", ""),
-        ("\\..\\..\\x", ""),                      # REJECT: backslashes -> ".."
-        ("a\x00b.txt", ""),                       # REJECT: NUL / control char
-        ("a\tb.txt", ""),                         # REJECT: control char (tab)
-    ]:
+    for rel, want in EDIT_SAFE_ROWS:
         check("edit_safe_path(%r)" % rel, edit_safe_path(R, rel), want)
 
     # -- directory-listing icon classification --
-    for name, is_dir, want in [
-        ("photos", True, "dir"),                  # a folder
-        ("index.html", False, "code"),            # web source -> code icon
-        ("app.min.js", False, "code"),            # last ext only
-        ("styles.css", False, "code"),
-        ("logo.PNG", False, "img"),               # case-insensitive
-        ("clip.mp4", False, "vid"),
-        ("song.flac", False, "aud"),
-        ("notes.txt", False, "doc"),
-        ("readme.md", False, "doc"),
-        ("data.csv", False, "doc"),
-        ("archive.tar.gz", False, "zip"),         # final ext gz -> zip
-        ("manual.pdf", False, "pdf"),
-        ("photo.heic", False, "img"),
-        ("blob.bin", False, "file"),              # unknown -> generic
-        ("Makefile", False, "file"),              # no extension -> generic
-    ]:
+    for name, is_dir, want in ICON_ROWS:
         check("fs_icon(%r)" % name, fs_icon(name, is_dir), want)
 
-    # -- file-size seek probe: must return the exact size for every shape --
-    for s in [0, 1, 2, 3, 4, 7, 8, 255, 256, 257, 1000, 4095, 4096, 65535, 65536,
-              1000000, 2 ** 30, 8589934592]:      # last = exactly the 8 GiB cap
-        check("file_size_probe(%d)" % s, file_size_probe(s), s)
-    # a file larger than the cap gives up (caller falls back to the linear count)
-    check("file_size_probe over-cap", file_size_probe(8589934592 + 1), None)
-
-    # -- Content-Disposition filename sanitising --
-    for name, want in [
-        ("report.pdf", "report.pdf"),
-        ("my file.txt", "my file.txt"),           # spaces are fine
-        ('a"b.txt', "ab.txt"),                     # drop the quote
-        ("back\\slash", "backslash"),             # drop the backslash
-        ("nau\x00gh\tty", "naughty"),             # drop control bytes
-        ("café.png", "caf.png"),             # drop non-ASCII (no RFC 5987 needed)
-        ("", "download"),                          # nothing left -> a default
-        ("\x01\x02", "download"),
-    ]:
-        check("safe_filename(%r)" % name, safe_filename(name), want)
-
-    # -- compact transfer-row rate + ETA formatting --
-    for bps, want in [
-        (0, "0B/s"), (-5, "0B/s"), (512, "512B/s"), (1024, "1K/s"),
-        (1536, "1.5K/s"), (1048576, "1M/s"), (1300000, "1.2M/s"),
-        (1073741824, "1G/s"), (2000, "2K/s"),
-    ]:
-        check("rate_short(%d)" % bps, rate_short(bps), want)
-    for secs, want in [
-        (-1, ""), (0, "0s"), (45, "45s"), (59, "59s"), (60, "1m"), (125, "2m"),
-        (3599, "59m"), (3600, "1h0m"), (3725, "1h2m"), (86399, "23h59m"),
-        (86400, ">1d"), (200000, ">1d"), (44.9, "44s"),
-    ]:
-        check("eta_short(%r)" % secs, eta_short(secs), want)
-
     # -- editor LAN-first gate (only local peers may reach the editor) --
-    for conn, want in [
-        ("cw:192.168.1.5:52000", True),           # home LAN
-        ("cw:10.0.0.9:1234", True),               # RFC-1918 10/8
-        ("cw:127.0.0.1:5000", True),              # loopback
-        ("cw:172.16.4.4:80", True),               # 172.16/12 lower edge
-        ("cw:172.31.9.9:80", True),               # 172.16/12 upper edge
-        ("cw:172.32.0.1:80", False),              # just outside 172.16-31 -> public
-        ("cw:100.64.0.1:80", False),              # carrier-NAT: ISP-shared, NOT the LAN
-        ("cw:169.254.1.1:80", True),              # link-local
-        ("cw:::1:5000", True),                    # IPv6 loopback
-        ("cw:8.8.8.8:443", False),                # public
-        ("cw:203.0.113.7:12345", False),          # public (TEST-NET-3)
-        ("cw:192.168.0.1:80|2", True),            # private with a |n socket suffix
-        ("cw:1.2.3.4:80|3", False),               # public with a |n socket suffix
-        ("ox:streamhandle42", False),             # Tor: ALWAYS remote
-        ("ox:anything", False),
-    ]:
+    for conn, want in LAN_ROWS:
         check("edit_is_local(%r)" % conn, edit_is_local(conn), want)
 
     # -- query-string value extraction (editor read/write ?path=) --
-    for query, name, want in [
-        ("path=css/app.css", "path", "css/app.css"),
-        ("path=a%2Fb.txt", "path", "a/b.txt"),    # %2F decoded to /
-        ("path=a%20b.txt", "path", "a b.txt"),    # %20 decoded to a space
-        ("path=a+b.txt", "path", "a b.txt"),      # LiveCode urlDecode: '+' -> space
-        ("path=a%2Bb.txt", "path", "a+b.txt"),    # %2B -> a literal '+' (what the JS sends)
-        ("x=1&path=main.js", "path", "main.js"),  # second param
-        ("path=main.js&x=1", "path", "main.js"),  # first param
-        ("path=x=y", "path", "x=y"),              # value may contain '='
-        ("path=", "path", ""),                    # present but empty
-        ("q=hello", "path", ""),                  # absent -> empty
-        ("", "path", ""),                         # no query -> empty
-        ("foo=bar&foo=baz", "foo", "bar"),        # first match wins
-    ]:
+    for query, name, want in QUERY_ROWS:
         check("query_param(%r,%r)" % (query, name), query_param(query, name), want)
 
     # -- the case-exact route keys (2026-09-25) and the lookup --
@@ -867,11 +1102,11 @@ def main():
     if _fail:
         print("fileserver_golden: FAIL\n" + "\n".join(_fail))
         return 1
-    print("fileserver_golden: OK (range parse, traversal guard, MIME, icon classify, "
-          "HTML escape, capability gate, SPA fallback, HTTP framing, keep-alive req "
-          "length, JSON escape, editor confinement, LAN-first gate, query parse, size "
-          "probe, filename sanitise, rate + ETA format, case-exact route keys + HEAD "
-          "route lookup + fold rows all match)")
+    print("fileserver_golden: OK (range parse, traversal guard, dotfile guard, reserved "
+          "namespaces, the static decision on both transports, the listing, the editor's "
+          "write refusals, MIME, icon classify, HTML escape, capability gate, SPA "
+          "fallback, HTTP framing, JSON escape, editor confinement, LAN-first gate, query "
+          "parse, case-exact route keys + HEAD route lookup + fold rows all match)")
     return 0
 
 

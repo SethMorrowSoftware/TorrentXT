@@ -122,7 +122,11 @@ page; other files (`css`, `js`, `wasm`, ES modules, fonts, images, source maps, 
 served with correct MIME types, with **HTTP Range** so media streams and seeks. A
 **single-page app** works automatically: an unresolved path that looks like a client-side
 route (no file extension) falls back to `index.html` so the app's own router takes over,
-while a genuinely missing asset still returns 404. Two things to know:
+while a genuinely missing asset still returns 404. **Hidden files stay hidden:** any
+path with a segment starting with a dot (`.git/`, `.env`, `.well-known/`) answers 404 and
+is never listed, and so does a path under `/_qs` or `/_edit` that no built-in route
+answers (both since 2026-09-27; verified statically; needs an OXT pass). Two things to
+know:
 - The **Tor `.onion`** path is the best home for an app: it serves at the root, and Tor
   Browser treats an onion as a **secure context**, so features that need HTTPS (service
   workers, some Web APIs) work. Plain `http://` over the direct web link is *not* a secure
@@ -178,8 +182,10 @@ built-in editor - a file list, a text pane, and Save. This is deliberately locke
   or control byte), so a save can only ever land **inside the shared folder**.
 - It edits **text/code** files up to ~256 KB (a browser textarea, not a binary editor).
 
-The LAN-only rule and the write-path confinement are pinned by adversarial vectors in
-`tests/fileserver_golden.py` (`edit_is_local`, `edit_safe_path`).
+The editor will not write a hidden (dot-leading) path: nobody browsing the share could
+see it. The LAN-only rule, the write-path confinement and that refusal are pinned by
+adversarial vectors in `tests/fileserver_golden.py` (`edit_is_local`, `edit_safe_path`,
+`edit_write_decision`), which `tools/check-script-vectors.py` holds to the demo.
 
 ### Client (`torrent-client.livecodescript`)
 A real multi-torrent client. Paste a magnet, an `http(s)` `.torrent` URL, a local

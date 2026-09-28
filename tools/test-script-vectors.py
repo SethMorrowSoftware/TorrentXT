@@ -131,6 +131,95 @@ FIXTURES = [
      "   return qsHexKey(toUpper(pMethod) & space & pPath)\n",
      "   return toUpper(pMethod) & space & pPath\n",
      "qsRouteLookupKey: GET /_EDIT (fold)"),
+    # The folder server's two refusals (WORK-PLAN torrentxt #21, 2026-09-27: nocloud's
+    # dotfile and reserved-namespace guards, ported), each call site undone in turn, the
+    # predicates weakened, the listing's two filters and the editor's write refusal
+    # removed, and the clearweb rest path joined from items again (the trailing-slash
+    # loss the serve rows found the same day). Each must be NAMED by the gate's serve,
+    # listing, editor or helper rows.
+    ("the Tor pipeline's dotfile refusal removed", "qs", 1,
+     "   if qsHasDotSegment(tPath) then\n"
+     "      qsFsSendText pStream, \"404 Not Found\", \"text/html; charset=utf-8\", "
+     "qsFsNotFound(tPath)\n"
+     "      exit qsFsServePath\n"
+     "   end if\n",
+     "",
+     "serve: Tor GET /.env"),
+    ("the clearweb pipeline's dotfile refusal removed", "qs", 1,
+     "   if qsHasDotSegment(tRest) then\n"
+     "      qsCwSendText pSocketID, \"404 Not Found\", \"text/html; charset=utf-8\", "
+     "qsFsNotFound(tRest)\n"
+     "      exit qsCwServe\n"
+     "   end if\n",
+     "",
+     "serve: clearweb GET /abc123/.env"),
+    ("the Tor pipeline's reserved-namespace refusal removed", "qs", 1,
+     "   if qsHttpReservedPath(tPath) then\n"
+     "      qsFsSendText pStream, \"404 Not Found\", \"text/html; charset=utf-8\", "
+     "qsFsNotFound(tPath)\n"
+     "      exit qsFsServePath\n"
+     "   end if\n",
+     "",
+     "serve: Tor GET /_qs/data.json"),
+    ("the clearweb pipeline's reserved-namespace refusal removed", "qs", 1,
+     "   if qsHttpReservedPath(tRest) then\n"
+     "      qsCwSendText pSocketID, \"404 Not Found\", \"text/html; charset=utf-8\", "
+     "qsFsNotFound(tRest)\n"
+     "      exit qsCwServe\n"
+     "   end if\n",
+     "",
+     "serve: clearweb GET /abc123/_qs/data.json"),
+    ("qsHttpReservedPath no longer folding case", "qs", 1,
+     "   put toLower(pPath) into tLow\n",
+     "   put pPath into tLow\n",
+     "serve: Tor GET /_QS/info"),
+    ("qsHasDotSegment testing a whole segment, not its first char", "qs", 1,
+     "      if tSeg is not empty and char 1 of tSeg is \".\" then\n",
+     "      if tSeg is not empty and tSeg is \".\" then\n",
+     "qsHasDotSegment('/.git/config')"),
+    ("the listing showing dot-folders again", "qs", 1,
+     "      if char 1 of tName is \".\" then\n"
+     "         next repeat      -- hidden entries stay hidden (matches the 404 guard)\n"
+     "      end if\n"
+     "      put \"<li class='dir t-dir'>",
+     "      put \"<li class='dir t-dir'>",
+     "qsFsListing('/'): the names listed"),
+    ("the listing showing dotfiles again", "qs", 1,
+     "      if char 1 of tName is \".\" then\n"
+     "         next repeat      -- hidden entries stay hidden (matches the 404 guard)\n"
+     "      end if\n"
+     "      put \"<li class='file t-\"",
+     "      put \"<li class='file t-\"",
+     "qsFsListing('/'): the names listed"),
+    ("the editor writing a hidden path again", "qs", 1,
+     "   if qsHasDotSegment(tSegs) then\n",
+     "   if false then\n",
+     "qsEditWriteRoute('.env')"),
+    ("the clearweb rest path joined from items (a subfolder's trailing slash lost)", "qs", 1,
+     "   put char ((the number of chars of item 1 of tPath) + (the number of chars of tTok) + 2) \\\n"
+     "      to -1 of tPath into tRest\n",
+     "   put \"/\" & (item 3 to -1 of tPath) into tRest\n",
+     "serve: clearweb GET /abc123/docs/"),
+    # The review of that port (2026-09-27): three spellings the guards did not read the
+    # way the disk does. Each old line planted back must be NAMED by an anchor or
+    # backslash row, whose witness (the golden's main()) is a real path outside the share
+    # or a real dot path written.
+    ("the Tor path not anchored at the share root (a sibling folder served)", "qs", 1,
+     "   if char 1 of tPath is not \"/\" then\n"
+     "      put \"/\" before tPath\n"
+     "   end if\n",
+     "",
+     "serve: Tor GET -backup/secret.txt"),
+    ("the clearweb rest offset from the token's length alone (the first 2026-09-27 fix)",
+     "qs", 1,
+     "   put char ((the number of chars of item 1 of tPath) + (the number of chars of tTok) + 2) \\\n"
+     "      to -1 of tPath into tRest\n",
+     "   put char ((the number of chars of tTok) + 2) to -1 of tPath into tRest\n",
+     "serve: clearweb GET X/abc123/public.txt"),
+    ("the editor's dot check reading the raw path (a backslash slips past)", "qs", 1,
+     "   if qsHasDotSegment(tSegs) then\n",
+     "   if qsHasDotSegment(tRel) then\n",
+     "qsEditWriteRoute('\\\\.env')"),
 ]
 
 

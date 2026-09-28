@@ -247,12 +247,42 @@ note 2.7), so `GET /_EDIT` dispatched to the `/_edit` route; it is keyed by `qsR
 that dispatches, or empty. `tests/fileserver_golden.py` mirrors all three helpers, and
 `tools/check-script-vectors.py` drives the demo's own `qsHttpRoute` and
 `qsRouteLookupKey` against those mirrors through the family interpreter, whose keys fold
-(verified statically; needs an OXT pass). That section is the only part of this golden a
-gate holds to the demo: the rest was copied from nocloud's and restates it, and five of
-its mirrors name nocloud handlers this demo never got, the dotfile guard among them
-(`qsHasDotSegment`: this demo's folder server has no refusal of `/.git/config` or
-`/.env`), nor did nocloud's reserved-namespace guard (`qsHttpReservedPath`) come across
-(found 2026-09-25; the suite's docs/WORK-PLAN.md tracks it). The family checker's check 23 then found the LAN editor's
+(verified statically; needs an OXT pass). Until 2026-09-27 that section was the only
+part of this golden a gate held to the demo: the rest was copied from nocloud's, and
+five of its mirrors named nocloud handlers this demo never got, the dotfile guard among
+them, so the folder server answered `/.git/config` and `/.env` over Tor and the web link
+and listed dot-folders, and nocloud's reserved-namespace guard had not come across
+either (found 2026-09-25). On 2026-09-27 both guards were ported, byte for byte in their
+code: `qsHasDotSegment` 404s a dot-leading segment in both serve paths (below the 503,
+nocloud's order), `qsFsListing` lists no dot-leading name, and the LAN editor refuses to
+WRITE one (it may still list and read one); `qsHttpReservedPath` (case-folded, stricter
+than the case-exact table) 404s a `/_qs` or `/_edit` path no route answered, above the
+503, where the static pipeline used to serve a real `_qs` folder or the SPA fallback's
+index.html. The golden lost the four mirrors of handlers this demo does not have
+(nocloud's golden keeps them, against nocloud's script) and gained `reserved_path`,
+`serve_static` (the whole static decision over a folder tree, both transports),
+`listing_visible` and `edit_write_decision`; `tools/check-script-vectors.py` now drives
+EVERY mirror against the demo, and runs the real `qsFsServePath`, `qsCwServe`,
+`qsFsListing` and `qsEditWriteRoute` over a real folder carrying `.env`, `.git/config`
+and folders named like the reserved namespaces. Run against the demo before the port,
+it fails on each of those rows. Its first run also found `qsCwServe` building the rest
+path from `item 3 to -1` of the decoded path, which loses a subfolder's trailing slash
+(the engine ignores one trailing delimiter, engine note 2.2), so every clearweb
+subfolder answered a redirect to `.../docs//`; the rest is now the text after
+the token's item, and nocloud's identical `qsCwServe` is a suite work plan row. The
+same day's review found three spellings the guards read differently from the disk,
+each pinned by rows whose witness is a real path outside the share or a real dot path
+written, and each red with its old line planted back: a request target with no
+leading `/` (a raw client's `GET -old/x HTTP/1.1`; no browser sends one) was joined to
+the root's text, which carries no trailing slash, so the Tor path served a SIBLING
+folder whose name begins with the share's, listing included (in the tree since its
+first commit), and the first slash fix's offset, counted from the token alone, did the same
+on the web link; `qsFsServePath` now reads every path from the share root, and
+`qsCwServe` counts item 1 too. And the editor's new dot refusal read the raw path while
+`qsEditSafePath` turns `\` into `/`, so `\.env` was written as `.env`; it reads the
+path with those separators now. nocloud's copies of the unanchored Tor path and the
+backslash bypass are a suite work plan row. All verified statically; needs an OXT pass
+(+ live-Tor for the onion half). The family checker's check 23 then found the LAN editor's
 write gate (`qsEditAuthed`, the `x-edit-token` header) still on bare `is` in both copies, and
 own-key, info-hash and cross-library key compares in `torrent-dht-channels` and
 `torrent-client`; all took the same fix the same day (the cross-library key check compares
@@ -278,7 +308,8 @@ bytes with `sxMemEqual`), verified statically; needs an OXT pass.
 | 2026-09-25 | OXT, Linux (box2dxt's lines print `the platform` as Linux); by the maintainer's account 64-bit Kubuntu 24.04 with the latest committed builds, so the `x86_64-linux` file of `421bab3` (release run 34657390798, 2026-09-12; libtorrent 2.0.11 and static OpenSSL 3.5 by the tree's pins, glibc floor 2.28, and Kubuntu 24.04 ships 2.39); the latest OXT (no version recorded) and no preflight, by the same account (given 2026-09-26); library versions not recorded (the report prints none) | the D-23 suite paste as regenerated at f1346e0 (the tree at cba3130, PR #145; this harness's folded code as on 2026-09-24, comments aside), 2672 passed / 0 failed / 10 skipped | torrentxt 118/0/0 (sampler 11, harness 106, the merge line): every section, incl. gotcha 7's five 996/997 rows, the v9-v11 surface and the three refusal legs; both CROSS sections green (one seed one identity; the SodiumXT-signed put and its other-seq refusal); `btStopSession` released THE session; deleteFiles=true stays manual. That `.so`'s first engine load and this member's first Linux engine figure (the 2026-08-18 and 2026-08-21 Linux pastes recorded none), so gotcha 7's cap and `load_torrent_buffer` (every shim since 2026-08-23 parses through it, and the harness adds a torrent from bytes) have run on Linux on the 2.0.11 pin as well as on Windows' 2.1.1. The 997 refusals corroborate the account: no shim before 2026-09-08 (`aad430a`) passes them, and `421bab3`'s are the only committed Linux builds that carry the cap. By the maintainer's account (given 2026-09-26) the report is the launch's SECOND Run all, the first having run on open: THE session that first run took had been released before this run's probe (by that run's teardown, or by the `stCleanup` every Run all runs first), and the probe took a new one in the same process (`btStartSession returned a positive handle`), on which all 118 ran and which the teardown released again (trap 5.1: one session at a time, not one per launch) |
 | 2026-09-25 (Windows; the Kit report's clock 10:54 PM local) | Windows (the engine reports Win32), by the maintainer's account the machine of the 2026-09-24 runs and 64-bit, so the `x86_64-win32` DLL, INFERRED to be the 2026-09-12 file (no Windows DLL committed since; the 997 refusals agree), whose libtorrent is 2.1.1 by the tree's pin; no preflight (the same account: none on either machine); the OXT build, library versions and whether the report is a launch's first or second Run all not recorded | the same D-23 suite paste as the Linux run (INFERRED from the version lines both reports print: the board stamp `suite-board-1`, holde-em's "stack v0.25.5 harness v47" and riptide's third probe line), 2653 passed / 2 failed / 10 skipped | torrentxt 118/0/0: harness "106 passed, 0 failed of 106 checks", the 996/997-byte lines PASS, every section as on Linux; both CROSS sections and the teardown green (the cross-member row 20/0/0; `btStopSession` released THE session). None of the 2 failures is torrentxt's: they are the live loopbacks, which stalled again on this machine |
 | 2026-09-26 (Linux; the Kit report's clock "Saturday, September 26, 2026 4:23 PM") | OXT, Linux (box2dxt's lines print `the platform` as Linux); by the maintainer's account the machine of the 2026-09-25 Linux run (64-bit Kubuntu 24.04, the latest committed builds, "the latest" OXT; no OXT version recorded, and whether it was the 2026-09-25 build not stated); a fresh stack, no preflight, and the report the launch's second Run all, taken with Copy results (the same account, given 2026-09-26), so the `x86_64-linux` file of `421bab3` again; library versions not recorded | PR #147's D-23 suite paste (INFERRED from the version lines the report prints, which exist together only in that batch: the board stamp `suite-board-0961bb91e5ee`, holde-em's "stack v0.25.6 harness v48" and riptide's fourth probe line; its head `2ec9594` carries the paste as last regenerated at `986769f`; one harness check, `btDhtKeypair`'s determinism, now compares hex behind a letter), 2876 passed / 0 failed / 10 skipped | torrentxt 118/0/0 (sampler 11, harness "106 passed, 0 failed of 106 checks", the merge line): every section as on 2026-09-25, gotcha 7's five 996/997 rows included; both CROSS sections green; `btStopSession` released THE session. Again the launch's second Run all, so on a session the core took after the first run's was released (trap 5.1) |
-| 2026-09-26 (Linux; the suite's engine preflight, and the Kit report's clock "Saturday, September 26, 2026 5:11 PM") | OXT 9.7.0-dp-1 on Linux (OBSERVED in the preflight's engine block, with systemVersion `Linux 6.8.0-139-generic` and processor `x86_64`; INFERRED for the paste run reported with it); presumably the machine of the 4:23 PM run, so the `x86_64-linux` file of `421bab3` again (not stated for these two reports); for the paste run, a launch's first or second Run all and Copy results not stated | the suite's `tests/preflight.livecodescript`, its first Linux run; and the batch paste a second time (INFERRED from its version lines, the 4:23 PM run's) | Preflight: "TorrentXT loads; its ABI guard accepted the installed library (expects ABI 11)" PASS, LOADED at 11 by `_checkABI`'s strict equality inside `btStartSession` (an INFERENCE, as the report says). No TorrentXT details line printed, so the probe's session handle was above 0 and it gave the session straight back (the probe prints a line only when a session was already live in the process); the preflight prints no libtorrent version, so the Linux build's 2.0.11 is still the pin, not a reading. The paste: 2876 / 0 / 10, line for line the 4:23 PM report bar the Kit's clock line, four box2dxt joint handles and an image id, so torrentxt 118/0/0 (harness 106/106, gotcha 7's 996/997 rows included) and both CROSS sections again |
+| 2026-09-26 (Linux; the suite's engine preflight, and the Kit report's clock "Saturday, September 26, 2026 5:11 PM") | OXT 9.7.0-dp-1 on Linux (OBSERVED in the preflight's engine block, with systemVersion `Linux 6.8.0-139-generic` and processor `x86_64`; INFERRED for the paste run reported with it); presumably the machine of the 4:23 PM run, so the `x86_64-linux` file of `421bab3` again (not stated for these two reports); for the paste run, its launch's on-open Run all and the only one in that launch, by the maintainer's account (given later that day: "5:11 was the on open run only"), and Copy results not stated | the suite's `tests/preflight.livecodescript`, its first Linux run; and the batch paste a second time (INFERRED from its version lines, the 4:23 PM run's) | Preflight: "TorrentXT loads; its ABI guard accepted the installed library (expects ABI 11)" PASS, LOADED at 11 by `_checkABI`'s strict equality inside `btStartSession` (an INFERENCE, as the report says). No TorrentXT details line printed, so the probe's session handle was above 0 and it gave the session straight back (the probe prints a line only when a session was already live in the process); the preflight prints no libtorrent version, so the Linux build's 2.0.11 is still the pin, not a reading. The paste: 2876 / 0 / 10, line for line the 4:23 PM report bar the Kit's clock line, four box2dxt joint handles and an image id, so torrentxt 118/0/0 (harness 106/106, gotcha 7's 996/997 rows included) and both CROSS sections again |
+| 2026-09-26 (Windows; the suite's engine preflight, and the Kit report's clocks "Saturday, September 26, 2026 7:24 PM" and "7:28 PM", two paste runs) | OXT 9.6.3 on Win32 (OBSERVED in the preflight's engine block, with systemVersion `NT 10.0` and processor `x86_64`; INFERRED for the paste runs, whether they shared its launch not stated); by the maintainer's account (given after the pass) the machine of 2026-09-24 and 2026-09-25, a fresh stack, and the two paste runs ONE launch's on-open Run all and its second; so the `x86_64-win32` DLL, presumably the 2026-09-12 file (INFERRED: none committed since, and torrentxt's 997-byte refusals pass); Copy results not stated | the suite's `tests/preflight.livecodescript` (its first Windows run at the current ABIs), and the batch paste twice (INFERRED from its version lines: the board stamp `suite-board-0961bb91e5ee`, holde-em's "stack v0.25.6 harness v48" and riptide's fourth probe line; presumably main's at `a812580`; 2857 passed / 2 failed / 10 skipped each time, the 2 the live loopbacks) | Preflight: "TorrentXT loads; its ABI guard accepted the installed library (expects ABI 11)" PASS, LOADED at 11 by `_checkABI`'s strict equality inside `btStartSession` (an INFERENCE, as the report says); no TorrentXT details line, so the probe's session was above 0 and given straight back, as on Linux; no libtorrent version printed, so the Windows DLLs' 2.1.1 is still the build's, not a reading. The paste, both runs: torrentxt 118/0/0 (sampler 11, harness "106 passed, 0 failed of 106 checks", the merge line), gotcha 7's five 996/997 rows included; both CROSS sections green; `btStopSession` released THE session each time. Run 2, the launch's second Run all by the account, took a fresh session ("btStartSession returned a positive handle") after run 1's was released, in the same process (trap 5.1: one at a time, not one per launch), as on Linux on 2026-09-25 and 2026-09-26: the first Windows report the maintainer's account places as a second Run all (2026-09-25's place in its launch was not stated, and the 2026-09-24 reports were not placed either: that the second and third were fresh stacks does not settle it, and the first printed the box2dxt joint handles every recorded second Run all has printed; the suite runbook's section 8). None of the paste's 2 FAILs is torrentxt's |
 
 Apart from that rp1 chat report, the demos have no dated engine record in this tree; this
 ledger holds harness and transport rows only, and since 2026-09-24 the three demo headers
@@ -288,10 +319,10 @@ carries "UI unified 2026-08-14; needs an OXT re-pass".
 ## Status
 
 Engine-proven: every public `bt*` handler in `src/torrent.lcb` has executed on a real engine
-through the folded harness (suite coverage 85/85), last counted 2026-09-25 (106/106 on Linux
-x86_64 and on Windows x86_64, as on Windows 2026-09-24, gotcha 7's 996/997 rows included each
-time); `btMoveStorage` on its stale-id refusal leg only (2026-08-17, again 2026-09-24 and
-2026-09-25); `btRemoveTorrent` only with deleteFiles=false (its delete path is manual-only and
+through the folded harness (suite coverage 85/85), last counted 2026-09-26 (106/106 on Linux
+x86_64 and, twice in one launch, on Windows x86_64, as on both 2026-09-25 and on Windows
+2026-09-24, gotcha 7's 996/997 rows included each time); `btMoveStorage` on its stale-id
+refusal leg only (2026-08-17, again 2026-09-24 to 2026-09-26); `btRemoveTorrent` only with deleteFiles=false (its delete path is manual-only and
 has never run). The script-side helpers (`btStartPolling`, `btStopPolling`,
 `btTorrentPollOnce`, `btFormatBytes`, `btStateName`) are "verified statically; needs an OXT
 pass". The binaries committed 2026-09-12 (`421bab3`, release run 34657390798 from `0f17ab5`)
@@ -335,6 +366,7 @@ since 2026-09-24 `tools/check-script-vectors.py` RUNS the demos' Model C receive
 BTXO receivers, `qsKeyOpensVerifier`, `qsReceiveOnion`'s parse, the Channels feed seal)
 through riptide's runner against `tests/onion_frame_golden.py`'s mirrors and the committed
 SodiumXT, and since 2026-09-25 Quick Share's route table against
-`tests/fileserver_golden.py`'s; it settles logic, not parser behaviour, so it upgrades no
-honesty label. Its
+`tests/fileserver_golden.py`'s, and since 2026-09-27 every other mirror there, the two
+serve paths, the listing and the editor's write route over a real folder; it settles
+logic, not parser behaviour, so it upgrades no honesty label. Its
 siblings are riptide, nostrxt and sodiumxt. `docs/building.md` has the options, floors and CI.

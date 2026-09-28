@@ -43,9 +43,11 @@ shopt -u nullglob
 # The Model C execution gate (2026-09-24): the demos' shipped receive paths
 # RUN headlessly through riptide's runner, held to the onion golden's mirrors
 # and, in tier 2, to the committed SodiumXT (the verifier, the truncated-code
-# parse, the M9 feed-seal KAT). After the golden, which it stands on; its
-# fixture test first, because a blind gate prints OK too. Siblings: riptide,
-# nostrxt, sodiumxt (tools/member-registry.py).
+# parse, the M9 feed-seal KAT); since 2026-09-25 Quick Share's route table, and
+# since 2026-09-27 its folder server (every file-server mirror, both serve paths,
+# the listing and the editor's write route over a real folder). After the
+# golden, which it stands on; its fixture test first, because a blind gate
+# prints OK too. Siblings: riptide, nostrxt, sodiumxt (tools/member-registry.py).
 echo "== torrentxt: tools/test-script-vectors.py =="
 python3 tools/test-script-vectors.py
 echo "== torrentxt: tools/check-script-vectors.py =="
