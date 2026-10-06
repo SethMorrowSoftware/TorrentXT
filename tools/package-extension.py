@@ -19,7 +19,8 @@ WHAT IT DOES
 THE FIVE PLATFORM-IDS (exact, ARCHITECTURE FIRST, Windows is -win32 for BOTH
 bitnesses - do not invent variants):
 
-        x86_64-linux   x86-linux   x86_64-win32   x86-win32   universal-mac
+        x86_64-linux   x86-linux   arm64-linux   x86_64-win32   x86-win32
+        universal-mac
 
 THE BARE-TOKEN NAME RULE
     The file is named with the bare token `torrentxt` (NO `lib` prefix) so it
@@ -63,6 +64,7 @@ CODE_ROOT = os.path.join(REPO_ROOT, "src", "code")
 PLATFORM_SUFFIX = {
     "x86_64-linux": ".so",
     "x86-linux": ".so",
+    "arm64-linux": ".so",
     "x86_64-win32": ".dll",
     "x86-win32": ".dll",
     "universal-mac": ".dylib",
@@ -92,7 +94,10 @@ def detect_platform_id():
 
     # Normalise the architecture token to our {x86_64, x86} vocabulary.
     is_64 = machine in ("x86_64", "amd64", "x64") or sys.maxsize > 2**32 and machine in ("aarch64", "arm64")
-    if machine in ("x86_64", "amd64", "x64"):
+    if machine in ("aarch64", "arm64") and sys.maxsize > 2**32:
+        # 64-bit ARM Linux (arm64-linux, added 2026-10-06)
+        arch = "arm64"
+    elif machine in ("x86_64", "amd64", "x64"):
         arch = "x86_64"
     elif machine in ("i386", "i686", "x86") or (machine == "" and not is_64):
         arch = "x86"
