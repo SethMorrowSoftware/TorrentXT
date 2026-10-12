@@ -264,21 +264,109 @@ local sNextHandle            -- monotonic handle allocator (0 is never valid)
 -- Configuration.
 -- ==========================================================================
 
+/**
+Title: OnionXT
+
+Author: Seth Morrow Software
+
+Description:
+A Tor transport and rendezvous layer for OpenXTalk. OnionXT dials any TCP
+endpoint through Tor's SOCKS5 proxy and creates and reaches v3 onion
+services, whose address is an ed25519 public key. It talks to a tor daemon
+that is already running on this machine (SOCKS 127.0.0.1:9050, control
+127.0.0.1:9051 by default); it does not embed or ship Tor.
+
+Everything is asynchronous. Commands that open something (<oxDial>,
+<oxCreateService>) report a handle in the result at once, and the outcome
+arrives later through the callbacks you register: a status callback, a
+per-stream callback and a peer callback. Commands report empty or a
+handle on success and an "OnionXT: ..." string on failure; every wire
+error fails closed and tears the resource down.
+
+OnionXT adds no cryptography. The payload is yours to seal (with SodiumXT),
+and the deterministic-address, SAFECOOKIE and offline-checksum features
+compose SodiumXT handlers (ABI 6 or later; ABI 7 for the checksum). Free
+what you open with <oxShutdown>, for example on closeStack.
+
+Tags: Networking, Tor
+*/
+/**
+Summary: Set the local port of Tor's SOCKS proxy.
+
+pPort: the SOCKS port on 127.0.0.1 (default 9050; Tor Browser uses 9150).
+
+Example:
+oxSetSocksPort 9150
+
+Description:
+Use <oxSetSocksPort> when tor listens somewhere other than 9050. Only the
+port can be set; the host is always 127.0.0.1. It takes effect on the next
+<oxDial>.
+
+References: oxSetControlPort (handler), oxDial (handler)
+*/
 command oxSetSocksPort pPort
    -- Loopback-locked: only the port is settable, never the host (CLAUDE.md
    -- socket gotcha 6). Take effect on the next oxDial.
    put pPort into sSocksPort
 end oxSetSocksPort
 
+/**
+Summary: Set the local port of tor's control connection.
+
+pPort: the control port on 127.0.0.1 (default 9051; Tor Browser uses 9151).
+
+Example:
+oxSetControlPort 9151
+
+Description:
+Use <oxSetControlPort> before <oxConnectControl> when tor's control port is
+not 9051. Only the port can be set; the host is always 127.0.0.1.
+
+References: oxSetSocksPort (handler), oxConnectControl (handler)
+*/
 command oxSetControlPort pPort
    put pPort into sControlPort
 end oxSetControlPort
 
+/**
+Summary: Store the password for tor's HASHEDPASSWORD control authentication.
+
+pPassword: the control password configured for the tor daemon.
+
+Example:
+oxSetControlPassword "my control password"
+oxConnectControl
+
+Description:
+Only needed when the daemon offers HASHEDPASSWORD authentication. Cookie
+and SAFECOOKIE authentication need no password. Set it before
+<oxConnectControl>.
+
+References: oxConnectControl (handler)
+*/
 command oxSetControlPassword pPassword
    -- Only used if the daemon offers HASHEDPASSWORD auth (docs/03 step 2).
    put pPassword into sControlPassword
 end oxSetControlPassword
 
+/**
+Summary: Name the object whose script holds your OnionXT callbacks.
+
+pObjectLongId: the long id of the object that holds the callback handlers.
+
+Example:
+oxSetCallbackOwner the long id of me
+
+Description:
+Status, stream and peer callbacks are sent with dispatch to this object.
+If you never set it they go to the topStack, which is usually but not
+always your app's stack, so set it explicitly. A callback handler the
+object does not define is a clean no-op, and an error thrown inside one is
+caught so the transport keeps running.
+
+References: oxSetStatusCallback (handler), oxSetPeerCallback (handler), oxSetStreamCallback (handler)
+*/
 command oxSetCallbackOwner pObjectLongId
    -- The object whose script holds the app callbacks. If unset, callbacks
    -- dispatch to the topStack; setting this explicitly (as the demo does) removes
@@ -287,14 +375,63 @@ command oxSetCallbackOwner pObjectLongId
    put pObjectLongId into sCallbackOwner
 end oxSetCallbackOwner
 
+/**
+Summary: Register the handler that receives OnionXT status updates.
+
+pHandlerName: the name of a handler in the callback owner's script, called with a kind and an info value.
+
+Example:
+oxSetStatusCallback "onTorStatus"
+
+Description:
+The handler receives two parameters, a kind and an info value. The kinds
+are "control" (connected, authenticated, disconnected, or an "authfailed:"
+or "error:" reason), "bootstrap" (0 to 100), "ready", "service" (a new
+address), "serviceReady" (its descriptor is uploaded), "notice" and
+"event" (a raw 650 line). Bootstrap updates are coalesced to about four
+per second.
+
+References: oxSetCallbackOwner (handler), oxConnectControl (handler), oxBootstrapProgress (handler)
+*/
 command oxSetStatusCallback pHandlerName
    put pHandlerName into sStatusCallback
 end oxSetStatusCallback
 
+/**
+Summary: Register the handler called when a peer connects to one of your onion services.
+
+pHandlerName: the name of a handler in the callback owner's script, called with a stream, a service and a peer address.
+
+Example:
+oxSetPeerCallback "onPeer"
+
+Description:
+The handler receives the new inbound stream handle, the service handle (or
+empty when more than one service is live and OnionXT cannot tell which was
+reached) and the loopback address Tor forwarded from. Register a stream
+callback on the new stream inside this handler: reading starts only after
+it returns.
+
+References: oxCreateService (handler), oxSetStreamCallback (handler)
+*/
 command oxSetPeerCallback pHandlerName
    put pHandlerName into sPeerCallback
 end oxSetPeerCallback
 
+/**
+Summary: Return the OnionXT version, and tor's version once it is known.
+
+Returns: The library version, followed by the tor version in parentheses once the control connection has read it.
+
+Example:
+put oxVersion() into field "Version"
+
+Description:
+Before the control connection has answered, only the OnionXT version comes
+back.
+
+References: oxConnectControl (handler)
+*/
 function oxVersion
    -- The library version, plus the tor version once the control connection has
    -- answered GETINFO version (docs/05).
@@ -310,6 +447,28 @@ end oxVersion
 -- asynchronously; the app learns the outcome through the status callback.
 -- ==========================================================================
 
+/**
+Summary: Open and authenticate the control connection to the tor daemon.
+
+Example:
+oxSetStatusCallback "onTorStatus"
+oxConnectControl
+if the result is not empty then answer the result
+
+Description:
+Use <oxConnectControl> before creating onion services or reading bootstrap
+progress. It works asynchronously: it asks tor which authentication methods
+it offers and uses the best one it can (SAFECOOKIE, cookie, none, then a
+password). The
+outcome arrives as a "control" status: "authenticated", or an "authfailed:"
+or "error:" reason. A handshake that does not finish within 20 seconds is
+torn down.
+
+The result is an error at once only when a control connection is already
+open; call <oxDisconnectControl> first to reconnect.
+
+References: oxDisconnectControl (handler), oxIsControlAuthenticated (handler), oxSetStatusCallback (handler), oxIsReady (handler)
+*/
 command oxConnectControl
    -- Idempotent-ish: refuse a second concurrent connect rather than leak a
    -- socket. Disconnect first to reconnect.
@@ -334,6 +493,19 @@ command oxConnectControl
    return empty
 end oxConnectControl
 
+/**
+Summary: Close the control connection.
+
+Example:
+oxDisconnectControl
+
+Description:
+Closes the control socket and resets the control state. It is safe to call
+when nothing is open. Services created with Flags=Detach stay published;
+remove them with <oxRemoveService> first if they should go.
+
+References: oxConnectControl (handler), oxShutdown (handler)
+*/
 command oxDisconnectControl
    -- Idempotent close of the control socket and reset of all control state.
    if sControlSocket is not empty then
@@ -349,10 +521,38 @@ command oxDisconnectControl
    put empty into sControlClientNonce
 end oxDisconnectControl
 
+/**
+Summary: Tell whether the control connection has authenticated.
+
+Returns: true once the control connection is authenticated, otherwise false.
+
+Example:
+if oxIsControlAuthenticated() then oxCreateService 80, 8080
+
+Description:
+Service creation needs an authenticated control connection.
+
+References: oxConnectControl (handler), oxIsReady (handler)
+*/
 function oxIsControlAuthenticated
    return (sControlState is "authenticated")
 end oxIsControlAuthenticated
 
+/**
+Summary: Return tor's bootstrap progress.
+
+Returns: A number from 0 to 100; 0 until tor has reported any progress.
+
+Example:
+put oxBootstrapProgress() & "%" into field "Progress"
+
+Description:
+The value comes from tor's bootstrap status over the control connection, so
+it stays 0 until <oxConnectControl> has authenticated. A cold tor can take
+tens of seconds to reach 100.
+
+References: oxIsReady (handler), oxSetStatusCallback (handler)
+*/
 function oxBootstrapProgress
    if sBootstrap is empty then
       return 0
@@ -360,6 +560,20 @@ function oxBootstrapProgress
    return sBootstrap
 end oxBootstrapProgress
 
+/**
+Summary: Tell whether tor is fully bootstrapped and the control connection is authenticated.
+
+Returns: true when bootstrap is at 100 and the control connection is authenticated, otherwise false.
+
+Example:
+if oxIsReady() then enable button "Publish"
+
+Description:
+This is daemon readiness only. Whether a particular published service can
+be reached yet is <oxServiceIsReady>.
+
+References: oxBootstrapProgress (handler), oxIsControlAuthenticated (handler), oxServiceIsReady (handler)
+*/
 function oxIsReady
    -- Ready to carry traffic once bootstrapped to 100 and the control port is
    -- authenticated. A published service's own reachability is reported
@@ -748,6 +962,31 @@ end oxStatusUpdate
 -- local DNS lookup), parse the reply, hand up a raw byte-stream tunnel.
 -- ==========================================================================
 
+/**
+Summary: Open a stream to a host and port through Tor.
+
+pHost: a .onion address or a host name; Tor resolves it, never the local machine.
+
+pPort: the port to connect to, 1 to 65535.
+
+Example:
+oxDial "example.onion", 80
+put the result into tStream
+if tStream is an integer then oxSetStreamCallback tStream, "onStream"
+
+Description:
+Use <oxDial> to reach any TCP endpoint anonymously. The result is a stream
+handle at once, or an "OnionXT: ..." error for an empty host or a bad
+port. The SOCKS5 handshake then runs asynchronously: the stream callback
+receives "open" when the tunnel is live or "error" with a reason (a SOCKS
+failure, a refused connection, or a handshake that took longer than 20
+seconds), after which the stream is already closed.
+
+Register the stream callback straight after dialing. The tor daemon must be
+running; the control connection is not needed for dialing.
+
+References: oxSetStreamCallback (handler), oxWrite (handler), oxCloseStream (handler), oxTransportDial (handler)
+*/
 command oxDial pHost, pPort
    -- Reports a stream handle through `the result` immediately; the SOCKS
    -- handshake completes asynchronously and the stream's callback receives
@@ -778,6 +1017,28 @@ command oxDial pHost, pPort
    return tHandle
 end oxDial
 
+/**
+Summary: Register the handler that receives a stream's events and data.
+
+pStream: a stream handle from oxDial or from the peer callback.
+
+pHandlerName: the name of a handler in the callback owner's script, called with a stream, an event and data.
+
+Example:
+oxSetStreamCallback tStream, "onStream"
+
+Description:
+The handler receives the stream handle, an event and data. The events are
+"open" (the tunnel or inbound peer is live), "data" (the third parameter
+is an inbound chunk of binary data), "closed" (the far side closed) and
+"error" (the third parameter is the reason; the stream is already torn
+down). Chunks arrive as the network delivers them; your app reassembles its
+own messages.
+
+The result is an error for an unknown stream handle, otherwise empty.
+
+References: oxDial (handler), oxSetPeerCallback (handler), oxWrite (handler)
+*/
 command oxSetStreamCallback pStream, pHandlerName
    if sStreams[pStream]["socketID"] is empty then
       return "OnionXT: unknown stream handle " & pStream
@@ -786,6 +1047,24 @@ command oxSetStreamCallback pStream, pHandlerName
    return empty
 end oxSetStreamCallback
 
+/**
+Summary: Write bytes to an open stream.
+
+pStream: a stream handle whose state is connected.
+
+pData: the binary data to send, already encrypted by your app if it needs to be.
+
+Example:
+oxWrite tStream, textEncode("hello", "UTF-8")
+if the result is not empty then answer the result
+
+Description:
+OnionXT does not encrypt or frame what you send. The result is empty on
+success, or an "OnionXT: ..." error when the stream is not open or the
+engine reports that the write failed.
+
+References: oxDial (handler), oxStreamState (handler), oxTransportSend (handler)
+*/
 command oxWrite pStream, pData
    -- Write app bytes (already sealed by the app via SodiumXT) to the
    -- tunnel. OnionXT does not encrypt (docs/02).
@@ -821,6 +1100,20 @@ command oxWrite pStream, pData
    return empty
 end oxWrite
 
+/**
+Summary: Close a stream and forget its handle.
+
+pStream: a stream handle.
+
+Example:
+oxCloseStream tStream
+
+Description:
+Safe to call more than once; an unknown or stale handle is a no-op. No
+"closed" event is delivered for a stream you close yourself.
+
+References: oxDial (handler), oxShutdown (handler)
+*/
 command oxCloseStream pStream
    -- Idempotent close of the stream socket; forget the handle. A stale handle is
    -- a clean no-op.
@@ -832,6 +1125,22 @@ command oxCloseStream pStream
    delete variable sStreams[pStream]
 end oxCloseStream
 
+/**
+Summary: Return the current state of a stream.
+
+pStream: a stream handle.
+
+Returns: The stream's state, such as "connecting" or "connected", or "unknown" for a stale or never-opened handle.
+
+Example:
+if oxStreamState(tStream) is "connected" then oxWrite tStream, tData
+
+Description:
+Use it to check a stream before writing; <oxWrite> refuses any stream that
+is not "connected".
+
+References: oxDial (handler), oxWrite (handler)
+*/
 function oxStreamState pStream
    if sStreams[pStream]["socketID"] is empty then
       return "unknown"
@@ -1093,6 +1402,31 @@ end oxSocksRepMessage
 -- publishes is answered (CLAUDE.md socket gotcha 5).
 -- ==========================================================================
 
+/**
+Summary: Publish a new onion service with a key that tor generates.
+
+pVirtualPort: the port visitors connect to on the .onion address, 1 to 65535.
+
+pLocalPort: the loopback port OnionXT listens on and tor forwards to, 1 to 65535.
+
+Example:
+oxCreateService 80, 8080
+put the result into tService
+
+Description:
+Needs an authenticated control connection. OnionXT starts listening on
+127.0.0.1 at pLocalPort first, then asks tor to publish the service. The
+result is a service handle at once, or an "OnionXT: ..." error (control not
+authenticated, a bad port, or a local port that cannot be bound or is
+already used by another service).
+
+The address arrives later as a "service" status and from
+<oxServiceAddress>; "serviceReady" follows when its descriptor is uploaded.
+Each visitor arrives through the peer callback. The address is new each
+time; use <oxCreateServiceFromSeed> for a stable one.
+
+References: oxRemoveService (handler), oxServiceAddress (handler), oxSetPeerCallback (handler), oxCreateServiceFromSeed (handler)
+*/
 command oxCreateService pVirtualPort, pLocalPort
    -- Ephemeral service, Tor generates the key. Reports a service handle through
    -- `the result`; the .onion address arrives asynchronously (status "service"
@@ -1117,6 +1451,28 @@ command oxCreateService pVirtualPort, pLocalPort
    return tHandle
 end oxCreateService
 
+/**
+Summary: Publish an onion service whose address is derived from a seed.
+
+pSeed: 32 bytes of secret binary data; the same seed always gives the same address.
+
+pVirtualPort: the port visitors connect to on the .onion address, 1 to 65535.
+
+pLocalPort: the loopback port OnionXT listens on and tor forwards to, 1 to 65535.
+
+Example:
+oxCreateServiceFromSeed tSeed, 80, 8080
+put the result into tService
+
+Description:
+Works like <oxCreateService>, but the service key is the ed25519 key from
+pSeed, so the address survives restarts and can serve as a published
+identity. It needs SodiumXT (ABI 6 or later) for the key expansion and
+reports an "OnionXT: ..." error if it is missing or the seed is not 32
+bytes. Keep the seed secret: anyone holding it can run your address.
+
+References: oxCreateService (handler), oxAddressFromPublicKey (handler), oxTransportListen (handler)
+*/
 command oxCreateServiceFromSeed pSeed, pVirtualPort, pLocalPort
    -- Deterministic, reproducible address: derive the ed25519 identity from pSeed
    -- and pass Tor the 64-byte ED25519-V3 expanded key (docs/04). The expansion is
@@ -1153,6 +1509,28 @@ command oxCreateServiceFromSeed pSeed, pVirtualPort, pLocalPort
    return tHandle
 end oxCreateServiceFromSeed
 
+/**
+Summary: Publish an onion service that forwards to a local server you run yourself.
+
+pVirtualPort: the port visitors connect to on the .onion address, 1 to 65535.
+
+pLocalPort: the loopback port your own server already accepts connections on, 1 to 65535.
+
+Example:
+oxPublishService 80, 8090
+put the result into tService
+
+Description:
+Unlike <oxCreateService>, OnionXT starts no listener and no peer callback
+fires: the external server owns the port. The result is a service handle,
+and the address arrives as for <oxCreateService>. <oxRemoveService>
+unpublishes it and leaves your server's socket alone.
+
+Your server must refuse any peer that is not 127.0.0.1 itself, because a
+listening port may be reachable from the local network, bypassing Tor.
+
+References: oxCreateService (handler), oxRemoveService (handler), oxServiceAddress (handler)
+*/
 command oxPublishService pVirtualPort, pLocalPort
    -- Publish an onion whose virtual port Tor forwards to a loopback port that
    -- SOMETHING ELSE is already accepting on (LiveCode's built-in HTTPD Library, or
@@ -1269,6 +1647,21 @@ private command oxHandleAddOnionReply pHandle, pReply
    end if
 end oxHandleAddOnionReply
 
+/**
+Summary: Unpublish an onion service and stop its listener.
+
+pService: a service handle.
+
+Example:
+oxRemoveService tService
+
+Description:
+Asks tor to remove the service (when the control connection is
+authenticated) and closes the local listener if OnionXT owns it. Safe to
+call more than once; a stale handle is a no-op.
+
+References: oxCreateService (handler), oxPublishService (handler), oxShutdown (handler)
+*/
 command oxRemoveService pService
    -- DEL_ONION and stop the listener. Idempotent: a stale handle is a no-op.
    if sServices[pService]["localPort"] is empty then
@@ -1293,10 +1686,41 @@ command oxRemoveService pService
    delete variable sServices[pService]
 end oxRemoveService
 
+/**
+Summary: Return the .onion address of a service.
+
+pService: a service handle.
+
+Returns: The full address ending in .onion, or empty until tor has assigned it.
+
+Example:
+put oxServiceAddress(tService) into field "Address"
+
+Description:
+The address is known shortly after the service is created, when the
+"service" status arrives.
+
+References: oxCreateService (handler), oxServiceIsReady (handler)
+*/
 function oxServiceAddress pService
    return sServices[pService]["address"]
 end oxServiceAddress
 
+/**
+Summary: Tell whether a service's descriptor has been uploaded.
+
+pService: a service handle.
+
+Returns: true once the "serviceReady" status has fired for this service, otherwise false.
+
+Example:
+if oxServiceIsReady(tService) then answer "Reachable at" && oxServiceAddress(tService)
+
+Description:
+Until the descriptor is uploaded, visitors cannot find the service.
+
+References: oxServiceAddress (handler), oxIsReady (handler)
+*/
 function oxServiceIsReady pService
    return (sServices[pService]["ready"] is true)
 end oxServiceIsReady
@@ -1413,6 +1837,22 @@ end oxHostIsLoopback
 -- the checksum needs SHA3-256, which is composed from SodiumXT (docs/08).
 -- ==========================================================================
 
+/**
+Summary: Return the ed25519 public key inside a v3 .onion address.
+
+pOnionAddress: a 56-character v3 address, with or without ".onion".
+
+Returns: The 32-byte public key, or empty if the address is not a well-formed v3 address.
+
+Example:
+put oxPublicKeyFromAddress(tAddress) into tPubKey
+
+Description:
+Pure decoding, with no network and no SodiumXT. It does not verify the
+checksum; use <oxIsValidAddress> for that.
+
+References: oxAddressFromPublicKey (handler), oxIsValidAddress (handler)
+*/
 function oxPublicKeyFromAddress pOnionAddress
    -- Strip ".onion", base32-decode 56 chars -> 35 bytes, return the first 32 (the
    -- ed25519 public key). No crypto needed. Empty on a structural error.
@@ -1431,6 +1871,23 @@ function oxPublicKeyFromAddress pOnionAddress
    return byte 1 to 32 of tRaw
 end oxPublicKeyFromAddress
 
+/**
+Summary: Return the v3 .onion address for an ed25519 public key.
+
+pEd25519Pub: a 32-byte ed25519 public key.
+
+Returns: The address ending in .onion, or an "OnionXT: ..." error string.
+
+Example:
+put oxAddressFromPublicKey(tPubKey) into tAddress
+
+Description:
+The checksum uses SodiumXT's SHA3-256 (ABI 7 or later). Without it, or for
+a key that is not 32 bytes, the result is an "OnionXT: ..." error rather
+than a wrong address.
+
+References: oxPublicKeyFromAddress (handler), oxIsValidAddress (handler)
+*/
 function oxAddressFromPublicKey pEd25519Pub
    -- base32( pubkey || checksum || 0x03 ) & ".onion" (docs/04). The checksum is
    -- SHA3-256(".onion checksum" || pubkey || 0x03)[:2], composed from SodiumXT;
@@ -1446,6 +1903,23 @@ function oxAddressFromPublicKey pEd25519Pub
    return oxBase32Encode(pEd25519Pub & tChecksum & numToByte(3)) & ".onion"
 end oxAddressFromPublicKey
 
+/**
+Summary: Check that text is a well-formed v3 .onion address.
+
+pOnionAddress: the address to check, with or without ".onion".
+
+Returns: true or false.
+
+Example:
+if not oxIsValidAddress(field "Address") then answer "That is not a v3 onion address."
+
+Description:
+Always checks the length, alphabet and version. It also verifies the
+checksum when SodiumXT's SHA3-256 is available; without it a structurally
+valid address passes. Tor still authenticates the service when you connect.
+
+References: oxPublicKeyFromAddress (handler), oxAddressFromPublicKey (handler)
+*/
 function oxIsValidAddress pOnionAddress
    -- Structural checks always (length, alphabet, version byte); checksum
    -- verification too when SodiumXT SHA3-256 is available (docs/04, docs/08).
@@ -1610,6 +2084,21 @@ end oxExpandedKeyFromSeed
 -- no framing opinion; the payload is sealed by the app via SodiumXT.
 -- ==========================================================================
 
+/**
+Summary: Describe the OnionXT transport and which optional features are available.
+
+Returns: An array with the keys transport ("ox"), version, safeCookieAuth, deterministicOnion and offlineAddress.
+
+Example:
+put oxTransportInfo() into tInfo
+if not tInfo["deterministicOnion"] then answer "Stable addresses need SodiumXT."
+
+Description:
+The three flags are true when the SodiumXT handlers that feature needs are
+loaded, so a protocol layer can choose a transport and fall back visibly.
+
+References: oxTransportDial (handler), oxTransportListen (handler)
+*/
 function oxTransportInfo
    -- Advertise the transport and which optional SodiumXT-backed capabilities are
    -- available, so a caller can negotiate transports and fall back visibly
@@ -1623,6 +2112,23 @@ function oxTransportInfo
    return tInfo
 end oxTransportInfo
 
+/**
+Summary: Dial a rendezvous address through the transport seam.
+
+pAddress: a .onion address, a 32-byte ed25519 public key, or that key as 64 hex characters.
+
+pPort: the port to connect to; empty means 80.
+
+Example:
+oxTransportDial tPeerKey, 80
+put the result into tStream
+
+Description:
+A key is turned into its .onion address first (which needs SodiumXT's
+SHA3-256), then this works exactly like <oxDial> and reports the same way.
+
+References: oxDial (handler), oxTransportSend (handler), oxTransportRecv (handler)
+*/
 command oxTransportDial pAddress, pPort
    -- Dial a rendezvous address. Accepts a full <56>.onion, or a 32-byte ed25519
    -- public key / 64-hex string, which it maps to an address first (docs/06).
@@ -1651,17 +2157,64 @@ command oxTransportDial pAddress, pPort
    return the result
 end oxTransportDial
 
+/**
+Summary: Listen at a seed-derived address through the transport seam.
+
+pSeed: 32 bytes of secret binary data that fix the address.
+
+pVirtualPort: the port visitors connect to on the .onion address.
+
+pLocalPort: the loopback port OnionXT listens on.
+
+Example:
+oxTransportListen tSeed, 80, 8080
+
+Description:
+A wrapper for <oxCreateServiceFromSeed>; the result is the same.
+
+References: oxCreateServiceFromSeed (handler), oxTransportDial (handler)
+*/
 command oxTransportListen pSeed, pVirtualPort, pLocalPort
    -- Publish a reproducible rendezvous point from a seed (docs/06).
    oxCreateServiceFromSeed pSeed, pVirtualPort, pLocalPort
    return the result
 end oxTransportListen
 
+/**
+Summary: Send bytes on a transport stream.
+
+pStream: a stream handle.
+
+pData: the binary data to send.
+
+Example:
+oxTransportSend tStream, tSealed
+
+Description:
+A wrapper for <oxWrite>; the result is the same.
+
+References: oxWrite (handler), oxTransportRecv (handler)
+*/
 command oxTransportSend pStream, pData
    oxWrite pStream, pData
    return the result
 end oxTransportSend
 
+/**
+Summary: Register where a transport stream's inbound bytes are delivered.
+
+pStream: a stream handle.
+
+pHandlerName: the name of the stream callback handler.
+
+Example:
+oxTransportRecv tStream, "onStream"
+
+Description:
+A wrapper for <oxSetStreamCallback>; the result is the same.
+
+References: oxSetStreamCallback (handler), oxTransportSend (handler)
+*/
 command oxTransportRecv pStream, pHandlerName
    -- Register where inbound bytes are delivered (the stream callback).
    oxSetStreamCallback pStream, pHandlerName
@@ -1674,6 +2227,19 @@ end oxTransportRecv
 -- is no deterministic unload hook in OXT; CLAUDE.md handles-and-state).
 -- ==========================================================================
 
+/**
+Summary: Close every stream, remove every service and disconnect control.
+
+Example:
+oxShutdown
+
+Description:
+Call it when your app closes, for example in closeStack: OpenXTalk has no
+unload hook, so OnionXT cannot free its sockets and services on its own.
+Safe to call more than once.
+
+References: oxCloseStream (handler), oxRemoveService (handler), oxDisconnectControl (handler)
+*/
 command oxShutdown
    -- Idempotent: close every stream, remove every service, disconnect control.
    -- Safe to call twice.
@@ -1712,6 +2278,30 @@ end oxShutdown
 
 -- Was pSocketID one of OUR sockets, and did we handle the error? "true" when
 -- consumed, "false" when it belongs to somebody else.
+/**
+Summary: Handle a socketError message if the socket belongs to OnionXT.
+
+pSocketID: the socket id from the engine's socketError message.
+
+pError: the error text from that message.
+
+Returns: "true" if the socket was OnionXT's and the error was handled, "false" otherwise.
+
+Example:
+if oxSocketError(pSocketID, pError) then exit socketError
+
+Description:
+For apps that embed OnionXT's script into their own: call it from your own
+socketError handler where you would otherwise pass the message. For an
+OnionXT stream it fails the stream with an "error" event; for the control
+socket it reports the error and disconnects.
+
+When OnionXT is loaded as a library instead, it handles the message itself,
+and your own socketError handler must pass any socket that is not yours,
+or OnionXT never sees it and the app hangs.
+
+References: oxSocketClosed (handler), oxSocketTimeout (handler)
+*/
 function oxSocketError pSocketID, pError
    -- The engine's socket-failure message. If the socket closes because of an
    -- error, this arrives instead of socketClosed. Look up the owner and fail
@@ -1743,6 +2333,24 @@ on socketError pSocketID, pError
 end socketError
 
 -- Was pSocketID one of OUR sockets, and did we handle the close?
+/**
+Summary: Handle a socketClosed message if the socket belongs to OnionXT.
+
+pSocketID: the socket id from the engine's socketClosed message.
+
+Returns: "true" if the socket was OnionXT's and the close was handled, "false" otherwise.
+
+Example:
+if oxSocketClosed(pSocketID) then exit socketClosed
+
+Description:
+For apps that embed OnionXT's script into their own: call it from your own
+socketClosed handler where you would otherwise pass the message. For an
+OnionXT stream it delivers "closed" to the stream callback and forgets the
+stream; for the control socket it reports "disconnected".
+
+References: oxSocketError (handler), oxSocketTimeout (handler)
+*/
 function oxSocketClosed pSocketID
    -- The remote side closed cleanly. Deliver "closed" to a stream's app callback
    -- and forget it; for the control socket, mark disconnected.
@@ -1771,6 +2379,25 @@ on socketClosed pSocketID
 end socketClosed
 
 -- Was pSocketID one of OUR sockets, and did we handle the timeout?
+/**
+Summary: Handle a socketTimeout message if the socket belongs to OnionXT.
+
+pSocketID: the socket id from the engine's socketTimeout message.
+
+Returns: "true" if the socket was OnionXT's, "false" otherwise.
+
+Example:
+if oxSocketTimeout(pSocketID) then exit socketTimeout
+
+Description:
+For apps that embed OnionXT's script into their own: call it from your own
+socketTimeout handler where you would otherwise pass the message. The
+engine repeats socketTimeout while a read is pending, so OnionXT treats it
+as fatal only during a handshake; an idle connected stream ignores it but
+still answers "true".
+
+References: oxSocketError (handler), oxSocketClosed (handler)
+*/
 function oxSocketTimeout pSocketID
    -- socketTimeout REPEATS every interval while a read/write is pending (docs
    -- LiveCode ref), so it is only fatal during a handshake; on a connected stream
@@ -1812,6 +2439,34 @@ end socketTimeout
 -- daemon (Mode A) is the trusted, recommended base. VERIFY every step on-engine.
 -- ==========================================================================
 
+/**
+Summary: Write a torrc and start a tor process for this app (optional Mode B).
+
+pTorPath: the full path to the tor executable.
+
+pDataDir: an existing folder for tor's data, its torrc and its log.
+
+pSocksPort: the SOCKS port to configure; empty means 9050.
+
+pControlPort: the control port to configure; empty means 9051.
+
+Example:
+oxLaunchTor tTorPath, tDataDir, 9250, 9251
+if the result is not empty then answer the result
+
+Description:
+The recommended setup is a tor daemon that is already running; this is an
+optional convenience that has not yet been run on an engine. It writes
+onionxt-torrc into pDataDir (cookie authentication, tor's log to
+onionxt-tor.log there, tied to this process) and starts tor with it. Only
+after the launch is accepted are the SOCKS and control ports pointed at it.
+
+The result is empty or an "OnionXT: ..." reason. Empty does not mean tor is
+up: it does not wait for bootstrap, so connect with <oxConnectControl> and
+watch <oxBootstrapProgress>.
+
+References: oxStopTor (handler), oxConnectControl (handler)
+*/
 command oxLaunchTor pTorPath, pDataDir, pSocksPort, pControlPort
    -- Write a minimal torrc into pDataDir and launch pTorPath against it, so tor
    -- exits with the app (__OwningControllerProcess) and uses cookie auth. Returns
@@ -1919,6 +2574,19 @@ command oxLaunchTor pTorPath, pDataDir, pSocksPort, pControlPort
    return empty
 end oxLaunchTor
 
+/**
+Summary: Ask tor to shut down, then disconnect the control connection.
+
+Example:
+oxStopTor
+
+Description:
+Sends tor a shutdown signal when the control connection is authenticated,
+then disconnects. Without an authenticated connection it only disconnects.
+Safe to call more than once. Not yet run on an engine.
+
+References: oxLaunchTor (handler), oxDisconnectControl (handler)
+*/
 command oxStopTor
    -- Ask tor to shut down over the control port, then disconnect. If Mode B was
    -- not used this simply disconnects control (idempotent).

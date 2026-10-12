@@ -28,11 +28,63 @@ local sPollTarget       -- object that receives the semantic event messages
 local sPollInterval     -- milliseconds between drains (the latency/CPU knob)
 local sPolling          -- "true" while the timer loop is armed
 
+/**
+Title: TorrentXT Helpers
+
+Author: Seth Morrow Software
+
+Description:
+The script-side poll loop and formatting helpers for TorrentXT. Put this
+stack in the message path with start using stack "torrentHelpers" (or use
+its script as a behavior), then call btStartPolling once the session is
+running.
+
+libtorrent never calls back into script. The helper drains the session's
+events on a timer with btPoll and btRp1Poll and dispatches each one to
+your target as a message named after the event, such as metadataReceived,
+torrentFinished or rp1Message, with the event array as its one parameter.
+Every event is also sent as torrentEvent, a catch-all. When a drain
+reports that events were lost because a queue filled, the target also gets
+a torrentPollWarning message.
+
+btFormatBytes and btStateName turn raw numbers into labels for a
+dashboard.
+*/
+
 -- btStartPolling SESSION, TARGET, INTERVALMS
 -- Begin draining SESSION's events and dispatching them to TARGET. If TARGET is
 -- empty, events go to the current card. INTERVALMS defaults to 250. Calling it
 -- again while polling re-points the session, target and interval (last caller
 -- wins); it does NOT arm a second chain.
+/**
+Summary: Start draining a session's events on a timer and dispatching them as messages.
+
+pSession: The session handle from btStartSession.
+
+pTarget: The object that receives the event messages; empty for the current card.
+
+pIntervalMs: Milliseconds between drains; empty for 250.
+
+Example:
+btStartSession
+put the result into sSession
+btStartPolling sSession, the long id of this card, 250
+
+Description:
+Use <btStartPolling> once the session is running. Each pass runs
+<btTorrentPollOnce>: it drains <btPoll> and then <btRp1Poll> and
+dispatches each event to the target as a message named after the event,
+with the event array as its one parameter, and also as torrentEvent.
+
+Handle the events you need with handlers such as on torrentFinished
+pEvent, and read the keys of pEvent.
+
+Calling it again while polling changes the session, target and interval;
+it does not start a second timer. The interval trades latency for CPU, but
+both event queues are limited, so a very slow interval can lose events.
+
+References: btStopPolling (handler), btTorrentPollOnce (handler), btPoll (handler)
+*/
 command btStartPolling pSession, pTarget, pIntervalMs
    put pSession into sPollSession
    if pTarget is empty then
@@ -59,6 +111,20 @@ command btStartPolling pSession, pTarget, pIntervalMs
 end btStartPolling
 
 -- Stop the timer loop. Safe to call when not polling.
+/**
+Summary: Stop the event polling timer.
+
+Example:
+btStopPolling
+btStopSession sSession
+
+Description:
+Use <btStopPolling> before <btStopSession>; call both from closeStack. The
+pass already scheduled sees the flag and does nothing. It is safe to call
+when polling is not running.
+
+References: btStartPolling (handler), btStopSession (handler)
+*/
 command btStopPolling
    put "false" into sPolling
 end btStopPolling
@@ -86,6 +152,29 @@ end btStopPolling
 -- timer message never runs between an app's bt* call and its own
 -- btLastError() read unless that handler yields (`wait ... with messages`).
 -- Verified statically; needs an OXT pass (no harness drives this helper yet).
+/**
+Summary: Run one drain pass of the polling loop.
+
+Example:
+btStartPolling sSession, the long id of this card, 250
+
+Description:
+<btTorrentPollOnce> is the timer message <btStartPolling> schedules; you
+normally do not call it yourself. It does nothing unless polling is on and
+a session is set.
+
+Each pass clears the last error, drains <btPoll>, and dispatches every
+event by its name and as torrentEvent. It then does the same with
+<btRp1Poll>, which returns nothing when rp1 is not enabled. Finally it
+schedules the next pass.
+
+If <btLastError> is not empty right after a drain, the queue overflowed.
+The pass then dispatches a torrentPollWarning event (and torrentEvent)
+whose array has the keys name, torrent (0), source (btPoll or btRp1Poll)
+and message (the text from btLastError).
+
+References: btStartPolling (handler), btStopPolling (handler), btPoll (handler), btRp1Poll (handler)
+*/
 command btTorrentPollOnce
    local tEvents, tEvent, tName, tLoss
    if sPolling is not "true" then
@@ -145,6 +234,23 @@ private command btPollDispatchLoss pSource, pMessage
 end btPollDispatchLoss
 
 -- btFormatBytes N -- a small humaniser for dashboards (KiB/MiB/GiB).
+/**
+Summary: Format a byte count as text such as 1.5 MiB.
+
+pBytes: A number of bytes.
+
+Returns: The size with one decimal place and a unit: B, KiB, MiB, GiB or TiB.
+
+Example:
+put btTorrentStatus(tH) into tStatus
+put btFormatBytes(tStatus["totalDone"]) into field "done"
+
+Description:
+Use <btFormatBytes> for dashboard labels. It divides by 1024 per unit.
+Empty or non-numeric input returns 0 B.
+
+References: btStateName (handler), btTorrentStatus (handler)
+*/
 function btFormatBytes pBytes
    local tUnits, tVal, tI, tSavedDelim, tOut
    if pBytes is empty or pBytes is not a number then
@@ -180,6 +286,24 @@ function btFormatBytes pBytes
 end btFormatBytes
 
 -- btStateName N -- map a libtorrent torrent_status::state_t int to a label.
+/**
+Summary: Turn a torrent state number into a label.
+
+pState: The state value from the state key of btTorrentStatus.
+
+Returns: checking, fetching metadata, downloading, finished, seeding, checking resume or queued.
+
+Example:
+put btTorrentStatus(tH) into tStatus
+put btStateName(tStatus["state"]) into field "state"
+
+Description:
+Use <btStateName> to show libtorrent's torrent state. 1 is checking, 2
+fetching metadata, 3 downloading, 4 finished, 5 seeding and 7 checking
+resume; any other value, 0 and 6 included, gives queued.
+
+References: btTorrentStatus (handler), btFormatBytes (handler)
+*/
 function btStateName pState
    switch pState
       case 1

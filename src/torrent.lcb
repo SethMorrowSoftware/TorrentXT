@@ -1,3 +1,28 @@
+/**
+Bindings to libtorrent, the BitTorrent engine, for downloading, seeding and
+serverless peer contact.
+
+TorrentXT runs one libtorrent session per process. Start it with
+<btStartSession> and stop it with <btStopSession> before your app quits:
+there is no automatic unload hook. Sessions and torrents are integer
+handles; 0 means the call failed (see <btLastError>), and a stale handle is
+a harmless no-op. Action handlers return 0 on success or a negative code.
+
+libtorrent works on its own threads and never calls back into script.
+Events wait in a queue until <btPoll> (and <btRp1Poll> for the rp1
+extension) drains them. The torrentHelpers library (btStartPolling) does
+that on a timer and dispatches each event as a message named after it,
+such as metadataReceived or torrentFinished, plus a catch-all
+torrentEvent.
+
+Payload never crosses into script: pieces move between the network and
+disk inside libtorrent. 64-bit numbers and info-hashes come back as text.
+Besides plain downloads it covers the DHT (BEP 5 peers and the BEP 44
+key-value store), UPnP / NAT-PMP port mapping, torrent creation and rp1, a
+custom peer-wire extension that moves opaque bytes between peers.
+
+Tags: Networking, Library
+*/
 library org.openxtalk.library.torrent
 
 -- torrent.lcb - the LCB binding for TorrentXT (library
@@ -757,6 +782,29 @@ end handler
 -- Start THE session. Verifies the ABI first (throws on skew). Returns a
 -- positive session handle, or 0 on failure (see btLastError). The app MUST
 -- call btStopSession before quitting (no auto unload hook).
+/**
+Summary: Start the one libtorrent session and return its handle.
+
+Returns: A positive session handle, or 0 on failure.
+
+Example:
+btStartSession
+put the result into sSession
+if sSession is 0 then answer "TorrentXT failed:" && btLastError()
+
+Description:
+Use <btStartSession> once, typically on openStack, before any other call
+that takes a session. Only one session may be live in the process at a
+time; a second call while one is live returns 0 and sets <btLastError>.
+
+It first checks that the loaded native library matches this binding. On a
+mismatch it throws an error asking you to rebuild and repackage the
+native library. This is the only handler in the library that throws.
+
+Pair it with <btStopSession> before your app quits.
+
+References: btStopSession (handler), btLastError (handler), btPoll (handler)
+*/
 public handler btStartSession() returns Integer
    variable tSession as Integer
    _checkABI()
@@ -768,6 +816,26 @@ end handler
 
 -- Pause, flush resume data, destroy, and join the session's threads.
 -- Idempotent: a stale handle is a harmless no-op.
+/**
+Summary: Stop the session and release its threads.
+
+pSession: The session handle from btStartSession.
+
+Example:
+btStopPolling
+btStopSession sSession
+
+Description:
+Use <btStopSession> before your app quits; call it from closeStack. It
+pauses the session, flushes resume data, destroys it and joins
+libtorrent's background threads. There is no automatic unload hook, so a
+session that is never stopped leaks at quit.
+
+It is idempotent: a second call, or a stale handle, does nothing. It
+returns nothing.
+
+References: btStartSession (handler)
+*/
 public handler btStopSession(in pSession as Integer)
    unsafe
       _btx_session_free(pSession)
@@ -775,6 +843,25 @@ public handler btStopSession(in pSession as Integer)
 end handler
 
 -- The module-static last-error string ("" when there is no error).
+/**
+Summary: Return the text of the most recent error.
+
+Returns: The last error message, or empty when there is none.
+
+Example:
+btAddMagnet sSession, tUri, tSavePath
+if the result is 0 then answer btLastError()
+
+Description:
+Use <btLastError> after a handler returns 0, a negative code or an empty
+value to learn why. The message is set by the most recent failed call and
+stays until <btClearError> or the next failure replaces it.
+
+After a drain, <btPoll> and <btRp1Poll> also leave a message here when
+events were lost because a queue filled between two drains.
+
+References: btClearError (handler), btPoll (handler)
+*/
 public handler btLastError() returns String
    variable tCount as Integer
    _ensureScratch(kScratchCap)
@@ -793,6 +880,21 @@ public handler btLastError() returns String
    return _decodeText(_bufToData(sScratchPtr, tCount), 1, tCount)
 end handler
 
+/**
+Summary: Clear the last error message.
+
+Example:
+btClearError
+put btPoll(sSession) into tEvents
+put btLastError() into tWarning
+
+Description:
+Use <btClearError> before a call whose error you want to read on its own,
+since the last error stays until something replaces it. It does not clear
+a torrent's error state; that is <btClearTorrentError>.
+
+References: btLastError (handler), btClearTorrentError (handler)
+*/
 public handler btClearError()
    unsafe
       _btx_clear_error()
@@ -804,6 +906,28 @@ end handler
 -- ===================================================================== --
 
 -- Set an integer setting. pValue is a STRING so 64-bit values cross losslessly.
+/**
+Summary: Set an integer session setting.
+
+pSession: The session handle.
+
+pKey: A libtorrent settings_pack name, such as "download_rate_limit".
+
+pValue: The value as decimal text, so 64-bit values pass without loss.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetInt sSession, "download_rate_limit", "5000000"
+if the result is not 0 then answer btLastError()
+
+Description:
+Use <btSetInt> to change an integer setting of the running session.
+Settings apply at once. An unknown key fails with -3 and sets
+<btLastError>. Rate limits are bytes per second, and "0" means unlimited.
+
+References: btSetBool (handler), btSetString (handler), btGetSetting (handler)
+*/
 public handler btSetInt(in pSession as Integer, in pKey as String, in pValue as String) returns Integer
    variable tR as Integer
    unsafe
@@ -812,6 +936,28 @@ public handler btSetInt(in pSession as Integer, in pKey as String, in pValue as 
    return tR
 end handler
 
+/**
+Summary: Set a true/false session setting.
+
+pSession: The session handle.
+
+pKey: A libtorrent settings_pack name, such as "enable_dht".
+
+pValue: true or false.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetBool sSession, "enable_dht", true
+btSetBool sSession, "enable_lsd", true
+
+Description:
+Use <btSetBool> to switch a session feature on or off, for example the
+DHT, local service discovery, UPnP or NAT-PMP. Settings apply at once. An
+unknown key fails with -3 and sets <btLastError>.
+
+References: btSetInt (handler), btSetString (handler), btGetSetting (handler)
+*/
 public handler btSetBool(in pSession as Integer, in pKey as String, in pValue as Boolean) returns Integer
    variable tR as Integer
    variable tV as Integer
@@ -826,6 +972,27 @@ public handler btSetBool(in pSession as Integer, in pKey as String, in pValue as
    return tR
 end handler
 
+/**
+Summary: Set a text session setting.
+
+pSession: The session handle.
+
+pKey: A libtorrent settings_pack name, such as "user_agent" or "listen_interfaces".
+
+pValue: The new text value.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetString sSession, "listen_interfaces", "0.0.0.0:6881"
+
+Description:
+Use <btSetString> for text settings such as the user agent or the listen
+address list. Settings apply at once. An unknown key fails with -3 and
+sets <btLastError>.
+
+References: btSetInt (handler), btSetBool (handler), btGetSetting (handler)
+*/
 public handler btSetString(in pSession as Integer, in pKey as String, in pValue as String) returns Integer
    variable tR as Integer
    unsafe
@@ -835,6 +1002,25 @@ public handler btSetString(in pSession as Integer, in pKey as String, in pValue 
 end handler
 
 -- Read a setting back as text (diagnostics; not on the hot path).
+/**
+Summary: Read a session setting back as text.
+
+pSession: The session handle.
+
+pKey: A libtorrent settings_pack name.
+
+Returns: The current value as text, or empty on a bad handle or unknown key.
+
+Example:
+put btGetSetting(sSession, "connections_limit") into tLimit
+
+Description:
+Use <btGetSetting> to check what a setting holds, whether it is an
+integer, a boolean or a string. It is meant for diagnostics, not for a
+timer loop.
+
+References: btSetInt (handler), btSetBool (handler), btSetString (handler)
+*/
 public handler btGetSetting(in pSession as Integer, in pKey as String) returns String
    variable tCount as Integer
    _ensureScratch(kScratchCap)
@@ -855,6 +1041,30 @@ end handler
 
 -- MSE / protocol encryption. in/out policy: 0=forced 1=enabled 2=disabled;
 -- level: 1=plaintext 2=rc4 3=both.
+/**
+Summary: Set the protocol encryption policy for peer connections.
+
+pSession: The session handle.
+
+pIn: Policy for incoming connections: 0 forced, 1 enabled, 2 disabled.
+
+pOut: Policy for outgoing connections: 0 forced, 1 enabled, 2 disabled.
+
+pLevel: Allowed cipher level: 1 plaintext, 2 rc4, 3 both.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetEncryption sSession, 1, 1, 3
+
+Description:
+Use <btSetEncryption> to set libtorrent's in_enc_policy, out_enc_policy
+and allowed_enc_level in one call. The example allows encryption both ways
+with either cipher. You can also set the three keys one by one with
+<btSetInt>.
+
+References: btSetInt (handler)
+*/
 public handler btSetEncryption(in pSession as Integer, in pIn as Integer, in pOut as Integer, in pLevel as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -867,6 +1077,22 @@ end handler
 
 -- Pause / resume the WHOLE session (every torrent). Distinct from the
 -- per-torrent btPause / btResume.
+/**
+Summary: Pause the whole session.
+
+pSession: The session handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSessionPause sSession
+
+Description:
+Use <btSessionPause> to stop every torrent at once. To pause a single
+torrent use <btPause> instead. Undo it with <btSessionResume>.
+
+References: btSessionResume (handler), btSessionIsPaused (handler), btPause (handler)
+*/
 public handler btSessionPause(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -875,6 +1101,22 @@ public handler btSessionPause(in pSession as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Resume a paused session.
+
+pSession: The session handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+if btSessionIsPaused(sSession) then btSessionResume sSession
+
+Description:
+Use <btSessionResume> to undo <btSessionPause>. It does not resume
+torrents you paused one by one with <btPause>.
+
+References: btSessionPause (handler), btSessionIsPaused (handler)
+*/
 public handler btSessionResume(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -883,6 +1125,22 @@ public handler btSessionResume(in pSession as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Report whether the session is paused.
+
+pSession: The session handle.
+
+Returns: true if the session is paused, false otherwise or when there is no session.
+
+Example:
+if btSessionIsPaused(sSession) then put "Paused" into field "status"
+
+Description:
+Use <btSessionIsPaused> to show or toggle the session-wide pause state set
+by <btSessionPause>.
+
+References: btSessionPause (handler), btSessionResume (handler)
+*/
 public handler btSessionIsPaused(in pSession as Integer) returns Boolean
    variable tR as Integer
    unsafe
@@ -892,6 +1150,23 @@ public handler btSessionIsPaused(in pSession as Integer) returns Boolean
 end handler
 
 -- The TCP port we actually ended up listening on (0 == not listening yet).
+/**
+Summary: Return the TCP port the session is listening on.
+
+pSession: The session handle.
+
+Returns: The port number, or 0 if the session is not listening yet or the handle is bad.
+
+Example:
+put btListenPort(sSession) into tPort
+
+Description:
+Use <btListenPort> to learn the port libtorrent actually opened, which can
+differ from the one you asked for in listen_interfaces. A listenSucceeded
+event reports the same thing when the socket opens.
+
+References: btSetString (handler), btMapPort (handler)
+*/
 public handler btListenPort(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -902,6 +1177,25 @@ end handler
 
 -- Look up an already-added torrent by its 40-hex (v1) info-hash; returns the
 -- torrent handle, or 0 if not found.
+/**
+Summary: Find a torrent in the session by its info-hash.
+
+pSession: The session handle.
+
+pInfoHash: The torrent's v1 info-hash as 40 hex characters.
+
+Returns: The torrent handle, or 0 if the torrent is not in this session.
+
+Example:
+put btFindTorrent(sSession, tHashHex) into tH
+if tH is 0 then answer "Not loaded."
+
+Description:
+Use <btFindTorrent> to recover a handle from a hash you stored earlier,
+instead of keeping the integer handle around.
+
+References: btInfoHash (handler), btTorrentHandleAt (handler)
+*/
 public handler btFindTorrent(in pSession as Integer, in pInfoHash as String) returns Integer
    variable tR as Integer
    unsafe
@@ -912,6 +1206,28 @@ end handler
 
 -- Classic BEP5 DHT peer announce (NOT BEP44): tell the DHT we have peers for
 -- this 40-hex info-hash on pPort (0 == our listen port).
+/**
+Summary: Announce on the DHT that we serve peers for an info-hash.
+
+pSession: The session handle.
+
+pInfoHash: The info-hash or rendezvous id, as 40 hex characters.
+
+pPort: The port to announce, or 0 for our listen port.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btDhtAnnounce sSession, tHashHex, 0
+
+Description:
+Use <btDhtAnnounce> for a classic BEP 5 announce, so others can find you
+through the DHT. This is the peer announce, not the BEP 44 key-value
+store. The DHT must be enabled. Other peers find you with <btDhtGetPeers>
+on the same id.
+
+References: btDhtGetPeers (handler), btAddInfohash (handler)
+*/
 public handler btDhtAnnounce(in pSession as Integer, in pInfoHash as String, in pPort as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -924,6 +1240,29 @@ end handler
 -- be any caller-derived rendezvous point, not a real torrent, so this is the
 -- presence/discovery primitive. The peer list arrives later as a dhtGetPeers
 -- event carrying "target" and "peers" (a newline-separated "ip:port" list).
+/**
+Summary: Ask the DHT which peers announced an id.
+
+pSession: The session handle.
+
+pId: The id to look up, as 40 hex characters.
+
+Returns: 0 if the lookup started, or a negative error code.
+
+Example:
+btDhtGetPeers sSession, tRendezvousHex
+
+Description:
+Use <btDhtGetPeers> for a classic BEP 5 get_peers lookup. The id need not
+be a real torrent: any id both sides derive, for example from a shared
+secret, works as a rendezvous point.
+
+The answer arrives later as a dhtGetPeers event with keys target and
+peers, a return-separated list of ip:port entries (IPv6 addresses in
+square brackets).
+
+References: btDhtAnnounce (handler), btAddInfohash (handler), btPoll (handler)
+*/
 public handler btDhtGetPeers(in pSession as Integer, in pId as String) returns Integer
    variable tR as Integer
    unsafe
@@ -942,6 +1281,35 @@ end handler
 -- arrives as "portMapError", and the machine's external IP as an "externalIp"
 -- event. NOTE: this is the CLEAR-WEB path - the IP is public, so it is NOT
 -- anonymous (use the Tor onion path for that).
+/**
+Summary: Ask the router to forward a port to this machine with UPnP or NAT-PMP.
+
+pSession: The session handle.
+
+pExternalPort: The port to open on the router.
+
+pLocalPort: The port on this machine to forward it to.
+
+pIsTcp: true for TCP, false for UDP.
+
+Returns: A mapping id greater than 0, or 0 if no mapper is active or the port is bad.
+
+Example:
+put btMapPort(sSession, 8080, 8080, true) into tMapId
+if tMapId is 0 then answer "No UPnP or NAT-PMP mapper is active."
+
+Description:
+Use <btMapPort> so others can reach a server on this machine without
+manual port forwarding. UPnP or NAT-PMP must be enabled in the session.
+
+The mapping happens later. A portMapped event reports the external port
+the router actually assigned (it may differ) and which mapper won; a
+failure arrives as portMapError, and the machine's external address as an
+externalIp event. The address and port are public, so this path is not
+anonymous.
+
+References: btUnmapPort (handler), btListenPort (handler)
+*/
 public handler btMapPort(in pSession as Integer, in pExternalPort as Integer, in pLocalPort as Integer, in pIsTcp as Boolean) returns Integer
    variable tR as Integer
    variable tTcp as Integer
@@ -956,6 +1324,24 @@ public handler btMapPort(in pSession as Integer, in pExternalPort as Integer, in
 end handler
 
 -- Withdraw a mapping created by btMapPort (idempotent; a stale id is a no-op).
+/**
+Summary: Remove a router port mapping.
+
+pSession: The session handle.
+
+pMappingId: The mapping id returned by btMapPort.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btUnmapPort sSession, tMapId
+
+Description:
+Use <btUnmapPort> to withdraw a mapping made by <btMapPort>. A stale or
+unknown mapping id is a harmless no-op.
+
+References: btMapPort (handler)
+*/
 public handler btUnmapPort(in pSession as Integer, in pMappingId as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -968,6 +1354,31 @@ end handler
 --  Public API: add / remove torrents
 -- ===================================================================== --
 
+/**
+Summary: Add a torrent from a magnet link.
+
+pSession: The session handle.
+
+pURI: The magnet URI.
+
+pSavePath: The folder to download into.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+btAddMagnet sSession, field "magnet", field "savepath"
+put the result into tH
+if tH is 0 then answer "Add failed:" && btLastError()
+
+Description:
+Use <btAddMagnet> to start a download from a magnet link. The torrent has
+no name or file list until its metadata arrives from peers, which a
+metadataReceived event announces.
+
+To add the torrent paused or with other flags, use <btAddMagnetEx>.
+
+References: btAddMagnetEx (handler), btAddTorrentFile (handler), btRemoveTorrent (handler)
+*/
 public handler btAddMagnet(in pSession as Integer, in pURI as String, in pSavePath as String) returns Integer
    variable tHandle as Integer
    unsafe
@@ -979,6 +1390,29 @@ end handler
 -- Add from .torrent BYTES (an input buffer: MCDataGetBytePtr hands C the
 -- read-only pointer to the bytes, with their length). Only the metainfo
 -- crosses; payload never does.
+/**
+Summary: Add a torrent from the bytes of a .torrent file.
+
+pSession: The session handle.
+
+pData: The contents of the .torrent file.
+
+pSavePath: The folder to download into.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+put url ("binfile:" & tTorrentPath) into tBytes
+btAddTorrentFile sSession, tBytes, tSavePath
+put the result into tH
+
+Description:
+Use <btAddTorrentFile> when you have the .torrent file itself. Read the
+file as binary and pass its bytes. Empty data returns 0 at once, and a
+malformed file fails with a reason in <btLastError>.
+
+References: btAddTorrentFileEx (handler), btAddMagnet (handler), btCreateTorrent (handler)
+*/
 public handler btAddTorrentFile(in pSession as Integer, in pData as Data, in pSavePath as String) returns Integer
    variable tHandle as Integer
    variable tPtr as Pointer
@@ -996,6 +1430,39 @@ end handler
 -- pFlags / pMask are decimal strings (combine kFlag* constants). The common
 -- use is adding PAUSED (kFlagPaused) to set file priorities before it starts.
 
+/**
+Summary: Add a torrent from a magnet link with add-time flags.
+
+pSession: The session handle.
+
+pURI: The magnet URI.
+
+pSavePath: The folder to download into.
+
+pFlags: The flag bits to set, as a decimal string.
+
+pMask: The flag bits to touch, as a decimal string.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+put btAddMagnetEx(sSession, tUri, tSavePath, "16", "16") into tH
+btSetFilePriority tH, 0, 7
+btResume tH
+
+Description:
+Use <btAddMagnetEx> like <btAddMagnet> when the torrent must start with
+certain libtorrent torrent_flags. Only the bits in pMask change; each of
+them is set if it is also in pFlags. Add the flag values to combine them:
+seed mode 1, upload mode 2, share mode 4, apply IP filter 8, paused 16,
+auto managed 32, super seeding 256, sequential download 512, stop when
+ready 1024.
+
+The usual use is adding paused (16), so you can set file priorities before
+anything downloads.
+
+References: btAddMagnet (handler), btAddTorrentFileEx (handler), btSetTorrentFlags (handler)
+*/
 public handler btAddMagnetEx(in pSession as Integer, in pURI as String, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer
    variable tHandle as Integer
    unsafe
@@ -1004,6 +1471,33 @@ public handler btAddMagnetEx(in pSession as Integer, in pURI as String, in pSave
    return tHandle
 end handler
 
+/**
+Summary: Add a torrent from .torrent bytes with add-time flags.
+
+pSession: The session handle.
+
+pData: The contents of the .torrent file.
+
+pSavePath: The folder to download into.
+
+pFlags: The flag bits to set, as a decimal string.
+
+pMask: The flag bits to touch, as a decimal string.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+put url ("binfile:" & tTorrentPath) into tBytes
+put btAddTorrentFileEx(sSession, tBytes, tSavePath, "512", "512") into tH
+
+Description:
+Use <btAddTorrentFileEx> like <btAddTorrentFile> when the torrent must
+start with certain flags. The flags work as in <btAddMagnetEx>; the
+example adds the torrent with sequential download (512) for streaming.
+Empty data returns 0 at once.
+
+References: btAddTorrentFile (handler), btAddMagnetEx (handler)
+*/
 public handler btAddTorrentFileEx(in pSession as Integer, in pData as Data, in pSavePath as String, in pFlags as String, in pMask as String) returns Integer
    variable tHandle as Integer
    variable tPtr as Pointer
@@ -1021,6 +1515,30 @@ end handler
 
 -- Add an inclusive IP range to the session filter; pBlock true blocks it.
 -- Rules accumulate. Start/end must be the same family (both v4 or both v6).
+/**
+Summary: Add an IP address range rule to the session's filter.
+
+pSession: The session handle.
+
+pStartIp: The first address of the range.
+
+pEndIp: The last address of the range, of the same family as the first.
+
+pBlock: true to block the range, false to allow it.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btIpFilterAdd sSession, "1.2.3.0", "1.2.3.255", true
+
+Description:
+Use <btIpFilterAdd> to keep peers in an address range from connecting.
+The range is inclusive, and both ends must be IPv4 or both IPv6. Rules
+add up; an empty filter allows everything. Clear them all with
+<btIpFilterClear>.
+
+References: btIpFilterClear (handler)
+*/
 public handler btIpFilterAdd(in pSession as Integer, in pStartIp as String, in pEndIp as String, in pBlock as Boolean) returns Integer
    variable tR as Integer
    variable tB as Integer
@@ -1035,6 +1553,21 @@ public handler btIpFilterAdd(in pSession as Integer, in pStartIp as String, in p
    return tR
 end handler
 
+/**
+Summary: Remove every IP filter rule.
+
+pSession: The session handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btIpFilterClear sSession
+
+Description:
+Use <btIpFilterClear> to return the filter to allowing every address.
+
+References: btIpFilterAdd (handler)
+*/
 public handler btIpFilterClear(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1044,6 +1577,30 @@ public handler btIpFilterClear(in pSession as Integer) returns Integer
 end handler
 
 -- Streaming: fetch a piece by a deadline (ms from now); soonest deadlines win.
+/**
+Summary: Ask for a piece to arrive within a time limit, for streaming.
+
+pTorrent: The torrent handle.
+
+pPieceIndex: The 0-based piece index.
+
+pDeadlineMs: The deadline in milliseconds from now.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+repeat with tPiece from 0 to 9
+   btSetPieceDeadline tH, tPiece, 1000 + tPiece * 500
+end repeat
+
+Description:
+Use <btSetPieceDeadline> while playing media from a torrent. libtorrent
+reorders its requests so the soonest deadlines come first. Set deadlines
+across the pieces you are about to play, and clear them with
+<btClearPieceDeadlines> after a seek.
+
+References: btClearPieceDeadlines (handler), btSetSequentialDownload (handler)
+*/
 public handler btSetPieceDeadline(in pTorrent as Integer, in pPieceIndex as Integer, in pDeadlineMs as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1052,6 +1609,22 @@ public handler btSetPieceDeadline(in pTorrent as Integer, in pPieceIndex as Inte
    return tR
 end handler
 
+/**
+Summary: Remove all piece deadlines from a torrent.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btClearPieceDeadlines tH
+
+Description:
+Use <btClearPieceDeadlines> to drop the deadlines set with
+<btSetPieceDeadline>, for example when playback stops or seeks.
+
+References: btSetPieceDeadline (handler)
+*/
 public handler btClearPieceDeadlines(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1060,6 +1633,31 @@ public handler btClearPieceDeadlines(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Re-add a torrent from saved resume data.
+
+pSession: The session handle.
+
+pResume: The resume data bytes you saved from a resumeDataReady event.
+
+pSavePath: The folder the torrent downloads into.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+put url ("binfile:" & tResumePath) into tResume
+btAddTorrentWithResume sSession, tResume, tSavePath
+put the result into tH
+
+Description:
+Use <btAddTorrentWithResume> on the next launch to bring a torrent back
+without hashing the pieces it already has again. Get the data with
+<btSaveResumeData> and the resumeDataReady event it triggers. Empty data
+returns 0 at once. If libtorrent rejects the data, a fastresumeRejected
+event follows and the torrent is checked again.
+
+References: btSaveResumeData (handler), btAddMagnet (handler)
+*/
 public handler btAddTorrentWithResume(in pSession as Integer, in pResume as Data, in pSavePath as String) returns Integer
    variable tHandle as Integer
    variable tPtr as Pointer
@@ -1073,6 +1671,28 @@ public handler btAddTorrentWithResume(in pSession as Integer, in pResume as Data
    return tHandle
 end handler
 
+/**
+Summary: Remove a torrent from the session.
+
+pSession: The session handle.
+
+pTorrent: The torrent handle.
+
+pDeleteFiles: true to delete the downloaded files too, false to keep them.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btRemoveTorrent sSession, tH, false
+
+Description:
+Use <btRemoveTorrent> to stop and drop a torrent. A torrentRemoved event
+follows when removal finishes, and the handle goes stale. With
+pDeleteFiles set to true the downloaded files are deleted from disk, so
+use it with care.
+
+References: btAddMagnet (handler), btPause (handler)
+*/
 public handler btRemoveTorrent(in pSession as Integer, in pTorrent as Integer, in pDeleteFiles as Boolean) returns Integer
    variable tR as Integer
    variable tDel as Integer
@@ -1091,6 +1711,22 @@ end handler
 --  Public API: control
 -- ===================================================================== --
 
+/**
+Summary: Pause one torrent.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btPause tH
+
+Description:
+Use <btPause> to stop a single torrent; a torrentPaused event follows.
+Resume it with <btResume>. To pause everything use <btSessionPause>.
+
+References: btResume (handler), btSessionPause (handler)
+*/
 public handler btPause(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1099,6 +1735,22 @@ public handler btPause(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Resume a paused torrent.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btResume tH
+
+Description:
+Use <btResume> to restart a torrent paused with <btPause> or added paused.
+A torrentResumed event follows.
+
+References: btPause (handler), btAddMagnetEx (handler)
+*/
 public handler btResume(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1107,6 +1759,22 @@ public handler btResume(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Check a torrent's data on disk against its piece hashes again.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btForceRecheck tH
+
+Description:
+Use <btForceRecheck> when files on disk may have changed outside the app.
+The torrent goes back into the checking state while its pieces are hashed.
+
+References: btTorrentStatus (handler)
+*/
 public handler btForceRecheck(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1115,6 +1783,22 @@ public handler btForceRecheck(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Announce a torrent to its trackers and the DHT now.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btForceReannounce tH
+
+Description:
+Use <btForceReannounce> sparingly, for example after a network change.
+A trackerReply event follows on success, or trackerError on failure.
+
+References: btScrapeTracker (handler), btTrackers (handler)
+*/
 public handler btForceReannounce(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1124,6 +1808,27 @@ public handler btForceReannounce(in pTorrent as Integer) returns Integer
 end handler
 
 -- priority: 0=dont_download .. 7=top.
+/**
+Summary: Set the download priority of one file in a torrent.
+
+pTorrent: The torrent handle.
+
+pFileIndex: The 0-based index of the file in the torrent's file list.
+
+pPriority: 0 to skip the file, 1 for normal, up to 7 for top priority.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetFilePriority tH, 0, 7
+
+Description:
+Use <btSetFilePriority> to choose which files to download. The file list
+is only known once the torrent has metadata; see <btFileList>. To set
+every file at once use <btSetFilePriorities>.
+
+References: btSetFilePriorities (handler), btFileList (handler), btSetPiecePriority (handler)
+*/
 public handler btSetFilePriority(in pTorrent as Integer, in pFileIndex as Integer, in pPriority as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1133,6 +1838,29 @@ public handler btSetFilePriority(in pTorrent as Integer, in pFileIndex as Intege
 end handler
 
 -- Bulk file priorities: one priority byte per file, in file order.
+/**
+Summary: Set the download priority of every file in a torrent at once.
+
+pTorrent: The torrent handle.
+
+pPriorities: One priority byte (0 to 7) per file, in file order.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+put empty into tBytes
+repeat for each element tFile in btFileList(tH)
+   put numToByte(7) after tBytes
+end repeat
+btSetFilePriorities tH, tBytes
+
+Description:
+Use <btSetFilePriorities> instead of many <btSetFilePriority> calls. Each
+byte is the priority of the file at that position. Empty data does nothing
+and returns 0.
+
+References: btSetFilePriority (handler), btFileList (handler)
+*/
 public handler btSetFilePriorities(in pTorrent as Integer, in pPriorities as Data) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1146,6 +1874,26 @@ public handler btSetFilePriorities(in pTorrent as Integer, in pPriorities as Dat
    return tR
 end handler
 
+/**
+Summary: Set the download priority of one piece.
+
+pTorrent: The torrent handle.
+
+pPieceIndex: The 0-based piece index.
+
+pPriority: 0 to skip the piece, 1 for normal, up to 7 for top priority.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetPiecePriority tH, 0, 7
+
+Description:
+Use <btSetPiecePriority> for fine control below the file level. For
+playback in order, <btSetPieceDeadline> is usually the better tool.
+
+References: btSetFilePriority (handler), btSetPieceDeadline (handler)
+*/
 public handler btSetPiecePriority(in pTorrent as Integer, in pPieceIndex as Integer, in pPriority as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1155,6 +1903,27 @@ public handler btSetPiecePriority(in pTorrent as Integer, in pPieceIndex as Inte
 end handler
 
 -- Per-torrent rate caps in bytes/sec, as STRINGS ("0" == unlimited).
+/**
+Summary: Set a torrent's download and upload rate limits.
+
+pTorrent: The torrent handle.
+
+pDownBytesPerSec: The download limit in bytes per second, as text; "0" means unlimited.
+
+pUpBytesPerSec: The upload limit in bytes per second, as text; "0" means unlimited.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetTorrentLimits tH, "1000000", "0"
+
+Description:
+Use <btSetTorrentLimits> to cap one torrent. The session-wide limits are
+the download_rate_limit and upload_rate_limit settings, set with
+<btSetInt>.
+
+References: btSetInt (handler), btSetMaxConnections (handler)
+*/
 public handler btSetTorrentLimits(in pTorrent as Integer, in pDownBytesPerSec as String, in pUpBytesPerSec as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1168,6 +1937,31 @@ end handler
 -- Set/clear raw torrent_flags_t bits. pFlags and pMask are decimal strings;
 -- combine the kFlag* constants by adding their values. set writes ONLY the
 -- masked bits, so set(flags, mask) is the read-modify-write primitive.
+/**
+Summary: Set libtorrent flag bits on a torrent.
+
+pTorrent: The torrent handle.
+
+pFlags: The bits to set, as a decimal string.
+
+pMask: The bits to touch, as a decimal string.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetTorrentFlags tH, "512", "512"
+
+Description:
+Use <btSetTorrentFlags> to change any torrent_flags bit. Only the bits in
+pMask change; each of them is set if it is also in pFlags. Add the values
+to combine flags: seed mode 1, upload mode 2, share mode 4, apply IP filter
+8, paused 16, auto managed 32, super seeding 256, sequential download 512,
+stop when ready 1024. The example turns on sequential download.
+
+The named setters such as <btSetSequentialDownload> are built on this.
+
+References: btUnsetTorrentFlags (handler), btSetSequentialDownload (handler), btAddMagnetEx (handler)
+*/
 public handler btSetTorrentFlags(in pTorrent as Integer, in pFlags as String, in pMask as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1176,6 +1970,25 @@ public handler btSetTorrentFlags(in pTorrent as Integer, in pFlags as String, in
    return tR
 end handler
 
+/**
+Summary: Clear libtorrent flag bits on a torrent.
+
+pTorrent: The torrent handle.
+
+pFlags: The bits to clear, as a decimal string.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btUnsetTorrentFlags tH, "512"
+
+Description:
+Use <btUnsetTorrentFlags> to turn off the flags named in pFlags. The flag
+values are listed under <btSetTorrentFlags>. The example turns off
+sequential download.
+
+References: btSetTorrentFlags (handler)
+*/
 public handler btUnsetTorrentFlags(in pTorrent as Integer, in pFlags as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1185,6 +1998,24 @@ public handler btUnsetTorrentFlags(in pTorrent as Integer, in pFlags as String) 
 end handler
 
 -- Convenience: toggle one common flag by name (built on the generic pair).
+/**
+Summary: Turn in-order download on or off for a torrent.
+
+pTorrent: The torrent handle.
+
+pOn: true to download pieces in order, false for the normal order.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetSequentialDownload tH, true
+
+Description:
+Use <btSetSequentialDownload> to stream a file while it downloads. It sets
+or clears the sequential download flag through <btSetTorrentFlags>.
+
+References: btSetTorrentFlags (handler), btSetPieceDeadline (handler)
+*/
 public handler btSetSequentialDownload(in pTorrent as Integer, in pOn as Boolean) returns Integer
    if pOn then
       return btSetTorrentFlags(pTorrent, kFlagSequentialDownload, kFlagSequentialDownload)
@@ -1192,6 +2023,25 @@ public handler btSetSequentialDownload(in pTorrent as Integer, in pOn as Boolean
    return btUnsetTorrentFlags(pTorrent, kFlagSequentialDownload)
 end handler
 
+/**
+Summary: Let libtorrent queue, start and stop a torrent for you.
+
+pTorrent: The torrent handle.
+
+pOn: true to make the torrent auto managed, false to manage it yourself.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetAutoManaged tH, true
+
+Description:
+Use <btSetAutoManaged> to put a torrent under libtorrent's queue. The
+queue handlers such as <btQueueUp> only matter for auto-managed torrents.
+It sets or clears the auto managed flag through <btSetTorrentFlags>.
+
+References: btSetTorrentFlags (handler), btQueuePosition (handler)
+*/
 public handler btSetAutoManaged(in pTorrent as Integer, in pOn as Boolean) returns Integer
    if pOn then
       return btSetTorrentFlags(pTorrent, kFlagAutoManaged, kFlagAutoManaged)
@@ -1199,6 +2049,25 @@ public handler btSetAutoManaged(in pTorrent as Integer, in pOn as Boolean) retur
    return btUnsetTorrentFlags(pTorrent, kFlagAutoManaged)
 end handler
 
+/**
+Summary: Turn super-seeding on or off for a torrent.
+
+pTorrent: The torrent handle.
+
+pOn: true for super-seeding, false for normal seeding.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetSuperSeeding tH, true
+
+Description:
+Use <btSetSuperSeeding> when you are the first seed of new content. It is
+only meaningful on a complete torrent. It sets or clears the super seeding
+flag through <btSetTorrentFlags>.
+
+References: btSetTorrentFlags (handler)
+*/
 public handler btSetSuperSeeding(in pTorrent as Integer, in pOn as Boolean) returns Integer
    if pOn then
       return btSetTorrentFlags(pTorrent, kFlagSuperSeeding, kFlagSuperSeeding)
@@ -1206,6 +2075,25 @@ public handler btSetSuperSeeding(in pTorrent as Integer, in pOn as Boolean) retu
    return btUnsetTorrentFlags(pTorrent, kFlagSuperSeeding)
 end handler
 
+/**
+Summary: Turn share mode on or off for a torrent.
+
+pTorrent: The torrent handle.
+
+pOn: true for share mode, false for normal mode.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetShareMode tH, true
+
+Description:
+Use <btSetShareMode> to make a torrent aim at a good share ratio rather
+than at completing the download. It sets or clears the share mode flag
+through <btSetTorrentFlags>.
+
+References: btSetTorrentFlags (handler)
+*/
 public handler btSetShareMode(in pTorrent as Integer, in pOn as Boolean) returns Integer
    if pOn then
       return btSetTorrentFlags(pTorrent, kFlagShareMode, kFlagShareMode)
@@ -1213,6 +2101,25 @@ public handler btSetShareMode(in pTorrent as Integer, in pOn as Boolean) returns
    return btUnsetTorrentFlags(pTorrent, kFlagShareMode)
 end handler
 
+/**
+Summary: Turn upload-only mode on or off for a torrent.
+
+pTorrent: The torrent handle.
+
+pOn: true to only upload, false to download as well.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetUploadMode tH, true
+
+Description:
+Use <btSetUploadMode> to keep serving the pieces you have without
+requesting any more. It sets or clears the upload mode flag through
+<btSetTorrentFlags>.
+
+References: btSetTorrentFlags (handler)
+*/
 public handler btSetUploadMode(in pTorrent as Integer, in pOn as Boolean) returns Integer
    if pOn then
       return btSetTorrentFlags(pTorrent, kFlagUploadMode, kFlagUploadMode)
@@ -1221,6 +2128,24 @@ public handler btSetUploadMode(in pTorrent as Integer, in pOn as Boolean) return
 end handler
 
 -- Per-torrent caps: max peer connections, and max unchoked upload slots.
+/**
+Summary: Limit how many peer connections a torrent may have.
+
+pTorrent: The torrent handle.
+
+pMax: The maximum, 2 or more, or -1 for unlimited.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetMaxConnections tH, 80
+
+Description:
+Use <btSetMaxConnections> to cap one torrent's connections. The
+session-wide cap is the connections_limit setting.
+
+References: btSetMaxUploads (handler), btSetTorrentLimits (handler)
+*/
 public handler btSetMaxConnections(in pTorrent as Integer, in pMax as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1229,6 +2154,23 @@ public handler btSetMaxConnections(in pTorrent as Integer, in pMax as Integer) r
    return tR
 end handler
 
+/**
+Summary: Limit how many peers a torrent uploads to at once.
+
+pTorrent: The torrent handle.
+
+pMax: The maximum number of unchoked upload slots.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btSetMaxUploads tH, 6
+
+Description:
+Use <btSetMaxUploads> to cap the upload slots of one torrent.
+
+References: btSetMaxConnections (handler), btSetTorrentLimits (handler)
+*/
 public handler btSetMaxUploads(in pTorrent as Integer, in pMax as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1238,6 +2180,24 @@ public handler btSetMaxUploads(in pTorrent as Integer, in pMax as Integer) retur
 end handler
 
 -- Clear a torrent's error state so it can resume (after fixing disk/permission).
+/**
+Summary: Clear a torrent's error state so it can run again.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btClearTorrentError tH
+
+Description:
+Use <btClearTorrentError> after fixing the cause of a torrent error, such
+as a full disk or a permission problem. The error text is in the error key
+of <btTorrentStatus>. This is not <btClearError>, which clears the
+library's last error message.
+
+References: btTorrentStatus (handler), btClearError (handler)
+*/
 public handler btClearTorrentError(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1247,6 +2207,23 @@ public handler btClearTorrentError(in pTorrent as Integer) returns Integer
 end handler
 
 -- Ask the tracker(s) for current seed/leecher counts (-> scrapeReply event).
+/**
+Summary: Ask the trackers for a torrent's seed and leecher counts.
+
+pTorrent: The torrent handle.
+
+Returns: 0 if the request was sent, or a negative error code.
+
+Example:
+btScrapeTracker tH
+
+Description:
+Use <btScrapeTracker> to refresh the swarm size. The answer arrives later
+as a scrapeReply event, and the counts appear as numComplete and
+numIncomplete in <btTorrentStatus>.
+
+References: btTorrentStatus (handler), btForceReannounce (handler)
+*/
 public handler btScrapeTracker(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1256,6 +2233,25 @@ public handler btScrapeTracker(in pTorrent as Integer) returns Integer
 end handler
 
 -- Move the downloaded files to a new folder (-> storageMoved / fileError event).
+/**
+Summary: Move a torrent's downloaded files to another folder.
+
+pTorrent: The torrent handle.
+
+pSavePath: The new folder.
+
+Returns: 0 if the move was started, or a negative error code.
+
+Example:
+btMoveStorage tH, "/mnt/big/downloads"
+
+Description:
+Use <btMoveStorage> to relocate a torrent's data. The move happens inside
+libtorrent; a storageMoved event reports success and a fileError event
+reports failure.
+
+References: btTorrentStatus (handler)
+*/
 public handler btMoveStorage(in pTorrent as Integer, in pSavePath as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1265,6 +2261,23 @@ public handler btMoveStorage(in pTorrent as Integer, in pSavePath as String) ret
 end handler
 
 -- Download-queue position: 0-based, or -1 if not queued (or invalid handle).
+/**
+Summary: Return a torrent's place in the download queue.
+
+pTorrent: The torrent handle.
+
+Returns: The 0-based queue position, or -1 if the torrent is not queued or the handle is bad.
+
+Example:
+put btQueuePosition(tH) into tPos
+if tPos is -1 then put "not queued" into tPos
+
+Description:
+Use <btQueuePosition> to show the queue order. This getter returns -1,
+not 0, for no value, because 0 is the first real position.
+
+References: btQueueUp (handler), btQueueTop (handler), btSetAutoManaged (handler)
+*/
 public handler btQueuePosition(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1273,6 +2286,22 @@ public handler btQueuePosition(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Move a torrent one place up the download queue.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btQueueUp tH
+
+Description:
+Use <btQueueUp> to give a queued torrent a little more priority. The queue
+only matters for auto-managed torrents.
+
+References: btQueueDown (handler), btQueueTop (handler), btQueuePosition (handler)
+*/
 public handler btQueueUp(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1281,6 +2310,22 @@ public handler btQueueUp(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Move a torrent one place down the download queue.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btQueueDown tH
+
+Description:
+Use <btQueueDown> to let other queued torrents go first. The queue only
+matters for auto-managed torrents.
+
+References: btQueueUp (handler), btQueueBottom (handler), btQueuePosition (handler)
+*/
 public handler btQueueDown(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1289,6 +2334,22 @@ public handler btQueueDown(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Move a torrent to the top of the download queue.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btQueueTop tH
+
+Description:
+Use <btQueueTop> to make a torrent the next to run. The queue only matters
+for auto-managed torrents.
+
+References: btQueueBottom (handler), btQueueUp (handler), btQueuePosition (handler)
+*/
 public handler btQueueTop(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1297,6 +2358,22 @@ public handler btQueueTop(in pTorrent as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Move a torrent to the bottom of the download queue.
+
+pTorrent: The torrent handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btQueueBottom tH
+
+Description:
+Use <btQueueBottom> to make a torrent wait for all the others. The queue
+only matters for auto-managed torrents.
+
+References: btQueueTop (handler), btQueueDown (handler), btQueuePosition (handler)
+*/
 public handler btQueueBottom(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1307,6 +2384,25 @@ end handler
 
 -- Request resume data (async; arrives later as a resumeDataReady event whose
 -- "resumeData" key holds the bytes to persist).
+/**
+Summary: Request resume data for a torrent.
+
+pTorrent: The torrent handle.
+
+Returns: 0 if the request was made, or a negative error code.
+
+Example:
+btSaveResumeData tH
+
+Description:
+Use <btSaveResumeData> before quitting or now and then, so the next launch
+can skip hashing again. The data does not come back here: it arrives later
+as a resumeDataReady event whose resumeData key holds the bytes to save,
+or a resumeDataFailed event. Pass the saved bytes to
+<btAddTorrentWithResume>.
+
+References: btAddTorrentWithResume (handler), btPoll (handler)
+*/
 public handler btSaveResumeData(in pTorrent as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1321,6 +2417,30 @@ end handler
 
 -- A status snapshot as an Array (keys: name, state, progress, downloadRate,
 -- totalDone, numPeers, savePath, infoHashV1, ...). Empty array on a bad handle.
+/**
+Summary: Return a snapshot of a torrent's status.
+
+pTorrent: The torrent handle.
+
+Returns: An array of status values, or an empty array on a bad handle.
+
+Example:
+put btTorrentStatus(tH) into tStatus
+put tStatus["name"] && round(tStatus["progress"] * 100) & "%" into field "status"
+
+Description:
+Use <btTorrentStatus> to refresh a dashboard. One call returns every
+value. Keys include name, state, progress (0 to 1), downloadRate,
+uploadRate, totalDone, totalWanted, totalSize, numPeers, numSeeds,
+savePath, infoHashV1, infoHashV2, numPieces, pieceLength, isFinished,
+isSeeding, isPaused, error, eta and flags.
+
+Every value is text; 64-bit totals stay exact that way. Turn state into a
+label with btStateName in the torrentHelpers library. Refresh a few times
+a second at most, not on every pieceFinished event.
+
+References: btPeerList (handler), btFileList (handler), btInfoHash (handler)
+*/
 public handler btTorrentStatus(in pTorrent as Integer) returns Array
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1339,6 +2459,22 @@ public handler btTorrentStatus(in pTorrent as Integer) returns Array
    return _parseRecord(_bufToData(sStatusPtr, tCount), 1)
 end handler
 
+/**
+Summary: Return how many torrents the session holds.
+
+pSession: The session handle.
+
+Returns: The number of torrents.
+
+Example:
+put btTorrentCount(sSession) into tCount
+
+Description:
+Use <btTorrentCount> with <btTorrentHandleAt> to walk every torrent in the
+session.
+
+References: btTorrentHandleAt (handler), btFindTorrent (handler)
+*/
 public handler btTorrentCount(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1347,6 +2483,26 @@ public handler btTorrentCount(in pSession as Integer) returns Integer
    return tR
 end handler
 
+/**
+Summary: Return the handle of the torrent at a position in the session.
+
+pSession: The session handle.
+
+pIndex: The 0-based index.
+
+Returns: The torrent handle, or 0 for an index out of range.
+
+Example:
+repeat with i = 0 to btTorrentCount(sSession) - 1
+   put btTorrentHandleAt(sSession, i) & return after tHandles
+end repeat
+
+Description:
+Use <btTorrentHandleAt> to enumerate the session's torrents, for example
+after re-adding them at startup.
+
+References: btTorrentCount (handler), btFindTorrent (handler)
+*/
 public handler btTorrentHandleAt(in pSession as Integer, in pIndex as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1356,6 +2512,22 @@ public handler btTorrentHandleAt(in pSession as Integer, in pIndex as Integer) r
 end handler
 
 -- The v1 (or, absent v1, v2) info-hash as a hex string.
+/**
+Summary: Return a torrent's info-hash as hex.
+
+pTorrent: The torrent handle.
+
+Returns: The v1 info-hash in lower-case hex (the v2 hash if there is no v1), or empty on a bad handle.
+
+Example:
+put btInfoHash(tH) into tHashHex
+
+Description:
+Use <btInfoHash> to get a stable id for a torrent, for example to store it
+and find the torrent again later with <btFindTorrent>.
+
+References: btFindTorrent (handler), btTorrentStatus (handler)
+*/
 public handler btInfoHash(in pTorrent as Integer) returns String
    variable tCount as Integer
    _ensureScratch(kScratchCap)
@@ -1375,6 +2547,25 @@ public handler btInfoHash(in pTorrent as Integer) returns String
 end handler
 
 -- The packed piece have-bitfield as raw Data (1 bit per piece, MSB first).
+/**
+Summary: Return which pieces of a torrent you have, one bit per piece.
+
+pTorrent: The torrent handle.
+
+Returns: Binary data with one bit per piece, or empty on a bad handle.
+
+Example:
+put btPieceBitfield(tH) into tBits
+put byteToNum(byte 1 of tBits) bitAnd 128 into tHaveFirst
+
+Description:
+Use <btPieceBitfield> to draw a piece map. Bits are packed most
+significant first: the top bit of the first byte is piece 0. Pair it with
+<btPieceAvailability> for a full map. This is a status view, never piece
+content.
+
+References: btPieceAvailability (handler), btTorrentStatus (handler)
+*/
 public handler btPieceBitfield(in pTorrent as Integer) returns Data
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1394,6 +2585,24 @@ public handler btPieceBitfield(in pTorrent as Integer) returns Data
 end handler
 
 -- Connected peers as a List of Arrays (keys: endpoint, client, downRate, ...).
+/**
+Summary: Return a torrent's connected peers.
+
+pTorrent: The torrent handle.
+
+Returns: A list of arrays, one per peer, or an empty list on a bad handle.
+
+Example:
+repeat for each element tPeer in btPeerList(tH)
+   put tPeer["endpoint"] && tPeer["client"] & return after tText
+end repeat
+
+Description:
+Use <btPeerList> to show who you are connected to. Each array has the keys
+endpoint (ip:port), client, downRate, upRate, progress (0 to 1) and flags.
+
+References: btTorrentStatus (handler), btTrackers (handler)
+*/
 public handler btPeerList(in pTorrent as Integer) returns List
    variable tPeers as List
    variable tCount as Integer
@@ -1434,6 +2643,29 @@ end handler
 -- The torrent's files as a List of Arrays (one per file), each with keys
 -- "path", "size", "progress" (bytes downloaded) and "priority" (0..7). Empty
 -- until metadata arrives. One FFI round-trip returns the whole file table.
+/**
+Summary: Return the files of a torrent.
+
+pTorrent: The torrent handle.
+
+Returns: A list of arrays, one per file, or an empty list.
+
+Example:
+repeat for each element tFile in btFileList(tH)
+   put tFile["path"] && tFile["size"] & return after tText
+end repeat
+
+Description:
+Use <btFileList> to show a torrent's files or pick which to download. Each
+array has the keys path (relative to the torrent), size in bytes, progress
+(bytes of that file downloaded) and priority (0 to 7). Files are in the
+order <btSetFilePriority> indexes them, from 0.
+
+The list is empty until the torrent has metadata, so for a magnet it also
+tells you whether metadata has arrived.
+
+References: btSetFilePriority (handler), btSetFilePriorities (handler), btTorrentStatus (handler)
+*/
 public handler btFileList(in pTorrent as Integer) returns List
    variable tFiles as List
    variable tCount as Integer
@@ -1473,6 +2705,24 @@ end handler
 
 -- Per-piece availability: one byte per piece (how many connected peers have
 -- that piece, clamped to 255). Empty data until the torrent has metadata+peers.
+/**
+Summary: Return how many peers have each piece of a torrent.
+
+pTorrent: The torrent handle.
+
+Returns: Binary data with one byte per piece, or empty.
+
+Example:
+put btPieceAvailability(tH) into tAvail
+put byteToNum(byte 1 of tAvail) into tPeersWithFirstPiece
+
+Description:
+Use <btPieceAvailability> to draw a rarity map. Each byte counts the
+connected peers that have that piece, up to 255. It is empty until the
+torrent has metadata and peers. Pair it with <btPieceBitfield>.
+
+References: btPieceBitfield (handler), btPeerList (handler)
+*/
 public handler btPieceAvailability(in pTorrent as Integer) returns Data
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1493,6 +2743,25 @@ end handler
 
 -- The torrent's trackers as a List of Arrays, each with keys "url", "tier",
 -- "verified" (0/1), "source". One FFI round-trip for the whole announce list.
+/**
+Summary: Return a torrent's trackers.
+
+pTorrent: The torrent handle.
+
+Returns: A list of arrays, one per tracker, or an empty list on a bad handle.
+
+Example:
+repeat for each element tTracker in btTrackers(tH)
+   put tTracker["url"] & return after tText
+end repeat
+
+Description:
+Use <btTrackers> to show a torrent's announce list. Each array has the
+keys url, tier (0 is tried first), verified (1 once the tracker has
+answered this session) and source (libtorrent's source bitmask).
+
+References: btAddTracker (handler), btWebSeeds (handler), btScrapeTracker (handler)
+*/
 public handler btTrackers(in pTorrent as Integer) returns List
    variable tTrackers as List
    variable tCount as Integer
@@ -1530,6 +2799,26 @@ public handler btTrackers(in pTorrent as Integer) returns List
 end handler
 
 -- Add an announce URL at the given tier (0 == first tier). Duplicates ignored.
+/**
+Summary: Add a tracker to a torrent.
+
+pTorrent: The torrent handle.
+
+pUrl: The tracker's announce URL.
+
+pTier: The tier, where 0 is tried first.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btAddTracker tH, "udp://tracker.example:6969/announce", 0
+
+Description:
+Use <btAddTracker> to give a torrent another tracker. A URL already in the
+list is ignored.
+
+References: btTrackers (handler), btForceReannounce (handler)
+*/
 public handler btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1539,6 +2828,24 @@ public handler btAddTracker(in pTorrent as Integer, in pUrl as String, in pTier 
 end handler
 
 -- Add / remove an HTTP (URL / web) seed (BEP 19).
+/**
+Summary: Add a web seed to a torrent.
+
+pTorrent: The torrent handle.
+
+pUrl: The URL of the web seed.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btAddWebSeed tH, "https://mirror.example/path/"
+
+Description:
+Use <btAddWebSeed> to add a plain web server that holds the torrent's
+files (BEP 19), so it can serve data alongside peers.
+
+References: btRemoveWebSeed (handler), btWebSeeds (handler)
+*/
 public handler btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1547,6 +2854,24 @@ public handler btAddWebSeed(in pTorrent as Integer, in pUrl as String) returns I
    return tR
 end handler
 
+/**
+Summary: Remove a web seed from a torrent.
+
+pTorrent: The torrent handle.
+
+pUrl: The URL of the web seed.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btRemoveWebSeed tH, "https://mirror.example/path/"
+
+Description:
+Use <btRemoveWebSeed> to drop a web seed added with <btAddWebSeed> or
+listed in the torrent.
+
+References: btAddWebSeed (handler), btWebSeeds (handler)
+*/
 public handler btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1556,6 +2881,24 @@ public handler btRemoveWebSeed(in pTorrent as Integer, in pUrl as String) return
 end handler
 
 -- The torrent's web seeds as a List of URL Strings.
+/**
+Summary: Return a torrent's web seeds.
+
+pTorrent: The torrent handle.
+
+Returns: A list of URL strings, or an empty list on a bad handle.
+
+Example:
+repeat for each element tUrl in btWebSeeds(tH)
+   put tUrl & return after tText
+end repeat
+
+Description:
+Use <btWebSeeds> to list the HTTP seeds of a torrent. Unlike
+<btTrackers>, each element is a plain URL, not an array.
+
+References: btAddWebSeed (handler), btRemoveWebSeed (handler), btTrackers (handler)
+*/
 public handler btWebSeeds(in pTorrent as Integer) returns List
    variable tSeeds as List
    variable tCount as Integer
@@ -1600,6 +2943,35 @@ end handler
 -- of Arrays. Each array has "code" (numeric), "name" (the semantic message),
 -- "torrent" (our handle), plus event-specific keys. The poll dispatcher in
 -- examples/torrent-helpers.livecodescript turns each into a sent message.
+/**
+Summary: Collect every pending event from the session.
+
+pSession: The session handle.
+
+Returns: A list of event arrays, or an empty list when nothing is pending.
+
+Example:
+repeat for each element tEvent in btPoll(sSession)
+   if tEvent["name"] is "torrentFinished" then answer "Done:" && tEvent["torrent"]
+end repeat
+
+Description:
+Use <btPoll> on a timer for as long as the session lives; libtorrent never
+calls back into script. Most apps let btStartPolling in the torrentHelpers
+library do it, which dispatches each event as a message named after it.
+
+Each array has code, name (such as metadataReceived, pieceFinished,
+torrentFinished, torrentError, resumeDataReady or dhtMutableItem), torrent
+(the handle it concerns, when there is one) and the event's own keys. rp1
+events come from <btRp1Poll> instead.
+
+libtorrent's alert queue has a size limit (the alert_queue_size setting).
+If it filled between two drains and alerts were lost, the drain leaves a
+message starting "alerts:" in <btLastError>. Poll more often or raise the
+setting with <btSetInt>.
+
+References: btRp1Poll (handler), btLastError (handler), btStartSession (handler)
+*/
 public handler btPoll(in pSession as Integer) returns List
    variable tEvents as List
    variable tCount as Integer
@@ -1652,6 +3024,27 @@ end handler
 --  Public API: DHT
 -- ===================================================================== --
 
+/**
+Summary: Add a DHT bootstrap node.
+
+pSession: The session handle.
+
+pHost: The host name or address of the node.
+
+pPort: The node's UDP port.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btDhtAddBootstrap sSession, "router.bittorrent.com", 6881
+
+Description:
+Use <btDhtAddBootstrap> to give the DHT a node to start from. Watch the
+nodes count of <btDhtState> climb from 0 as the routing table fills; a
+dhtBootstrap event reports when bootstrapping completes.
+
+References: btDhtState (handler), btDhtLoadState (handler)
+*/
 public handler btDhtAddBootstrap(in pSession as Integer, in pHost as String, in pPort as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1660,6 +3053,28 @@ public handler btDhtAddBootstrap(in pSession as Integer, in pHost as String, in 
    return tR
 end handler
 
+/**
+Summary: Return a snapshot of DHT health.
+
+pSession: The session handle.
+
+Returns: An array with the keys nodes, nodeCache, globalNodes and torrents, or an empty array on a bad handle.
+
+Example:
+put btDhtState(sSession) into tDht
+put "DHT nodes:" && tDht["nodes"] into field "dht"
+
+Description:
+Use <btDhtState> to show whether the DHT is working. nodes is the number
+of nodes in the routing table, nodeCache the cached nodes, globalNodes an
+estimate of the whole DHT's size and torrents the torrents tracked.
+
+The counts come from libtorrent's statistics, which are refreshed once per
+<btPoll>, so keep polling for them to change. A counter a libtorrent build
+does not provide stays 0.
+
+References: btDhtAddBootstrap (handler), btPoll (handler)
+*/
 public handler btDhtState(in pSession as Integer) returns Array
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1673,6 +3088,24 @@ public handler btDhtState(in pSession as Integer) returns Array
 end handler
 
 -- Opaque DHT routing-table state for persistence across runs.
+/**
+Summary: Return the DHT routing table so it can be saved.
+
+pSession: The session handle.
+
+Returns: Binary DHT state, or empty on failure.
+
+Example:
+put btDhtSaveState(sSession) into tDhtState
+if tDhtState is not empty then put tDhtState into url ("binfile:" & tStatePath)
+
+Description:
+Use <btDhtSaveState> before quitting, and pass the bytes to
+<btDhtLoadState> on the next launch so the DHT starts warm instead of
+bootstrapping from scratch. Treat the data as opaque.
+
+References: btDhtLoadState (handler), btDhtAddBootstrap (handler)
+*/
 public handler btDhtSaveState(in pSession as Integer) returns Data
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1691,6 +3124,25 @@ public handler btDhtSaveState(in pSession as Integer) returns Data
    return _bufToData(sStatusPtr, tCount)
 end handler
 
+/**
+Summary: Restore a saved DHT routing table.
+
+pSession: The session handle.
+
+pData: The bytes previously returned by btDhtSaveState.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+put url ("binfile:" & tStatePath) into tDhtState
+btDhtLoadState sSession, tDhtState
+
+Description:
+Use <btDhtLoadState> at startup with the data from <btDhtSaveState>.
+Empty data does nothing and returns 0.
+
+References: btDhtSaveState (handler)
+*/
 public handler btDhtLoadState(in pSession as Integer, in pData as Data) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1711,6 +3163,25 @@ end handler
 -- Generate (pSeed empty) or deterministically re-derive (pSeed = 64-hex seed)
 -- an ed25519 keypair for mutable items. Returns an Array {publicKey, secretKey,
 -- seed} (all hex); persist the seed (or secretKey) to keep a stable identity.
+/**
+Summary: Create or re-derive an ed25519 keypair for mutable DHT items.
+
+pSeed: Empty to make a new keypair, or a 64-hex seed to re-derive one.
+
+Returns: An array with the hex keys publicKey, secretKey and seed, or an empty array on failure.
+
+Example:
+put btDhtKeypair("") into tKey
+put tKey["seed"] into url ("file:" & tSeedPath)
+
+Description:
+Use <btDhtKeypair> to get the key that owns your mutable items. The same
+seed always gives the same keypair, so save the seed (or the secret key)
+to keep one identity across launches. publicKey is 64 hex characters,
+secretKey 128 and seed 64.
+
+References: btDhtPutMutable (handler), btDhtGetMutable (handler)
+*/
 public handler btDhtKeypair(in pSeed as String) returns Array
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1733,6 +3204,30 @@ end handler
 -- shim bencodes it; torrentxt/CLAUDE.md gotcha 7) as an immutable item. Returns its target hash
 -- (the lookup key) as hex, or "" on failure. The store confirms later as a
 -- dhtPut event.
+/**
+Summary: Store an immutable item in the DHT.
+
+pSession: The session handle.
+
+pData: The value, 1 to 996 bytes.
+
+Returns: The item's target hash in hex, or empty on failure.
+
+Example:
+put btDhtPutImmutable(sSession, tBytes) into tTarget
+if tTarget is empty then answer btLastError()
+
+Description:
+Use <btDhtPutImmutable> to publish a small value that never changes
+(BEP 44). The item is addressed by the hash of its value, so anyone with
+the target can fetch it with <btDhtGetImmutable>.
+
+The limit is 996 raw bytes: BEP 44 caps the encoded value at 1000 bytes,
+and the encoding adds up to 4. Empty data returns empty. The store
+confirms later as a dhtPut event.
+
+References: btDhtGetImmutable (handler), btDhtPutMutable (handler)
+*/
 public handler btDhtPutImmutable(in pSession as Integer, in pData as Data) returns String
    variable tCount as Integer
    variable tPtr as Pointer
@@ -1754,6 +3249,25 @@ end handler
 
 -- Look up an immutable item by its 40-hex target. The value arrives as a
 -- dhtImmutableItem event (carrying target + value).
+/**
+Summary: Look up an immutable DHT item by its target.
+
+pSession: The session handle.
+
+pTarget: The 40-hex target returned by btDhtPutImmutable.
+
+Returns: 0 if the lookup started, or a negative error code.
+
+Example:
+btDhtGetImmutable sSession, tTarget
+
+Description:
+Use <btDhtGetImmutable> to fetch a value published with
+<btDhtPutImmutable>. The value arrives later as a dhtImmutableItem event
+with the keys target and value.
+
+References: btDhtPutImmutable (handler), btPoll (handler)
+*/
 public handler btDhtGetImmutable(in pSession as Integer, in pTarget as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1765,6 +3279,36 @@ end handler
 -- Store pData (1..996 bytes, as btDhtPutImmutable) as a mutable item under an ed25519 key; the
 -- native layer signs it with pSecretKey (no script on the network thread).
 -- pSalt may be empty. Confirms as a dhtPut event.
+/**
+Summary: Store a signed, updatable item in the DHT.
+
+pSession: The session handle.
+
+pPublicKey: The 64-hex public key from btDhtKeypair.
+
+pSecretKey: The 128-hex secret key from btDhtKeypair.
+
+pSalt: An optional salt that names one item under the key; empty for none.
+
+pData: The value, 1 to 996 bytes.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+put btDhtKeypair(tSeed) into tKey
+btDhtPutMutable sSession, tKey["publicKey"], tKey["secretKey"], "myapp", tBytes
+
+Description:
+Use <btDhtPutMutable> to publish a value only the keyholder can update
+(BEP 44). The native layer signs it and raises the sequence number, so
+putting again under the same key and salt publishes a new version.
+
+The value limit is 996 raw bytes, as for <btDhtPutImmutable>; empty data
+returns -3. The store confirms later as a dhtPut event. To sign outside
+this library, use <btDhtPutSigned>.
+
+References: btDhtGetMutable (handler), btDhtKeypair (handler), btDhtPutSigned (handler)
+*/
 public handler btDhtPutMutable(in pSession as Integer, in pPublicKey as String, in pSecretKey as String, in pSalt as String, in pData as Data) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1782,6 +3326,27 @@ end handler
 
 -- Look up a mutable item by its 64-hex public key (+ optional salt). The value
 -- arrives as a dhtMutableItem event (value, seq, signature, authoritative).
+/**
+Summary: Look up a mutable DHT item by public key and salt.
+
+pSession: The session handle.
+
+pPublicKey: The owner's 64-hex public key.
+
+pSalt: The salt the item was stored under; empty for none.
+
+Returns: 0 if the lookup started, or a negative error code.
+
+Example:
+btDhtGetMutable sSession, tPublicKey, "myapp"
+
+Description:
+Use <btDhtGetMutable> to fetch a value published with <btDhtPutMutable> or
+<btDhtPutSigned>. It arrives later as a dhtMutableItem event with the keys
+value, seq, signature, salt, publicKey and authoritative.
+
+References: btDhtPutMutable (handler), btDhtPutSigned (handler), btPoll (handler)
+*/
 public handler btDhtGetMutable(in pSession as Integer, in pPublicKey as String, in pSalt as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1798,6 +3363,33 @@ end handler
 -- that must keep its key private (e.g. SodiumXT) can produce a BEP44
 -- signature without any secret key ever crossing into this library. Empty Data
 -- on failure.
+/**
+Summary: Build the exact bytes to sign for a BEP 44 mutable item.
+
+pSalt: The salt; empty for none.
+
+pSeq: The sequence number as decimal text.
+
+pValue: The value, already bencoded.
+
+Returns: The bytes to sign, or empty on failure.
+
+Example:
+put btDhtBep44SignBuf("rp-prekeys", "1", tValue) into tToSign
+-- sign tToSign with your own ed25519 key, then:
+btDhtPutSigned sSession, tPublicKey, "rp-prekeys", "1", tValue, tSignatureHex
+
+Description:
+Use <btDhtBep44SignBuf> when the signing key must stay in another library,
+for example a SodiumXT identity key. Sign the returned bytes with an
+ed25519 detached signature and pass the signature to <btDhtPutSigned>, so
+no secret key ever reaches TorrentXT.
+
+Unlike <btDhtPutMutable>, pValue must already be bencoded, and it may be up
+to 1000 bytes.
+
+References: btDhtPutSigned (handler), btDhtPutMutable (handler)
+*/
 public handler btDhtBep44SignBuf(in pSalt as String, in pSeq as String, in pValue as Data) returns Data
    variable tCount as Integer
    variable tPtr as Pointer
@@ -1827,6 +3419,37 @@ end handler
 -- btDhtBep44SignBuf(pSalt, pSeq, pValue). The native layer VERIFIES the signature
 -- against pPublicKey before storing, so a bad signature returns -3 here instead
 -- of silently vanishing on the network. Confirms as a dhtPut event.
+/**
+Summary: Store a mutable DHT item signed outside this library.
+
+pSession: The session handle.
+
+pPublicKey: The signer's 64-hex ed25519 public key.
+
+pSalt: The salt; empty for none.
+
+pSeq: The sequence number as decimal text.
+
+pValue: The value, already bencoded, exactly as signed.
+
+pSignature: The 128-hex ed25519 signature over the bytes from btDhtBep44SignBuf.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+put btDhtBep44SignBuf("rp-prekeys", "1", tValue) into tToSign
+-- sign tToSign elsewhere, then:
+btDhtPutSigned sSession, tPublicKey, "rp-prekeys", "1", tValue, tSignatureHex
+
+Description:
+Use <btDhtPutSigned> with <btDhtBep44SignBuf> to publish under a key that
+never enters this library. The value is stored as given, so it matches
+what was signed. The signature is checked against the public key first:
+a bad signature returns -3 here instead of vanishing on the network, and
+empty data returns -3 too. The store confirms later as a dhtPut event.
+
+References: btDhtBep44SignBuf (handler), btDhtGetMutable (handler), btDhtPutMutable (handler)
+*/
 public handler btDhtPutSigned(in pSession as Integer, in pPublicKey as String, in pSalt as String, in pSeq as String, in pValue as Data, in pSignature as String) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1850,6 +3473,34 @@ end handler
 -- pPieceSize 0 == auto. pTrackers is an optional newline-separated list of
 -- announce URLs (empty = trackerless / DHT-only). Empty Data on failure (see
 -- btLastError).
+/**
+Summary: Build a .torrent file for a file or folder.
+
+pContentPath: The file or folder to share.
+
+pPieceSize: The piece size in bytes, or 0 to choose automatically.
+
+pFlags: libtorrent create-torrent flags, passed through; 0 for the defaults.
+
+pTrackers: Tracker announce URLs, one per line; empty for a DHT-only torrent.
+
+Returns: The bytes of the .torrent file, or empty on failure.
+
+Example:
+put btCreateTorrent(tFolder, 0, 0, "udp://tr.example:1337/announce") into tTorrent
+if tTorrent is empty then answer btLastError()
+put tTorrent into url ("binfile:" & tOutPath)
+
+Description:
+Use <btCreateTorrent> to share your own content. It hashes the content,
+which can take a while for large files. Each tracker line becomes its own
+tier, in order.
+
+To seed, add the bytes with <btAddTorrentFile>, saving into the folder
+that holds the content.
+
+References: btAddTorrentFile (handler), btInfoHash (handler)
+*/
 public handler btCreateTorrent(in pContentPath as String, in pPieceSize as Integer, in pFlags as Integer, in pTrackers as String) returns Data
    variable tCount as Integer
    _ensureStatus(kStatusCap)
@@ -1875,6 +3526,32 @@ end handler
 -- Add a metadata-less "phantom swarm" from a bare 40-hex info-hash. Returns a
 -- torrent handle (0 on failure). Pair with btDhtAnnounce / btDhtGetPeers on the
 -- same id and the btRp1* calls to meet peers with no server and no content.
+/**
+Summary: Join a swarm from a bare info-hash, with no content.
+
+pSession: The session handle.
+
+pInfoHash: The swarm id, as 40 hex characters.
+
+pSavePath: A folder for the torrent; nothing is downloaded into it.
+
+Returns: A positive torrent handle, or 0 on failure.
+
+Example:
+put btAddInfohash(sSession, tRendezvousHex, tSavePath) into tH
+btDhtAnnounce sSession, tRendezvousHex, 0
+
+Description:
+Use <btAddInfohash> to make a meeting point for peers. libtorrent joins
+the swarm and completes the BitTorrent handshake with peers, but never
+fetches metadata, so there is nothing to download.
+
+Pair it with <btDhtAnnounce> and <btDhtGetPeers> on the same id, and with
+the rp1 calls (<btRp1Enable> first), for contact between peers with no
+tracker, server or content.
+
+References: btRp1Enable (handler), btDhtAnnounce (handler), btDhtGetPeers (handler)
+*/
 public handler btAddInfohash(in pSession as Integer, in pInfoHash as String, in pSavePath as String) returns Integer
    variable tR as Integer
    unsafe
@@ -1885,6 +3562,25 @@ end handler
 
 -- Turn on the rp1 extension for this session (idempotent). Call it before adding
 -- the swarms it should apply to. Returns 0 / negative.
+/**
+Summary: Turn on the rp1 peer-wire extension for the session.
+
+pSession: The session handle.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btRp1Enable sSession
+put btAddInfohash(sSession, tRendezvousHex, tSavePath) into tH
+
+Description:
+Use <btRp1Enable> before adding the swarms rp1 should apply to. It then
+advertises rp1 on every torrent in the session. rp1 is a custom BEP 10
+extension that carries opaque bytes between peers; it is off until this
+call, and calling it again does nothing.
+
+References: btRp1Send (handler), btRp1Poll (handler), btRp1SetToken (handler)
+*/
 public handler btRp1Enable(in pSession as Integer) returns Integer
    variable tR as Integer
    unsafe
@@ -1896,6 +3592,26 @@ end handler
 -- Publish an opaque blob in our extended-handshake "rp1_tok" field (e.g. a signed
 -- recognition token); empty Data clears it. Sent on handshakes made after this
 -- call. Returns 0 / negative (needs rp1 enabled).
+/**
+Summary: Set the token sent to peers in the rp1 handshake.
+
+pSession: The session handle.
+
+pToken: The token bytes; empty to clear it.
+
+Returns: 0 on success, or a negative error code.
+
+Example:
+btRp1SetToken sSession, tSignedToken
+
+Description:
+Use <btRp1SetToken> to tell peers who you are, for example with a signed
+recognition token. It goes out in the rp1_tok field of handshakes made
+after this call. A peer's own token appears as the token key of its
+rp1Handshake event. rp1 must be enabled with <btRp1Enable>.
+
+References: btRp1Enable (handler), btRp1Poll (handler)
+*/
 public handler btRp1SetToken(in pSession as Integer, in pToken as Data) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1911,6 +3627,31 @@ end handler
 -- Queue one rp1 message of opaque bytes to a peer (from an rp1 event). It is sent
 -- on libtorrent's next tick for that peer. Fails (-3) if the peer is unknown,
 -- gone, or has not completed an rp1 handshake. Returns 0 / negative.
+/**
+Summary: Send one rp1 message to a peer.
+
+pSession: The session handle.
+
+pPeer: The peer id from an rp1 event.
+
+pData: The message bytes, up to 60000.
+
+Returns: 0 if the message was queued, or a negative error code.
+
+Example:
+if tEvent["supportsRp1"] is "1" then btRp1Send sSession, tEvent["peer"], tHelloBytes
+
+Description:
+Use <btRp1Send> to send opaque bytes to a peer; TorrentXT does not frame
+or read them. The message goes out on libtorrent's next tick for that
+peer, within about a second. In the example, tEvent is an rp1Handshake
+event array.
+
+It fails with -3 if the peer is unknown, gone or has not finished the rp1
+handshake yet, or if the data is empty.
+
+References: btRp1Poll (handler), btRp1Enable (handler)
+*/
 public handler btRp1Send(in pSession as Integer, in pPeer as Integer, in pData as Data) returns Integer
    variable tR as Integer
    variable tPtr as Pointer
@@ -1929,6 +3670,31 @@ end handler
 -- Drain queued rp1 events (peer up/down, handshake, message). Returns a List of
 -- event Arrays in the SAME shape as btPoll (each with a "name", "code", "peer",
 -- and event-specific keys). Reuses the shared drain buffer.
+/**
+Summary: Collect pending rp1 events from the session.
+
+pSession: The session handle.
+
+Returns: A list of event arrays, or an empty list when nothing is pending.
+
+Example:
+repeat for each element tEvent in btRp1Poll(sSession)
+   if tEvent["name"] is "rp1Message" then handleMessage tEvent["peer"], tEvent["payload"]
+end repeat
+
+Description:
+Use <btRp1Poll> on every poll tick alongside <btPoll>; btStartPolling in
+the torrentHelpers library does both. The arrays have the same shape as
+btPoll's: name, code, peer, infoHashV1 and the event's own keys. The names
+are rp1PeerConnected, rp1Handshake (btPeerId, endpoint, supportsRp1,
+token), rp1Message (payload) and rp1PeerDisconnected.
+
+Each call drains at most 64 KiB. The inbound queue is limited too; when it
+overflows, the newest events are dropped and the next drain leaves a
+message starting "rp1:" in <btLastError>.
+
+References: btPoll (handler), btRp1Send (handler), btRp1Enable (handler)
+*/
 public handler btRp1Poll(in pSession as Integer) returns List
    variable tEvents as List
    variable tCount as Integer
