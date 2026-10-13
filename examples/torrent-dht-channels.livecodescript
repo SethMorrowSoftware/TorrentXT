@@ -1521,10 +1521,10 @@ oxPublishService 80, 8090
 put the result into tService
 
 Description:
-Unlike <oxCreateService>, OnionXT starts no listener and no peer callback
-fires: the external server owns the port. The result is a service handle,
-and the address arrives as for <oxCreateService>. <oxRemoveService>
-unpublishes it and leaves your server's socket alone.
+Unlike <oxCreateService>, OnionXT starts no listener and no peer
+callback fires: the external server owns the port. The result is a
+service handle, and the address arrives as for <oxCreateService>.
+<oxRemoveService> unpublishes it and leaves your server's socket alone.
 
 Your server must refuse any peer that is not 127.0.0.1 itself, because a
 listening port may be reachable from the local network, bypassing Tor.
@@ -2461,9 +2461,9 @@ onionxt-torrc into pDataDir (cookie authentication, tor's log to
 onionxt-tor.log there, tied to this process) and starts tor with it. Only
 after the launch is accepted are the SOCKS and control ports pointed at it.
 
-The result is empty or an "OnionXT: ..." reason. Empty does not mean tor is
-up: it does not wait for bootstrap, so connect with <oxConnectControl> and
-watch <oxBootstrapProgress>.
+The result is empty or an "OnionXT: ..." reason. Empty does not mean tor
+is up: it does not wait for bootstrap, so connect with <oxConnectControl>
+and watch <oxBootstrapProgress>.
 
 References: oxStopTor (handler), oxConnectControl (handler)
 */
