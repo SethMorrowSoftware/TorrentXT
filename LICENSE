@@ -23,6 +23,8 @@ SOFTWARE.
 ---
 
 TorrentXT statically links libtorrent-rasterbar (BSD-3-Clause) and Boost
-(Boost Software License 1.0) into its committed per-platform binaries. Their
+(Boost Software License 1.0) into its committed per-platform binaries, and
+OpenSSL 3 (Apache License 2.0) into the Windows, 64-bit Linux and macOS ones
+(OpenSSL-LICENSE.txt alongside this file). Their
 full license texts are reproduced in THIRD-PARTY-LICENSES.md alongside this
 file, as those licenses require for binary distribution.

@@ -10,6 +10,9 @@ for binary distribution.
   Boost Software License 1.0 text, puff.c, an ed25519 implementation,
   public-domain SHA-1/SHA-256, and a BSD route.h)
 - Boost (Boost Software License 1.0; text reproduced in its own section)
+- OpenSSL 3 (Apache License 2.0), statically linked into the Windows,
+  64-bit Linux and macOS libraries; the 32-bit Linux library uses the
+  system's OpenSSL (`libssl.so.3`) and bundles none. OpenSSL is Copyright (c) 1998-2025 The OpenSSL Project Authors and Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson, and is licensed under the Apache License 2.0, whose text (OpenSSL's own LICENSE.txt, unchanged) is in OpenSSL-LICENSE.txt alongside this file (the Apache License asks for it to go with the binaries).
 
 -------------------------------------------------------------------------------
 ## libtorrent-rasterbar
