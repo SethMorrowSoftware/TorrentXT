@@ -68,6 +68,14 @@ PLATFORM_SUFFIX = {
     "x86_64-win32": ".dll",
     "x86-win32": ".dll",
     "universal-mac": ".dylib",
+    # Android (2026-11-18): built and placed by the suite's
+    # tools/build-android.sh, which strips with the NDK's llvm-strip (this
+    # host's strip does not read an ARM library, so on the --lib path here
+    # an Android library is copied as given).
+    "arm64-android": ".so",
+    "armv7-android": ".so",
+    "x86_64-android": ".so",
+    "x86-android": ".so",
 }
 VALID_PLATFORM_IDS = sorted(PLATFORM_SUFFIX)
 

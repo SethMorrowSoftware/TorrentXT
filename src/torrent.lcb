@@ -65,6 +65,13 @@ metadata version is "0.1.0"
 metadata author is "Seth Morrow Software"
 metadata title is "TorrentXT"
 
+-- Android gives a process no socket without the INTERNET permission. OXT's
+-- standalone builder reads this key from every extension an app includes
+-- and writes the permission into the app's manifest, so including this
+-- library is enough; no other platform reads it. Added 2026-11-18;
+-- verified statically; needs an OXT pass on Android.
+metadata android.permissions is "INTERNET"
+
 -- ===================================================================== --
 --  Constants
 -- ===================================================================== --

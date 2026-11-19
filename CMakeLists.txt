@@ -449,7 +449,14 @@ if(TORRENTXT_BUILD_TESTS)
         add_executable(record_handle_test "${_rht_src}")
         target_include_directories(record_handle_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_link_libraries(record_handle_test PRIVATE torrentxt_flags)
-        if(NOT MSVC AND NOT TORRENTXT_SANITIZE)
+        # Not on Android either: the NDK HAS the runtime, so the question below
+        # would answer yes, but there it is a shared library
+        # (libclang_rt.asan-<arch>-android.so) that has to be on the device beside
+        # the test. The Android lane pushes one executable and runs it; a test that
+        # cannot start for a missing runtime would be a red lane that says nothing
+        # about the codec. The sanitized gate stays where it is enforced (the gcc
+        # ASan/UBSan lane of native-torrentxt.yml); Android runs the same test plain.
+        if(NOT MSVC AND NOT ANDROID AND NOT TORRENTXT_SANITIZE)
             # Turn the sanitizers on for just this executable when the global knob
             # is off, so `-DTORRENTXT_BUILD_TESTS=ON` alone still sanitizes the
             # header-only gate (its declared contract in the source banner).

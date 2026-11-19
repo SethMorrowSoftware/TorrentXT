@@ -60,6 +60,14 @@ Every torrentxt harness figure with a recorded platform came from Windows (see
 [Status](#status)).
 [docs/building.md](docs/building.md) has the floors and how each binary is built.
 
+**Android (2026-11-18).** `src/code/` also carries this library for `arm64-android`,
+`armv7-android`, `x86_64-android` and `x86-android` (Android 5.0, API 21, and up), built by the
+suite's `tools/build-android.sh` and landed by its `release-binaries.yml` dispatch. Its native
+tests ran on an Android 5.0 emulator for the two x86 ids; the two ARM libraries are built and
+statically checked, not run, and no OXT engine on Android has loaded any of the four: verified
+statically; needs an OXT pass on Android. The `.lcb` declares Android's INTERNET permission, which
+OXT-Beyond's standalone builder adds to an app that includes this extension.
+
 ## Install
 
 Install the packaged extension in the OpenXTalk IDE like any other. Your stack then sees

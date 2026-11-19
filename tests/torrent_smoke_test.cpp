@@ -82,6 +82,17 @@
 
 static int g_fail = 0;
 static int g_checks = 0;
+
+/* The folder the tests NAME as a save path. Nothing here downloads into it
+ * (a magnet with no peers never opens a file), but libtorrent keeps the path,
+ * so it should at least be a folder that exists: /tmp, except on Android,
+ * which has none. /data/local/tmp is the one folder the shell user, which is
+ * who runs these tests on a device (tools/android-run.sh), may write to. */
+#ifdef __ANDROID__
+#define TEST_SAVE_DIR "/data/local/tmp"
+#else
+#define TEST_SAVE_DIR "/tmp"
+#endif
 #define CHECK(cond)                                                            \
     do {                                                                       \
         ++g_checks;                                                            \
@@ -240,16 +251,16 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_set_piece_deadline(h, 0, 5000) < 0);
         CHECK(btx_clear_piece_deadlines(h) < 0);
         CHECK(btx_add_magnet_ex(h, "magnet:?xt=urn:btih:"
-              "0123456789abcdef0123456789abcdef01234567", "/tmp", "16", "16") == 0);
+              "0123456789abcdef0123456789abcdef01234567", TEST_SAVE_DIR, "16", "16") == 0);
         const unsigned char d8[4] = {'d', '3', ':', 'e'};
-        CHECK(btx_add_torrent_file_ex(h, d8, sizeof d8, "/tmp", "16", "16") == 0);
+        CHECK(btx_add_torrent_file_ex(h, d8, sizeof d8, TEST_SAVE_DIR, "16", "16") == 0);
 
         /* add-* on a bogus session return 0 (no handle made), not a crash. */
         CHECK(btx_add_magnet(h, "magnet:?xt=urn:btih:"
-              "0123456789abcdef0123456789abcdef01234567", "/tmp") == 0);
+              "0123456789abcdef0123456789abcdef01234567", TEST_SAVE_DIR) == 0);
         const unsigned char dummy[4] = {'d', '3', ':', 'e'};
-        CHECK(btx_add_torrent_file(h, dummy, sizeof dummy, "/tmp") == 0);
-        CHECK(btx_add_with_resume(h, dummy, sizeof dummy, "/tmp") == 0);
+        CHECK(btx_add_torrent_file(h, dummy, sizeof dummy, TEST_SAVE_DIR) == 0);
+        CHECK(btx_add_with_resume(h, dummy, sizeof dummy, TEST_SAVE_DIR) == 0);
 
         /* enumeration getters on a bogus session -> 0/empty. */
         CHECK(btx_torrent_count(h) == 0);
@@ -288,7 +299,7 @@ static void test_bogus_handles_are_noops() {
         CHECK(btx_set_max_uploads(h, 4) < 0);
         CHECK(btx_torrent_clear_error(h) < 0);
         CHECK(btx_scrape_tracker(h) < 0);
-        CHECK(btx_move_storage(h, "/tmp") < 0);
+        CHECK(btx_move_storage(h, TEST_SAVE_DIR) < 0);
         CHECK(btx_queue_move(h, 2) < 0);
         /* btx_queue_position is the lone int-getter that returns -1 (not 0) for a
          * bad handle, because 0 is a valid position. */
@@ -344,7 +355,7 @@ static void test_malformed_torrent_buffer() {
     /* (a) Outright garbage — not bencode at all. */
     const unsigned char junk[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02};
     btx_clear_error();
-    CHECK(btx_add_torrent_file(s, junk, sizeof junk, "/tmp") == 0);
+    CHECK(btx_add_torrent_file(s, junk, sizeof junk, TEST_SAVE_DIR) == 0);
     CHECK(!read_last_error().empty());      /* a diagnostic was set            */
 
     /* (b) Valid bencode but NOT a valid torrent dict (no info section). This is
@@ -353,21 +364,21 @@ static void test_malformed_torrent_buffer() {
     const char notATorrent[] = "d4:spam4:eggse";   /* {"spam":"eggs"} */
     btx_clear_error();
     CHECK(btx_add_torrent_file(s, notATorrent,
-                               static_cast<int>(std::strlen(notATorrent)), "/tmp") == 0);
+                               static_cast<int>(std::strlen(notATorrent)), TEST_SAVE_DIR) == 0);
     CHECK(!read_last_error().empty());
 
     /* (c) Empty / null buffers are invalid-arg, not crashes. */
-    CHECK(btx_add_torrent_file(s, nullptr, 0, "/tmp") == 0);
-    CHECK(btx_add_torrent_file(s, junk, 0, "/tmp") == 0);
+    CHECK(btx_add_torrent_file(s, nullptr, 0, TEST_SAVE_DIR) == 0);
+    CHECK(btx_add_torrent_file(s, junk, 0, TEST_SAVE_DIR) == 0);
 
     /* (d) Malformed RESUME data likewise fails cleanly. */
     btx_clear_error();
-    CHECK(btx_add_with_resume(s, junk, sizeof junk, "/tmp") == 0);
+    CHECK(btx_add_with_resume(s, junk, sizeof junk, TEST_SAVE_DIR) == 0);
     CHECK(!read_last_error().empty());
 
     /* (e) A malformed magnet URI fails cleanly (no torrent, last-error set). */
     btx_clear_error();
-    CHECK(btx_add_magnet(s, "magnet:?this-is-not-valid", "/tmp") == 0);
+    CHECK(btx_add_magnet(s, "magnet:?this-is-not-valid", TEST_SAVE_DIR) == 0);
     CHECK(!read_last_error().empty());
 
     btx_session_free(s);
@@ -410,7 +421,7 @@ static void test_alert_drain_roundtrip() {
      * effects we care about; we never let it actually download to completion. */
     int t = btx_add_magnet(
         s, "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-           "&dn=smoke-test", "/tmp");
+           "&dn=smoke-test", TEST_SAVE_DIR);
     /* The add itself should succeed and give us a positive id (parsing a magnet
      * does not need the network). */
     CHECK(t > 0);
@@ -880,7 +891,7 @@ static void test_alerts_dropped_report() {
         /* .invalid (RFC 2606) so no row here announces to a real tracker. */
         const std::string mag = std::string("magnet:?xt=urn:btih:") + ih
                               + "&tr=udp://tracker.invalid:1337/announce";
-        int t = btx_add_magnet(s, mag.c_str(), "/tmp");
+        int t = btx_add_magnet(s, mag.c_str(), TEST_SAVE_DIR);
         CHECK(t > 0);
         if (t > 0) ids.push_back(t);
     }
@@ -958,12 +969,12 @@ static void test_pre_model_c_btxtor1_magnet() {
 
     btx_clear_error();
     CHECK(btx_add_magnet(s, ("magnet:?xt=urn:btih:" + code64 + tr).c_str(),
-                         "/tmp") == 0);
+                         TEST_SAVE_DIR) == 0);
     CHECK(read_last_error().find("bad magnet URI") != std::string::npos);
 
     btx_clear_error();
     int t = btx_add_magnet(s, ("magnet:?xt=urn:btih:" + code40 + tr).c_str(),
-                           "/tmp");
+                           TEST_SAVE_DIR);
 #if LIBTORRENT_VERSION_NUM >= 20100
     CHECK(t == 0);
     CHECK(read_last_error().find("bad magnet URI") != std::string::npos);
