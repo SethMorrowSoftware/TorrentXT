@@ -62,11 +62,16 @@ Every torrentxt harness figure with a recorded platform came from Windows (see
 
 **Android (2026-11-18).** `src/code/` also carries this library for `arm64-android`,
 `armv7-android`, `x86_64-android` and `x86-android` (Android 5.0, API 21, and up), built by the
-suite's `tools/build-android.sh` and landed by its `release-binaries.yml` dispatch. Its native
-tests ran on an Android 5.0 emulator for the two x86 ids; the two ARM libraries are built and
-statically checked, not run, and no OXT engine on Android has loaded any of the four: verified
-statically; needs an OXT pass on Android. The `.lcb` declares Android's INTERNET permission, which
-OXT-Beyond's standalone builder adds to an app that includes this extension.
+suite's `tools/build-android.sh` and landed by its `release-binaries.yml` dispatch. Its native tests
+ran on an Android 5.0 emulator for the two x86 ids; the two ARM libraries are built and statically
+checked, not run. An OXT engine on Android first loaded this library on 2026-11-19: an app
+OXT-Beyond's CI built with the suite's extensions ran on x86_64 emulators (Android 13, and Android
+16 with 16 KB pages), where `btLastError()` answered (empty, as it should with no session). That is
+one call on the `x86_64-android` library; this member's selftest has not run on an Android engine,
+and no engine has loaded the `x86-android` or the ARM libraries: needs an OXT pass on Android. The
+`.lcb` declares Android's INTERNET permission, which OXT-Beyond's standalone builder adds to an app
+that includes this extension (observed in that app: it held INTERNET with no permission of its own
+chosen).
 
 ## Install
 
