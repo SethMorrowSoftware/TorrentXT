@@ -3246,6 +3246,11 @@ command uiChrome pTitle, pWidth, pHeight, pBandH
    end if
    set the width of this stack to pWidth
    set the height of this stack to pHeight
+   -- The page ground has NO text colour, on purpose: every control on the
+   -- card inherits one, and a native push button's face is the theme's -
+   -- dark in the dark appearance - so kUiInk here would put dark words on
+   -- it. Each builder below that puts words on a colour of the kit's sets
+   -- their colour itself (tools/check-ui-kit-text-colour.py holds that).
    set the backgroundColor of this card to kUiBg
    set the title of this stack to pTitle
    uiGfx "uiBand", "0,0," & pWidth & "," & pBandH
