@@ -20,7 +20,8 @@ equals `kABIVersion` in `src/torrent.lcb`).
 - `src/` - shim, binding, the header-only contracts (`btx_abi.h`, `btx_record.h`,
   `btx_handle_table.h`), `torrentxt.map` (version script), `code/` (libraries + `MANIFEST.sha256`).
 - `tests/` - ctest (`record_handle_test.cpp`, `torrent_smoke_test.cpp`,
-  `rp1_integration_test.cpp`), the `*golden*.py` suites, and the engine harness
+  `rp1_integration_test.cpp`, and on Linux `netlink_refused_preload.c`, the fixture gotcha 8
+  describes), the `*golden*.py` suites, and the engine harness
   `torrent-selftest.livecodescript` (folded into the suite paste).
 - `examples/` - the helper plus four demos: quickshare, client, dht-channels, rp1-chat.
 - `tools/` - `run-gates.sh`, `check-livecodescript.py`, `check-record-registry.py`,
@@ -160,6 +161,24 @@ C++ engine (the shim cites these by number):
    at the boundaries since 2026-09-24 (the old row refused only 1001, which the pre-fix cap
    refused too): 996 in / 997 out in the smoke test and the script harness, 1000 in / 1001
    out for the two already-bencoded paths.
+8. **On Android this library is built for API 24, and a lower level is the defect (2026-11-21).**
+   libtorrent decides at compile time how it learns the device's addresses: below API 24 over a
+   NETLINK_ROUTE socket (the Linux path), from API 24 with `getifaddrs()`. Android 11 and later
+   refuse an app that socket, the refusal is an exception inside the session's own start-up,
+   and libtorrent answers that by PAUSING THE SESSION, with no error this binding surfaces: a
+   torrent sits in "checking files" at progress 0 (observed in OXT-Beyond's app on Android 13
+   and 16 emulators with the API 21 library, where `btSessionIsPaused` answered true on a new
+   session; reproduced on Linux by refusing the same calls). The
+   suite's `tools/build-android.sh` builds this member alone for API 24 and its installer
+   refuses any other level. The smoke test's last row (`test_local_torrent_seeds`: a new
+   session is not paused, listens on "every address", checks a local file to seeding) is what
+   holds the symptom on every platform, and on Linux ctest runs that row a second time under
+   `tests/netlink_refused_preload.c` (`torrent_smoke_netlink_refused`) and requires it to
+   fail on exactly its four checks. Do not "fix" that test by making the row pass under the
+   preload: a Linux build is supposed to fail there. The suite's emulator cannot see the cause
+   (its tests run as the shell user, and the rule is for apps); OXT-Beyond's Android workflow
+   can. The committed Android libraries are the API 24 builds since 2026-11-21 (suite commit
+   d47060f), tested on an Android 7.0 emulator and not yet run in an app.
 
 **FOUND 2026-09-24: libtorrent 2.0.x accepts a non-hex 40-character btih.** Its
 `magnet_uri.cpp` ignores `from_hex`'s result for a 40-character `urn:btih:` (2.0.10, 2.0.11;
@@ -353,7 +372,7 @@ is tracked in the suite's docs/WORK-PLAN.md.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTORRENTXT_BUILD_TESTS=ON
 cmake --build build --config Release
-ctest --test-dir build --output-on-failure   # record_handle_test, torrent_smoke_test, rp1_integration_test, rp1_queue_test
+ctest --test-dir build --output-on-failure   # record_handle_test, torrent_smoke_test, rp1_integration_test, rp1_queue_test (Linux: + torrent_smoke_netlink_refused)
 bash tools/run-gates.sh                      # checker, tests/*golden*.py, the Model C execution gate, record registry, MANIFEST
 g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \
   -isystem <libtorrent-include> -isystem <boost-include> \

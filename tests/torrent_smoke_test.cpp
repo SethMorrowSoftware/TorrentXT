@@ -53,6 +53,16 @@
  *   8. test_pre_model_c_btxtor1_magnet: the native half of the Model C
  *      register #17 (a pre-Model-C QuickShare fed a BTXTOR1: code).
  *
+ * Added 2026-11-21, after a torrent of a local file never left "checking"
+ * inside an app on Android 13 while every row above was green on the Android
+ * 5.0 emulator:
+ *
+ *   9. test_local_torrent_seeds: what every one of those rows took for
+ *      granted. A new session is NOT paused, "listen on every address" finds
+ *      an address, and a torrent of a file we hold is checked to seeding with
+ *      no network. Rows 1 to 8 are about the binding's safety; this one asks
+ *      whether the library under it is running at all.
+ *
  * The third fix, the bounded rp1 inbound queue, is not reachable through the
  * public ABI without a peer flooding a live session, so it has its own test,
  * tests/rp1_queue_test.cpp, which compiles the shim source into itself.
@@ -1062,6 +1072,135 @@ static void test_port_mapping() {
     btx_session_free(s);
 }
 
+/* =========================================================================
+ *  9. A session that works: not paused at birth, listening, and able to check
+ *     a local file to seeding (2026-11-21)
+ *
+ *  WHY THIS ROW EXISTS. On 2026-11-21 OXT-Beyond's Android app, on an Android
+ *  13 emulator, added a torrent of a file it had just written and waited: the
+ *  torrent stayed in "checking files" at progress 0 with no error, on a
+ *  library that had passed every row above on the suite's own emulator. As
+ *  read in libtorrent 2.0.11: built for an Android below API 24 it watches the
+ *  machine's addresses over a NETLINK_ROUTE socket, Android 11 and later
+ *  refuse an app that socket, the refusal is an exception inside the
+ *  session's own start-up, and libtorrent answers an exception there by
+ *  PAUSING THE SESSION. A paused session starts no torrent, auto-managed or
+ *  not, and says so nowhere this binding surfaced. The same Android refuses
+ *  the question "which interfaces are there", so the default "listen on
+ *  0.0.0.0" expanded to no socket at all. (The fix is the Android level the
+ *  library is built for: tools/build-android.sh, TORRENTXT_ANDROID_API.)
+ *
+ *  WHAT THIS ROW CAN AND CANNOT SEE. It asserts the three things that were
+ *  false in that app, through the public ABI, so a session that is born
+ *  paused or deaf fails here on ANY platform, whatever the cause. It cannot
+ *  reproduce that cause on the suite's emulator: the test runs there as the
+ *  shell user (tools/android-run.sh), and the refusal is Android's rule for
+ *  an APP. The run that has an app is OXT-Beyond's own (its Android workflow
+ *  drives this library from inside one, on Android 13 and 16); this row is
+ *  what turns the next cause of the same symptom into a red test here.
+ * ========================================================================= */
+static void test_local_torrent_seeds() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path dir = fs::temp_directory_path() / "torrentxt_smoke_seed";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    fs::path file = dir / "data.bin";
+    {
+        /* Not one repeated byte: thirteen pieces that all hash alike would
+         * let a checker that read one piece thirteen times pass. */
+        std::ofstream f(file.string().c_str(), std::ios::binary);
+        std::vector<char> data(200000);
+        for (size_t i = 0; i < data.size(); ++i)
+            data[i] = static_cast<char>((i * 2654435761u) >> 24);
+        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+
+    int s = btx_session_new();
+    CHECK(s > 0);
+
+    /* Nothing below needs a network, so nothing below may wait on one: no
+     * DHT, no local discovery, no router. Port 0 is "any free port", so a
+     * machine where 6881 is taken does not fail a row about something else;
+     * the ADDRESS stays the unspecified one, because finding the machine's
+     * addresses behind it is one of the three things under test. */
+    CHECK(btx_set_bool(s, "enable_dht", 0) == BTX_OK);
+    CHECK(btx_set_bool(s, "enable_lsd", 0) == BTX_OK);
+    CHECK(btx_set_bool(s, "enable_upnp", 0) == BTX_OK);
+    CHECK(btx_set_bool(s, "enable_natpmp", 0) == BTX_OK);
+    CHECK(btx_set_str(s, "listen_interfaces", "0.0.0.0:0") == BTX_OK);
+
+    /* 1. Not paused at birth. is_paused() is answered on the session's own
+     * thread, after the start-up work queued before it, so this reads the
+     * state that start-up left and not a moment before it. */
+    CHECK(btx_session_is_paused(s) == 0);
+
+    std::vector<char> tbuf(65536);
+    int n = btx_create_torrent(file.string().c_str(), 16384, 0, "",
+                               tbuf.data(), static_cast<int>(tbuf.size()));
+    if (n < 0) {
+        tbuf.resize(static_cast<size_t>(-n));
+        n = btx_create_torrent(file.string().c_str(), 16384, 0, "",
+                               tbuf.data(), static_cast<int>(tbuf.size()));
+    }
+    CHECK(n > 0);
+    int t = btx_add_torrent_file(s, tbuf.data(), n, dir.string().c_str());
+    CHECK(t > 0);
+
+    /* 2. Checked to seeding. Bounded at 60 s: 200 kB hashes in milliseconds
+     * on anything, and a sanitizer build on a loaded emulator is still far
+     * inside it, so a run that reaches the bound is a torrent that is not
+     * being started, which is the failure. The alerts are drained as an app
+     * would drain them (an undrained queue is not what is under test). */
+    unsigned char status[4096];
+    std::vector<unsigned char> alerts(65536);
+    bool seeding = false;
+    int port = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline) {
+        int got = btx_pop_alerts(s, alerts.data(), static_cast<int>(alerts.size()));
+        if (got < 0) alerts.resize(static_cast<size_t>(-got));
+        int len = btx_torrent_status(t, status, static_cast<int>(sizeof status));
+        seeding = len > 0 && field_text(status, len, btx::F_IS_SEEDING) == "1";
+        port = btx_listen_port(s);
+        if (seeding && port > 0) break;
+        /* A paused session starts nothing, so waiting out the minute would
+         * only delay the same failure (and the fixture that provokes it,
+         * tests/netlink_refused_preload.c, would cost a minute a run). */
+        if (btx_session_is_paused(s) == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(seeding);
+    if (!seeding) {
+        /* The one failure here that is worth more than its line number: say
+         * what the torrent and the session were instead. */
+        int len = btx_torrent_status(t, status, static_cast<int>(sizeof status));
+        std::printf("   not seeding: state %s, progress %s, torrent paused %s, "
+                    "error \"%s\", session paused %d, last error \"%s\"\n",
+                    field_text(status, len, btx::F_STATE).c_str(),
+                    field_text(status, len, btx::F_PROGRESS).c_str(),
+                    field_text(status, len, btx::F_IS_PAUSED).c_str(),
+                    field_text(status, len, btx::F_ERROR).c_str(),
+                    btx_session_is_paused(s), read_last_error().c_str());
+    }
+
+    /* 3. Listening: "every address" found at least one. And still not
+     * paused, now that the session has done real work. */
+    CHECK(port > 0);
+    CHECK(btx_session_is_paused(s) == 0);
+
+    /* The getter itself, both ways, so "0" above is a session that is not
+     * paused and never a getter that cannot say 1. */
+    CHECK(btx_session_pause(s) == BTX_OK);
+    CHECK(btx_session_is_paused(s) == 1);
+    CHECK(btx_session_resume(s) == BTX_OK);
+    CHECK(btx_session_is_paused(s) == 0);
+
+    btx_remove(s, t, 0);
+    btx_session_free(s);
+    fs::remove_all(dir, ec);
+}
+
 /* Announce each section BEFORE running it, on an UNBUFFERED stdout.
  *
  * WHY, and it cost a CI round to learn. This file can be killed by an abort it
@@ -1080,11 +1219,31 @@ static void test_port_mapping() {
  * is a failure whose only information is that it happened. */
 #define RUN(fn)                                                                \
     do {                                                                       \
-        std::printf("-- %s\n", #fn);                                           \
-        fn();                                                                  \
+        if (wanted(#fn)) {                                                     \
+            std::printf("-- %s\n", #fn);                                       \
+            ++g_ran;                                                           \
+            fn();                                                              \
+        }                                                                      \
     } while (0)
 
-int main() {
+/* With no argument every section runs, which is the test. With arguments,
+ * only the sections named run: the netlink fixture (CMake's
+ * torrent_smoke_netlink_refused) runs ONE row under a library that makes it
+ * fail, and must not have to read past the rows that rightly still pass. A
+ * name that matches no section is an error, never a green run of nothing. */
+static int g_argc = 0;
+static char **g_argv = nullptr;
+static int g_ran = 0;
+static bool wanted(const char *name) {
+    if (g_argc <= 1) return true;
+    for (int i = 1; i < g_argc; ++i)
+        if (std::strcmp(g_argv[i], name) == 0) return true;
+    return false;
+}
+
+int main(int argc, char **argv) {
+    g_argc = argc;
+    g_argv = argv;
     /* Unbuffered, not line-buffered: an abort discards a partial line too, and
      * the section banner is exactly the partial line that matters. */
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1103,7 +1262,13 @@ int main() {
     RUN(test_pre_model_c_btxtor1_magnet);
     RUN(test_rp1);
     RUN(test_port_mapping);
+    RUN(test_local_torrent_seeds);
 
+    if (g_ran != (argc > 1 ? argc - 1 : g_ran) || g_ran == 0) {
+        std::printf("FAIL %d section(s) named, %d run: a name matched no section\n",
+                    argc - 1, g_ran);
+        return 2;
+    }
     std::printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

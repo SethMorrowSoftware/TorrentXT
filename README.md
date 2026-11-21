@@ -61,17 +61,34 @@ Every torrentxt harness figure with a recorded platform came from Windows (see
 [docs/building.md](docs/building.md) has the floors and how each binary is built.
 
 **Android (2026-11-18).** `src/code/` also carries this library for `arm64-android`,
-`armv7-android`, `x86_64-android` and `x86-android` (Android 5.0, API 21, and up), built by the
+`armv7-android`, `x86_64-android` and `x86-android` (built then for Android 5.0, API 21, and up;
+for Android 7.0 since 2026-11-21, below), built by the
 suite's `tools/build-android.sh` and landed by its `release-binaries.yml` dispatch. Its native tests
 ran on an Android 5.0 emulator for the two x86 ids; the two ARM libraries are built and statically
-checked, not run. An OXT engine on Android first loaded this library on 2026-11-19: an app
-OXT-Beyond's CI built with the suite's extensions ran on x86_64 emulators (Android 13, and Android
-16 with 16 KB pages), where `btLastError()` answered (empty, as it should with no session). That is
+checked, not run. An OXT engine on Android first loaded this library, its API 21 build, on
+2026-11-19: an app OXT-Beyond's CI built with the suite's extensions ran on x86_64 emulators
+(Android 13, and Android 16 with 16 KB pages), where `btLastError()` answered (empty, as it
+should with no session). That is
 one call on the `x86_64-android` library; this member's selftest has not run on an Android engine,
 and no engine has loaded the `x86-android` or the ARM libraries: needs an OXT pass on Android. The
 `.lcb` declares Android's INTERNET permission, which OXT-Beyond's standalone builder adds to an app
 that includes this extension (observed in that app: it held INTERNET with no permission of its own
 chosen).
+
+**Android 11 and later: the libraries built for API 21 did not work inside an app (2026-11-21).** In
+OXT-Beyond's app on an Android 13 emulator a torrent of a local file stayed in "checking files"
+at progress 0. Built for API 21, libtorrent learns the device's addresses over a netlink socket,
+which Android 11 and later refuse an app; the session then starts PAUSED, and "listen on every
+address" opens no socket (the stall, the refused socket and the paused session were observed
+there, the last on Android 16 as well; both consequences were reproduced on Linux by refusing the
+same calls). The suite's recipe now builds
+this library for API 24, **Android 7.0 and up**, where libtorrent uses `getifaddrs()` and no
+netlink socket. The four libraries in `src/code/` are the API 24 builds since that day's
+release dispatch (suite commit d47060f). Their native tests ran on an Android 7.0 emulator for
+the two x86 ids, this page's local-torrent row among them; no engine has loaded them and no app
+has run them, so the fix itself is verified statically; needs an OXT pass on Android. An app
+still carrying the API 21 libraries can call `btSessionResume` after `btStartSession` and name
+the address it listens on (`btSetString tSession, "listen_interfaces", "<address>:<port>"`).
 
 ## Install
 

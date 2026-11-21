@@ -529,6 +529,47 @@ if(TORRENTXT_BUILD_TESTS)
         add_test(NAME torrent_smoke_test COMMAND torrent_smoke_test)
         set_tests_properties(torrent_smoke_test PROPERTIES
             ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=halt_on_error=1")
+        # (b2) The FIXTURE for the smoke test's last row (a session is not
+        #     paused at birth, listens, and seeds a local file). That row exists
+        #     because a library built for Android API 21 stalled inside an app
+        #     on Android 13, and it passes on every machine the suite tests on;
+        #     a row that has only ever passed has not been shown to see
+        #     anything. So the row runs once more under a preloaded library
+        #     that refuses what Android 11 refuses an app (binding a
+        #     NETLINK_ROUTE socket, and RTM_GETLINK on one;
+        #     tests/netlink_refused_preload.c says how that was established),
+        #     and this test PASSES only when the row FAILS on exactly its four
+        #     checks: paused at birth, not seeding, no listen port, still
+        #     paused. Linux only, because the preload stands in for Linux's
+        #     own netlink path, which is the path an Android build below API
+        #     24 takes; and never under the sanitizers, whose runtime must be
+        #     the first preloaded library.
+        set(_deny_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/netlink_refused_preload.c")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT TORRENTXT_SANITIZE AND EXISTS "${_deny_src}")
+            # The project is C++ only; the preload is C, because it defines
+            # libc's own bind(), send() and sendto(), whose C++ declarations
+            # carry exception specifications that differ between libcs.
+            enable_language(C)
+            add_library(netlink_refused_preload MODULE "${_deny_src}")
+            target_link_libraries(netlink_refused_preload PRIVATE ${CMAKE_DL_LIBS})
+            add_test(NAME torrent_smoke_netlink_refused
+                     COMMAND torrent_smoke_test test_local_torrent_seeds)
+            # One expression, in the order the row prints: with PASS_REGULAR_
+            # EXPRESSION set ctest ignores the exit status, so the count of
+            # failures is pinned in the text ("4 failures"), and a run in
+            # which the row passed, or failed on anything else, does not match.
+            # The torrent's state is NOT pinned, only that it has made no
+            # progress under a paused session: the row stops at its first
+            # sight of the paused session, and by then the torrent is either
+            # still reading resume data (state 7, the first CI run of this
+            # fixture, a fast runner) or already at "checking files" (state 1,
+            # the machine it was written on, and what the Android app showed
+            # after 20 s). Pinning "state 1" pinned a race.
+            set_tests_properties(torrent_smoke_netlink_refused PROPERTIES
+                TIMEOUT 120
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:netlink_refused_preload>"
+                PASS_REGULAR_EXPRESSION "FAIL [^\n]*  btx_session_is_paused\\(s\\) == 0\nFAIL [^\n]*  seeding\n[^\n]*not seeding: state [17], progress 0[^\n]*session paused 1[^\n]*\nFAIL [^\n]*  port > 0\nFAIL [^\n]*  btx_session_is_paused\\(s\\) == 0\n[0-9]+ checks, 4 failures")
+        endif()
     elseif(EXISTS "${_smoke_src}")
         message(STATUS "TorrentXT: tests/torrent_smoke_test.cpp present but the shim library "
                        "is not — skipping the smoke test (needs src/torrent_shim.cpp).")
