@@ -3392,6 +3392,10 @@ command uiInput pName, pRect
    set the borderWidth of field pName to 1
    set the borderColor of field pName to kUiFieldLine
    set the opaque of field pName to true
+   -- SAY THE TEXT COLOUR. Left unset it is the system theme's, and a dark
+   -- theme's is white: white words on the white this builder paints (seen on
+   -- Windows, 2026-11-20, in a log and under two checkboxes).
+   set the foregroundColor of field pName to kUiInk
    set the backgroundColor of field pName to kUiCard
    -- 4-item margins form ONLY: OXT ignored the single-number form on a
    -- real engine pass
@@ -3414,6 +3418,8 @@ command uiArea pName, pRect
    set the borderColor of field pName to kUiCardLine
    set the opaque of field pName to true
    set the backgroundColor of field pName to kUiCard
+   -- and its words, for uiInput's reason: never the theme's
+   set the foregroundColor of field pName to kUiInk
    set the margins of field pName to "6,6,6,6"
    set the vScrollbar of field pName to true
    set the textSize of field pName to 10
@@ -3448,6 +3454,9 @@ command uiCheckbox pName, pLabel, pRect
    uiButton pName, pLabel, pRect
    set the style of button pName to "checkbox"
    set the autoHilite of button pName to false
+   -- its label sits on the adopter's card, which the kit paints white: the
+   -- theme's text colour (white, under a dark theme) must not reach it
+   set the foregroundColor of button pName to kUiInk
 end uiCheckbox
 
 -- Create-or-reuse a named graphic: the chrome layer (cards, pills,
