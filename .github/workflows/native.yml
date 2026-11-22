@@ -36,7 +36,10 @@ permissions:
 jobs:
   sanitize:
     name: shim ASan+UBSan (linux x86_64)
-    runs-on: ubuntu-24.04
+    # The maintainer's Linux PC takes this job while the repository variable
+    # PC_RUNNERS_LINUX is 'on', for this repository's own pushes and branches
+    # only; otherwise, and for every fork, GitHub's ubuntu-24.04 (docs/PC-RUNNERS.md).
+    runs-on: ${{ (vars.PC_RUNNERS_LINUX == 'on' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","Linux","X64","seth-pc"]')) || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
       # The sanitizer lane builds against the apt libtorrent on purpose: it
@@ -80,6 +83,7 @@ jobs:
           # shippable one.
           - name: linux-x86_64
             os: ubuntu-24.04
+            pc: linux
             platform_id: x86_64-linux
             acquire: linux64src
             # Cap parallelism: libtorrent's heaviest translation units each peak
@@ -90,6 +94,7 @@ jobs:
           # i386 system libraries. The slowest lane; no 32-bit apt libtorrent.
           - name: linux-x86
             os: ubuntu-24.04
+            pc: linux
             platform_id: x86-linux
             acquire: linux32
             build_jobs: 2
@@ -114,7 +119,11 @@ jobs:
             acquire: vcpkg
             vcpkg_triplet: x86-windows-static
             cmake_args: "-DTORRENTXT_USE_SYSTEM_LIBTORRENT=ON -A Win32"
-    runs-on: ${{ matrix.os }}
+    # Rows marked `pc:` may run on the maintainer's own PCs (docs/PC-RUNNERS.md):
+    # only while the repository variable PC_RUNNERS_LINUX or PC_RUNNERS_WINDOWS
+    # is 'on', and only for this repository's own pushes and branches; a pull
+    # request from a fork always runs on GitHub's machines. Otherwise matrix.os.
+    runs-on: ${{ ((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && ((matrix.pc == 'linux' && vars.PC_RUNNERS_LINUX == 'on' && fromJSON('["self-hosted","Linux","X64","seth-pc"]')) || (matrix.pc == 'windows' && vars.PC_RUNNERS_WINDOWS == 'on' && fromJSON('["self-hosted","Windows","X64","seth-pc"]')))) || matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python (for package-extension.py)
