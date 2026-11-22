@@ -177,8 +177,12 @@ C++ engine (the shim cites these by number):
    fail on exactly its four checks. Do not "fix" that test by making the row pass under the
    preload: a Linux build is supposed to fail there. The suite's emulator cannot see the cause
    (its tests run as the shell user, and the rule is for apps); OXT-Beyond's Android workflow
-   can. The committed Android libraries are the API 24 builds since 2026-11-21 (suite commit
-   d47060f), tested on an Android 7.0 emulator and not yet run in an app.
+   can, and did: the committed Android libraries are the API 24 builds since 2026-11-21 (suite
+   commit d47060f), tested on an Android 7.0 emulator, and on 2026-11-22 OXT-Beyond's app (its
+   pull request 625) started a session of the `x86_64-android` one unpaused, listening on
+   `0.0.0.0:0` and seeding a local file, on Android 13 and Android 16 emulators. Its test fails
+   on a session born paused, so the API 21 build cannot come back there unseen. No peer has
+   connected on Android.
 
 **FOUND 2026-09-24: libtorrent 2.0.x accepts a non-hex 40-character btih.** Its
 `magnet_uri.cpp` ignores `from_hex`'s result for a 40-character `urn:btih:` (2.0.10, 2.0.11;

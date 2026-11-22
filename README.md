@@ -85,8 +85,12 @@ same calls). The suite's recipe now builds
 this library for API 24, **Android 7.0 and up**, where libtorrent uses `getifaddrs()` and no
 netlink socket. The four libraries in `src/code/` are the API 24 builds since that day's
 release dispatch (suite commit d47060f). Their native tests ran on an Android 7.0 emulator for
-the two x86 ids, this page's local-torrent row among them; no engine has loaded them and no app
-has run them, so the fix itself is verified statically; needs an OXT pass on Android. An app
+the two x86 ids, this page's local-torrent row among them. The fix was then seen in an app
+(2026-11-22, OXT-Beyond pull request 625, its Android workflow's x86_64 emulators): on Android 13
+and on Android 16 with 16 KB pages, a new session was not paused, listened on every address
+(`0.0.0.0:0`) and a torrent of a file the app wrote was checked to seeding, with nothing resumed.
+No peer connected in that test, so a transfer, a tracker and the DHT on Android are verified
+statically; need an OXT pass on Android, and so are the ARM and `x86-android` libraries. An app
 still carrying the API 21 libraries can call `btSessionResume` after `btStartSession` and name
 the address it listens on (`btSetString tSession, "listen_interfaces", "<address>:<port>"`).
 
