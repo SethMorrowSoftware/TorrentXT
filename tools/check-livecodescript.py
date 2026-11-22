@@ -223,6 +223,22 @@ The checks, and the engine lesson each encodes:
       passes, though by the same parse "14e0" is "0014"). The family
       interpreter is the other half: it refuses every such comparison a
       gate RUNS (docs/OXT-ENGINE-NOTES.md 2.11).
+  24. A foreign handler that RETURNS a ZString (ZStringNative, ZStringUTF8,
+      ZStringUTF16) - .lcb only (suite engine note 6.18, OBSERVED and
+      DOCUMENTED). The engine wraps a returned C string in a value whose
+      finalizer free()s it (libscript module-foreign.cpp), so a string the
+      library or libc still owns crashes or double-frees when the value
+      dies: ShowControl's first lc-run of oscLastError() crashed the VM on
+      a static buffer, a getenv() probe died with "free(): invalid
+      pointer", and box2dxt's b2LoadNativeLibError aborted lc-run with
+      "free(): double free" on dlerror()'s text (2026-11-21). ShowControl's
+      own checker refused the form; the suite's unification dropped the
+      rule, and this restores it. Text comes back as `optional Pointer`
+      copied at once with the builtin MCStringCreateWithCString, or through
+      a caller buffer (bytes written / -needed). The one exemption is a
+      symbol whose returned text the CALLER owns and must free(), where the
+      engine's free() is the right one: ZSTRING_RETURN_CALLER_FREES, by the
+      C symbol its `binds to` names.
 
 One hold-em lineage check is deliberately NOT here, and the reason is
 recorded so it is not "rediscovered": the chunk-of-an-array-element refusal
@@ -914,6 +930,53 @@ def check_lcs_antipatterns(path, cleaned):
         for pat, msg in LCS_ANTIPATTERNS:
             if pat.search(line):
                 problems.append(Problem(path, lineno, msg))
+    return problems
+
+
+# Check 24's exemptions: C symbols whose returned string the CALLER owns and
+# must free(), so the engine's finalizer free() is the right owner. realpath()
+# only so when its buffer argument is NULL (box2dxt passes `nothing`; given a
+# buffer it returns that buffer, which a line scanner cannot tell apart).
+# MEASURED over the suite (2026-11-21): box2dxt's _realpath is the one bind
+# of the form left, and the only one that is right.
+ZSTRING_RETURN_CALLER_FREES = ("realpath",)
+
+_FOREIGN_ZSTRING_RETURN = re.compile(
+    r"\bforeign\s+handler\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(.*\)\s*returns\s+"
+    r"(?:optional\s+)?(ZString(?:Native|UTF8|UTF16))\b", re.IGNORECASE)
+_BINDS_TO = re.compile(r'\bbinds\s+to\s+"([^"]*)"', re.IGNORECASE)
+
+
+def check_lcb_zstring_returns(path, kept):
+    """Check 24: a foreign handler returning a ZString, which the engine
+    free()s (suite engine note 6.18). Reads the literal-preserving view: the
+    symbol is inside the `binds to` string ("c:lib>symbol!cdecl", "c:>symbol",
+    or "<builtin>", where the handler's own name is the symbol)."""
+    problems = []
+    for lineno, line in kept:
+        m = _FOREIGN_ZSTRING_RETURN.search(line)
+        if not m:
+            continue
+        symbol = None
+        b = _BINDS_TO.search(line, m.end())
+        if b:
+            spec = b.group(1).strip()
+            if spec.lower() == "<builtin>":
+                symbol = m.group(1)
+            else:
+                symbol = spec.split(">", 1)[-1].split("!", 1)[0].strip()
+        if symbol in ZSTRING_RETURN_CALLER_FREES:
+            continue
+        problems.append(Problem(path, lineno,
+                        "foreign handler `%s` RETURNS a %s: the engine "
+                        "free()s a returned C string when the value dies "
+                        "(suite engine note 6.18), so text the library or "
+                        "libc still owns (dlerror, getenv, a static or "
+                        "model-owned buffer) crashes or double-frees. Return "
+                        "`optional Pointer` and copy it at once with the "
+                        "builtin MCStringCreateWithCString, or return text "
+                        "through a caller buffer (bytes written / -needed)"
+                        % (m.group(1), m.group(2))))
     return problems
 
 
@@ -1848,6 +1911,10 @@ def check_file(path):
         problems += check_lcb_antipatterns(path, cleaned)
         problems += check_lcb_lowercase_names(path, cleaned)
         problems += check_lcb_imports(path, cleaned)
+        # check 24 reads the `binds to` string, so it needs literal CONTENTS
+        kept, _ = clean_logical_lines(path, text, line_comment_tokens,
+                                      keep_strings=True)
+        problems += check_lcb_zstring_returns(path, kept)
     # rules that hold in both dialects
     problems += check_constants_before_use(path, cleaned, is_script)
     problems += check_constant_values_are_literal(path, cleaned, is_script)
