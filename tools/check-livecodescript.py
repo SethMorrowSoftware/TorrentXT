@@ -58,8 +58,8 @@ The checks, and the engine lesson each encodes:
       (.livecodescript only - LCB allows it): `()` is not an expression, and
       one such line takes the whole file with it (the dcCleanup() lesson).
   9.  Engine-hostile constructs that COMPILE and silently do the wrong thing
-      (.livecodescript only): `repeat with ... step N` (the increment is not
-      honoured; the cxHexDecode lesson) and `throw` inside a `catch` block
+      (.livecodescript only): `repeat with ... step N` (the last pass can run
+      with i past B; the cxHexDecode lesson) and `throw` inside a `catch` block
       (the error never reaches the caller; the cxMnemonicValidate fail-open).
       `return` inside a catch is FINE and engine-proven; only `throw` is
       flagged.
@@ -1050,8 +1050,10 @@ def check_engine_hostile_constructs(path, text):
     and that rarity is the point. A construct nobody else uses is a construct
     nobody else has proved.
 
-    1. `repeat with i = A to B step N`. The increment was not honoured: i walked
-       one at a time. In cxHexDecode that made the last pass read one character
+    1. `repeat with i = A to B step N`. The engine tests i BEFORE adding the
+       step, so when B - A is not a multiple of N the last pass runs with i past
+       B (engine note 3.1, corrected 2026-11-25: the record once said i walked
+       one at a time). In cxHexDecode that made the last pass read one character
        past the pairs, get empty, and throw "not a hex digit" over VALID input -
        the library accusing the caller's data of being corrupt, in the exact
        words it reserves for real corruption. Use `repeat while` with an
@@ -1877,7 +1879,7 @@ def check_file(path):
     problems = []
     problems += find_banned_chars(path, text)
     for lineno, kind in check_engine_hostile_constructs(path, text):
-        problems.append(Problem(path, lineno, "%s" % ("a `repeat with ... step N` loop does not honour its increment on OXT; use `repeat while` with an explicit `add N to` (see cxHexDecode)" if kind == "step" else "a `throw` inside a `catch` block does not reach the caller on OXT; capture the error, close the try, and throw after `end try` (see the guards in coinxt.livecodescript)")))
+        problems.append(Problem(path, lineno, "%s" % ("a `repeat with ... step N` loop can make a last pass with its variable past the end bound; use `repeat while` with an explicit `add N to` (see cxHexDecode)" if kind == "step" else "a `throw` inside a `catch` block does not reach the caller on OXT; capture the error, close the try, and throw after `end try` (see the guards in coinxt.livecodescript)")))
     for lineno, name in check_zero_arg_statement_calls(path, text):
         problems.append(Problem(path, lineno, "a zero-argument call written %s() in statement position does not compile in LiveCodeScript (the engine parses `()` as the command's argument, and `()` is not an expression). Write it bare: %s" % (name, name)))
 
